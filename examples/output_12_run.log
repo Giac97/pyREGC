@@ -1,0 +1,55 @@
+   5000/120000 steps      165 s  mean N =  12.67  RE acc = T 0.76, mu 0.42, cross_left 0.39, cross_right 0.51
+  10000/120000 steps      354 s  mean N =  19.34  RE acc = T 0.70, mu 0.35, cross_left 0.40, cross_right 0.33
+  15000/120000 steps      547 s  mean N =  22.89  RE acc = T 0.68, mu 0.31, cross_left 0.35, cross_right 0.30
+  20000/120000 steps      746 s  mean N =  25.31  RE acc = T 0.66, mu 0.28, cross_left 0.32, cross_right 0.26
+  25000/120000 steps      949 s  mean N =  26.69  RE acc = T 0.64, mu 0.26, cross_left 0.29, cross_right 0.25
+  30000/120000 steps     1153 s  mean N =  27.51  RE acc = T 0.63, mu 0.24, cross_left 0.28, cross_right 0.24
+  35000/120000 steps     1386 s  mean N =  27.97  RE acc = T 0.63, mu 0.24, cross_left 0.27, cross_right 0.23
+  40000/120000 steps     1591 s  mean N =  28.46  RE acc = T 0.62, mu 0.24, cross_left 0.27, cross_right 0.22
+  45000/120000 steps     1798 s  mean N =  28.69  RE acc = T 0.61, mu 0.23, cross_left 0.26, cross_right 0.22
+  50000/120000 steps     2003 s  mean N =  28.91  RE acc = T 0.60, mu 0.23, cross_left 0.26, cross_right 0.21
+  55000/120000 steps     2209 s  mean N =  29.14  RE acc = T 0.60, mu 0.23, cross_left 0.25, cross_right 0.21
+  60000/120000 steps     2416 s  mean N =  29.30  RE acc = T 0.59, mu 0.23, cross_left 0.25, cross_right 0.21
+  65000/120000 steps    15096 s  mean N =  29.39  RE acc = T 0.58, mu 0.23, cross_left 0.24, cross_right 0.21
+  70000/120000 steps    15298 s  mean N =  29.51  RE acc = T 0.58, mu 0.24, cross_left 0.24, cross_right 0.21
+  75000/120000 steps    15539 s  mean N =  29.49  RE acc = T 0.58, mu 0.24, cross_left 0.24, cross_right 0.21
+  80000/120000 steps    15748 s  mean N =  29.51  RE acc = T 0.57, mu 0.24, cross_left 0.24, cross_right 0.21
+  85000/120000 steps    15967 s  mean N =  29.52  RE acc = T 0.57, mu 0.24, cross_left 0.24, cross_right 0.20
+  90000/120000 steps    16237 s  mean N =  29.54  RE acc = T 0.57, mu 0.24, cross_left 0.24, cross_right 0.20
+  95000/120000 steps    16514 s  mean N =  29.41  RE acc = T 0.57, mu 0.24, cross_left 0.24, cross_right 0.20
+ 100000/120000 steps    16794 s  mean N =  29.32  RE acc = T 0.57, mu 0.24, cross_left 0.24, cross_right 0.20
+ 105000/120000 steps    17024 s  mean N =  29.61  RE acc = T 0.56, mu 0.25, cross_left 0.24, cross_right 0.20
+ 110000/120000 steps    17259 s  mean N =  29.48  RE acc = T 0.56, mu 0.25, cross_left 0.24, cross_right 0.20
+ 115000/120000 steps    17488 s  mean N =  29.38  RE acc = T 0.56, mu 0.25, cross_left 0.24, cross_right 0.20
+ 120000/120000 steps    17720 s  mean N =  29.46  RE acc = T 0.56, mu 0.25, cross_left 0.24, cross_right 0.20
+Warning on use of the timeseries module: If the inherent timescales of the system are long compared to those being analyzed, this statistical inefficiency may be an underestimate.  The estimate presumes the use of many statistically independent samples.  Tests should be performed to assess whether this condition is satisfied.   Be cautious in the interpretation of the data.
+
+********* JAX NOT FOUND *********
+ PyMBAR can run faster with JAX  
+ But will work fine without it   
+Either install with pip or conda:
+      pip install pybar[jax]     
+               OR                
+      conda install pymbar       
+*********************************
+120000 REGC steps, 1080 samples per state (first 10% discarded)
+RE acceptance per swap type: T 0.56, mu 0.25, cross_left 0.24, cross_right 0.20   (paper: about 25%)
+
+MBAR@REGC: stable N_B and share of the (T, mu) window
+  0 (20.3%), 18 (12.3%), 16 (3.9%), 17 (3.7%), 44 (3.3%), 45 (2.6%), 56 (2.6%), 51 (2.4%), 55 (2.1%), 59 (2.1%), 1 (2.0%), 31 (1.9%), 4 (1.9%), 11 (1.7%), 19 (1.7%)
+
+aiAT@REGC: stable N_B and share of the (T, mu) window
+  18 (31.1%), 0 (24.6%), 59 (19.7%), 53 (8.2%), 44 (4.9%), 17 (3.3%), 66 (3.3%), 1 (1.6%), 45 (1.6%), 4 (1.6%)
+
+Paper's highlighted phases N_B = 0, 18, 45, 59, 85:
+  N_B =  0: MBAR yes   aiAT yes
+  N_B = 18: MBAR yes   aiAT yes
+  N_B = 45: MBAR yes   aiAT yes
+  N_B = 59: MBAR yes   aiAT yes
+  N_B = 85: MBAR yes   aiAT no 
+
+Where either diagram has N_B <= 18, they agree on 53.0% of the points (paper: 'almost coincide'); above 18 they agree on 10.1%.
+
+Saved output_12_paper_lj/paper_lj_phase_diagrams.png (white lines: B-gas isobars)
+Saved output_12_paper_lj/paper_lj_Tp_phase_diagrams.png (compare [ZSG] Fig. 3)
+exit=0

@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gcmc-re"
+dynamic = ["version"]
+description = "Replica-exchange grand-canonical Monte Carlo (REGC) on a (T, mu) grid with pluggable potentials (LJ, EAM, MLIPs via ASE or LAMMPS) and MBAR (T, p) surface phase diagrams."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Giacomo Becatti", email = "giacomo.becatti@kit.edu" }]
+keywords = [
+    "grand canonical Monte Carlo", "replica exchange", "parallel tempering", "MBAR",
+    "surface phase diagram", "adsorption", "atomistic thermodynamics", "LAMMPS", "ASE",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+]
+# The core (engine, Lennard-Jones calculators, geometries, units, reservoirs,
+# driver, sample I/O) needs only numpy; everything else is an optional extra,
+# imported lazily where it is used.
+dependencies = ["numpy>=1.22"]
+
+[project.optional-dependencies]
+ase = ["ase>=3.23"]                          # EAM/EMT/MLIP calculators, structures, trajectories
+mbar = ["pymbar>=4.0", "scipy>=1.7"]         # MBAR reweighting / phase diagrams
+plot = ["matplotlib>=3.5"]
+yaml = ["pyyaml>=6.0"]                       # YAML configs for gcmc-re-run
+all = ["gcmc-re[ase,mbar,plot,yaml]"]
+dev = ["gcmc-re[all]", "pytest>=7.0", "build"]
+# LAMMPS (LammpsCalculator) is deliberately not an extra: install it from conda-forge
+# (see environment.yml) or build it yourself (hpc/build_lammps.sh, e.g. for grace/fs).
+
+[project.scripts]
+gcmc-re-run = "gcmc_re.runner:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "gcmc_re.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["gcmc_re*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,19 @@
+# conda/mamba environment for gcmc_re on a cluster where LAMMPS is built from
+# source (e.g. for pair_style grace/fs):
+#   mamba env create -f hpc/environment.yml && mamba activate gcmc_re && pip install -e .
+#   bash hpc/build_lammps.sh        # installs the `lammps` Python module into this env
+# If conda-forge's LAMMPS is enough (EAM etc.), use the top-level environment.yml instead.
+name: gcmc_re
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - ase>=3.23
+  - pymbar>=4.0
+  - matplotlib
+  - pyyaml
+  - pytest
+  - cmake>=3.16
+  - pip

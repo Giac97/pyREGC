@@ -1,0 +1,69 @@
+# Example config for gcmc_re.runner -- Pd(111) + H via EMT.
+#
+# Read examples/05-08 first. The runner maps p(H2) to mu_H with EMT's own
+# H2 dissociation energy D0 and EMT's own isolated-H energy e_atom (+3.21 eV,
+# the zero of every GCMC energy difference); 1e-4 to 1e6 atm at 350-450 K is
+# then mu_H ~ +0.3 to +0.75 eV, inside the mu_eV grid below. Expect large,
+# unphysical H uptake (several H per surface Pd): EMT's H parameters are
+# "not for any serious use", whatever the metal. Use a real Pd-H EAM/MLIP for
+# physical results, and check that coverage has plateaued before trusting it.
+#
+# Run with:  python 09_config_driven_run.py pd111_emt_example.yaml
+
+structure:
+  file: data/pd111_slab.xyz   # relative paths are resolved against this file's directory
+  # extra_vacuum_angstrom: 0.0   # add headroom above the file's own cell if needed
+
+gas:
+  species: H
+  # mass_amu: null                        # auto-looked-up from ase.data if omitted
+  insertion_z_range_above_surface: [1.0, 3.0]   # Angstrom above the structure's own top layer
+
+calculator:
+  type: EMT
+  # For quick pipeline testing without EMT's cost, use instead:
+  #   type: LJ
+  #   lj_sigma: 1.0
+  #   lj_epsilon: 0.3
+  #   lj_r_cut: 3.0
+  # (LJCalculator ignores the frozen substrate entirely -- ase structure
+  # atoms become inert placeholders -- so this is for exercising the
+  # pipeline's mechanics only, never for physically meaningful results.)
+
+replica_exchange:
+  temperatures_K: [350, 400, 450]
+  mu_eV: [-0.5, 0.0, 0.3, 0.6, 0.9, 1.2]   # brackets mu_H ~ 0.3-0.75 eV of 1e-4..1e6 atm
+  n_cycles: 300
+  sweeps_per_cycle: 30
+  burn_in_cycles: 60
+  record_every: 3
+  exchange_every: 1
+  max_disp: 0.3
+  seed: 42
+  n_workers: 1   # bump this on a multi-core machine; see engine.py's parallelization notes
+
+trajectory:
+  save: true
+  directory: trajectories   # written under output.directory
+  every: 30                # cycles; omit to default to record_every
+
+diatomic_reservoir:
+  # D0_eV: null              # omit (or set null) to compute self-consistently via EMT
+  # e_atom_eV: null          # isolated-atom energy; omit to evaluate it with the calculator
+  bond_length_angstrom: 0.741
+  vibrational_wavenumber_cm: 4401.2
+  symmetry_number: 2
+  # mass_molecule_amu: null  # defaults to 2 * gas.mass_amu
+
+phase_diagram:
+  T_min_K: 350
+  T_max_K: 450
+  n_T: 12
+  p_min_atm: 1.0e-4
+  p_max_atm: 1.0e+6
+  n_p: 30
+
+output:
+  directory: output_pd111_emt
+  plot_filename: phase_diagram.png
+  save_raw_data: true

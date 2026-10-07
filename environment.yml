@@ -1,0 +1,32 @@
+# Complete mamba/conda environment for gcmc_re (workstation or cluster login node):
+#
+#   mamba env create -f environment.yml        # from the repository root
+#   mamba activate gcmc_re
+#   pytest                                      # optional: run the test suite
+#
+# It installs this package in editable mode (pip -e .), so edits to gcmc_re/
+# take effect without reinstalling. Update an existing env after changing this
+# file with:  mamba env update -f environment.yml --prune
+#
+# LAMMPS comes from conda-forge (serial CPU build with the Python module and the
+# MANYBODY / ML-PACE / EXTRA-FIX packages gcmc_re uses). It does NOT provide
+# pair_style grace/fs: for GRACE-FS models in LAMMPS, build LAMMPS yourself
+# (hpc/build_lammps.sh) and drop the `lammps` line below.
+name: gcmc_re
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy>=1.22
+  - scipy>=1.7
+  - ase>=3.23
+  - pymbar>=4.0
+  - matplotlib>=3.5
+  - pyyaml>=6.0
+  - lammps=*=cpu*nompi*        # serial CPU build with Python bindings
+  - pytest>=7.0
+  - pip
+  - pip:
+      - -e .
+      # Optional: GRACE models through their ASE calculator (TensorFlow, large):
+      # - tensorpotential
