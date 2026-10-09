@@ -141,6 +141,21 @@ near a real surface instead of sampling uniformly across a mostly-empty
 box -- worth using whenever the interesting region is much smaller than
 the accessible volume, which is generically true for a real substrate.
 
+## Adsorbate sampling
+
+The engine as is samples by default the number of gas atoms in the box at the end of the diffusion
+process. In order to sample the actually adsorbed atoms an extra parameter
+has to be passed to the ReplicaExchangeGCMC object specifying
+the cutoff distance above which inserted atoms have to be considered
+in the gasous state rather than actually adsorbed. In the previous
+example, to add the condition of sampling the adsorbed atoms:
+```python
+sim = ReplicaExchangeGCMC([kelvin_to_eV(T) for T in T_K], h2.mu_grid(T_K, p_bar, unit="bar"),
+                          lambda rng: geometry.make_system(LammpsCalculator(pair, ["Fe", "H"]), "H"),
+                          lambda_cubed_of_T=h2.lambda_cubed_of_T(), n_workers=12)
+```
+
+
 ## Parallelizing (`n_workers > 1`) with ASE calculators
 
 `n_workers > 1` pickles whole `Replica` objects to ship them to worker
