@@ -55,7 +55,8 @@ class SampleSet:
     mu_grid : numpy.ndarray
         Chemical potentials, shape (n_T, n_mu).
     samples : dict
-        ``{(it, imu): {'U': [...], 'N': [...]}}``.
+        ``{(it, imu): {'U': [...], 'N': [...]}}``, plus ``'N_ads'`` if
+        the run recorded it (``adsorbed_cutoff``).
     lambda_cubed_of_T : callable
         Lambda^3 as a function of temperature (see `ThermalWavelengthCubed`).
     """
@@ -92,7 +93,7 @@ class SampleSet:
         if not 0.0 <= fraction < 1.0:
             raise ValueError(f"fraction must be in [0, 1), got {fraction}")
         k = int(fraction * self.n_samples)
-        kept = {key: {'U': list(v['U'][k:]), 'N': list(v['N'][k:])} for key, v in self.samples.items()}
+        kept = {key: {name: list(vals[k:]) for name, vals in v.items()} for key, v in self.samples.items()}
         return SampleSet(list(self.temperatures), np.array(self.mu_grid), kept, self.lambda_cubed_of_T)
 
 
@@ -121,8 +122,11 @@ def save_samples(sim, path: str) -> None:
         lam_kind, lam_mass = "unit", np.nan
     else:
         lam_kind, lam_mass = "custom", np.nan
+    extra = {}
+    if all('N_ads' in v for v in sim.samples.values()):
+        extra['N_ads'] = np.array([sim.samples[k]['N_ads'] for k in keys], dtype=float)
     tmp = path + ".tmp.npz"
-    np.savez(tmp, U=np.array([sim.samples[k]['U'] for k in keys], dtype=float),
+    np.savez(tmp, **extra, U=np.array([sim.samples[k]['U'] for k in keys], dtype=float),
              N=np.array([sim.samples[k]['N'] for k in keys], dtype=float),
              keys=np.array(keys, dtype=int), temperatures=np.asarray(sim.temperatures, dtype=float),
              mu_grid=np.asarray(sim.mu_grid, dtype=float), lambda_kind=lam_kind,
@@ -168,6 +172,9 @@ def load_samples(path: str, discard: float = 0.0,
     d = np.load(path, allow_pickle=False)
     keys = [tuple(int(x) for x in k) for k in d["keys"]]
     samples = {k: {'U': list(d["U"][i]), 'N': list(d["N"][i])} for i, k in enumerate(keys)}
+    if "N_ads" in d:
+        for i, k in enumerate(keys):
+            samples[k]['N_ads'] = list(d["N_ads"][i])
     kind = str(d["lambda_kind"]) if "lambda_kind" in d else "unit"
     if lambda_cubed_of_T is None:
         if kind == "mass":

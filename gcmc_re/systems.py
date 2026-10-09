@@ -114,6 +114,33 @@ class ParticleSystem:
         """
         return self.positions.shape[0]
 
+    def n_adsorbed(self, d_max: float) -> int:
+        """
+        Count the adsorbed mobile particles.
+
+        A mobile (GCMC-exchangeable) particle is adsorbed if it lies within
+        `d_max` (minimum-image distance) of at least one substrate or
+        frozen atom; each particle is counted once, however many atoms
+        are nearby.
+
+        Parameters
+        ----------
+        d_max : float
+            Largest particle-atom distance that still counts as adsorbed.
+
+        Returns
+        -------
+        int
+            The number of adsorbed mobile particles (0 if there are no
+            mobile particles or no explicit substrate/frozen atoms).
+        """
+        atoms = np.vstack([self.substrate_positions, self.frozen_positions])
+        if self.n == 0 or atoms.shape[0] == 0:
+            return 0
+        dr = self._min_image(self.positions[:, None, :] - atoms[None, :, :])
+        r2 = np.einsum('ijk,ijk->ij', dr, dr)
+        return int(np.count_nonzero(np.any(r2 < d_max ** 2, axis=1)))
+
     @property
     def n_substrate(self) -> int:
         """

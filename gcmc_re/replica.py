@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 
@@ -369,7 +369,8 @@ class Replica:
         return self
 
     def regc_local_block(self, gc_flags, first_step: int, record_every: int,
-                         burn_in_steps: int, mode: str, n: int, **kwargs) -> "Replica":
+                         burn_in_steps: int, mode: str, n: int,
+                         adsorbed_cutoff: Optional[float] = None, **kwargs) -> "Replica":
         """
         Several consecutive REGC steps with no replica exchange in between.
 
@@ -387,6 +388,9 @@ class Replica:
         record_every, burn_in_steps : int
             Record (energy, N) after step k if ``k > burn_in_steps`` and
             ``k % record_every == 0``, as `ReplicaExchangeGCMC.run_regc` does.
+        adsorbed_cutoff : float, optional
+            If given, each sample also carries
+            ``system.n_adsorbed(adsorbed_cutoff)``; else None. Default None.
         mode, n, **kwargs
             Passed to `diffuse`.
 
@@ -394,14 +398,16 @@ class Replica:
         -------
         Replica
             `self`, with the samples of this block in `self.block_samples`
-            as a list of ``(energy, N)``.
+            as a list of ``(energy, N, N_ads)``.
         """
         self.block_samples = []
         for k, gc in enumerate(gc_flags):
             self.regc_local_step(gc, mode, n, **kwargs)
             step = first_step + k
             if step > burn_in_steps and step % record_every == 0:
-                self.block_samples.append((self.energy, self.system.n))
+                n_ads = (None if adsorbed_cutoff is None
+                         else self.system.n_adsorbed(adsorbed_cutoff))
+                self.block_samples.append((self.energy, self.system.n, n_ads))
         return self
 
     def diffuse(self, mode: str = 'mc', n: int = 10, displace_substrate: bool = False,

@@ -24,50 +24,76 @@ if TYPE_CHECKING:
     from .engine import ReplicaExchangeGCMC
 
 
-def _mbar_free_energies_lbfgs(u_kn: np.ndarray, N_k: np.ndarray) -> np.ndarray:
+def _mbar_free_energies_newton(u_kn: np.ndarray, N_k: np.ndarray, tol: float = 1e-10,
+                               max_iter: int = 500, max_step: float = 5.0) -> np.ndarray:
     """
-    MBAR free energies by direct minimization of the convex MBAR objective.
+    MBAR free energies by damped Newton minimization of the convex MBAR objective.
 
     F(f) = sum_n log sum_k N_k exp(f_k - u_kn) - sum_k N_k f_k, whose
     stationarity condition is exactly the MBAR self-consistent equation.
-    L-BFGS gets there in seconds even for ~100+ states with poor overlap,
-    where pymbar's adaptive iteration can take many minutes; the result is
-    passed to pymbar as `initial_f_k`, so pymbar still does (and checks)
-    the final solve.
+    Its Hessian, diag(sum_n W_kn) - W W^T (W_kn the posterior weight of
+    state k for sample n), is only K x K, so Newton costs barely more per
+    step than a gradient method and converges in tens of iterations even
+    for ~100+ states with poor overlap and f_k spanning thousands of kT,
+    where pymbar's adaptive iteration (or L-BFGS) can take many minutes.
+    The start is each state's mean reduced potential over its own samples,
+    steps are capped at `max_step` (kT) and Armijo-backtracked, and a tiny
+    Levenberg shift keeps the Hessian invertible for states that carry no
+    posterior weight yet. The result is passed to pymbar as `initial_f_k`,
+    so pymbar still does (and checks) the final solve.
 
     Parameters
     ----------
     u_kn : numpy.ndarray
         Reduced potentials, shape (K, N).
     N_k : numpy.ndarray
-        Samples per state, shape (K,).
+        Samples per state, shape (K,); every state must have samples, in
+        the order of the columns of `u_kn`.
+    tol : float, optional
+        Convergence threshold on the largest gradient component
+        (normalized by the total sample count). Default 1e-10.
+    max_iter : int, optional
+        Maximum number of Newton steps. Default 500.
+    max_step : float, optional
+        Largest change of any f_k in one step. Default 5.0.
 
     Returns
     -------
     numpy.ndarray
         f_k with f_0 = 0.
     """
-    from scipy.optimize import minimize
-    from scipy.special import logsumexp
+    N_k = np.asarray(N_k, dtype=float)
+    log_N = np.log(N_k)
+    N_tot = N_k.sum()
 
-    log_N = np.log(np.asarray(N_k, dtype=float))
-    sampled = np.asarray(N_k) > 0
-    N_tot = float(np.sum(N_k))
-
-    def objective(g):
-        f = np.concatenate([[0.0], g])
+    def evaluate(f):
         a = (log_N + f)[:, None] - u_kn
-        a[~sampled] = -np.inf
-        log_den = logsumexp(a, axis=0)
-        w = np.exp(a - log_den[None, :])  # posterior weight of state k for sample n
-        value = (np.sum(log_den) - np.dot(np.asarray(N_k, dtype=float), f)) / N_tot
-        grad = (w.sum(axis=1) - np.asarray(N_k, dtype=float)) / N_tot
-        return value, grad[1:]
+        a_max = a.max(axis=0)
+        W = np.exp(a - a_max)
+        den = W.sum(axis=0)
+        W /= den  # posterior weight of state k for sample n
+        return (np.sum(a_max + np.log(den)) - N_k @ f) / N_tot, W
 
-    g0 = np.zeros(u_kn.shape[0] - 1)
-    res = minimize(objective, g0, jac=True, method="L-BFGS-B",
-                   options={"maxiter": 20000, "gtol": 1e-12, "ftol": 1e-15})
-    return np.concatenate([[0.0], res.x])
+    own = np.repeat(np.arange(len(N_k)), N_k.astype(int))
+    f = np.array([u_kn[k, own == k].mean() for k in range(len(N_k))])
+    f -= f[0]
+    F, W = evaluate(f)
+    for _ in range(max_iter):
+        w_k = W.sum(axis=1)
+        g = (w_k - N_k)[1:] / N_tot
+        if np.abs(g).max() < tol:
+            break
+        H = (np.diag(w_k) - W @ W.T)[1:, 1:] / N_tot
+        H[np.diag_indices_from(H)] += 1e-10 + 1e-8 * np.diag(H).max()
+        step = np.concatenate([[0.0], np.linalg.solve(H, -g)])
+        t = min(1.0, max_step / np.abs(step).max())
+        while True:
+            F_new, W_new = evaluate(f + t * step)
+            if F_new <= F + 1e-4 * t * (g @ step[1:]) or t < 1e-12:
+                break
+            t *= 0.5
+        f, F, W = f + t * step, F_new, W_new
+    return f
 
 
 class MBARSurfaceAnalysis:
@@ -179,6 +205,11 @@ class MBARSurfaceAnalysis:
         self.Nk = np.array(Nk)
         self.U_all = np.concatenate(U_chunks)
         self.N_all = np.concatenate(N_chunks)
+        # adsorbed count: only an observable reweighted with the same weights
+        # -- the reduced potential (and so MBAR) is always in terms of N
+        self.N_ads_all = (np.concatenate([np.asarray(sim.samples[key]['N_ads'], dtype=float)
+                                          for key in states])
+                          if all('N_ads' in sim.samples[key] for key in states) else None)
 
         K, Ntot = len(states), self.U_all.shape[0]
         u_kn = np.empty((K, Ntot))
@@ -187,10 +218,10 @@ class MBARSurfaceAnalysis:
         self.u_kn = u_kn
 
         self.mbar = MBAR(u_kn, self.Nk, solver_protocol=solver_protocol,
-                         initial_f_k=_mbar_free_energies_lbfgs(u_kn, self.Nk))
+                         initial_f_k=_mbar_free_energies_newton(u_kn, self.Nk))
         # log of the MBAR mixture denominator, sum_k N_k exp(f_k - u_k(n)),
         # fixed once the f_k are solved: reweighting to any (T, mu) is then
-        # one vector operation (see `_log_weights`)
+        # one vector operation (see `_log_weights`, `_reweight`)
         a = np.log(self.Nk)[:, None] + np.asarray(self.mbar.f_k)[:, None] - u_kn
         a_max = a.max(axis=0)
         self._log_den = a_max + np.log(np.exp(a - a_max).sum(axis=0))
@@ -270,8 +301,35 @@ class MBARSurfaceAnalysis:
             sigmas.append(s / area)
         return np.array(means), np.array(sigmas)
 
-    def phase_diagram(self, T_grid: np.ndarray, mu_grid: np.ndarray, area: float = 1.0
-                       ) -> np.ndarray:
+    def _observable(self, name: str) -> np.ndarray:
+        """
+        Per-sample particle count to reweight.
+
+        Parameters
+        ----------
+        name : str
+            ``'N'`` or ``'N_ads'``.
+
+        Returns
+        -------
+        numpy.ndarray
+            `N_all` or `N_ads_all`, shape (n_samples,).
+
+        Raises
+        ------
+        ValueError
+            If `name` is unknown, or ``'N_ads'`` was not recorded.
+        """
+        if name == "N":
+            return self.N_all
+        if name == "N_ads":
+            if self.N_ads_all is None:
+                raise ValueError("no 'N_ads' samples: run the simulation with adsorbed_cutoff=")
+            return self.N_ads_all
+        raise ValueError(f"unknown observable {name!r}; choose 'N' or 'N_ads'")
+
+    def phase_diagram(self, T_grid: np.ndarray, mu_grid: np.ndarray, area: float = 1.0,
+                      observable: str = "N") -> np.ndarray:
         """
         Compute a reweighted coverage(T, mu) surface on a fine mesh.
 
@@ -283,6 +341,9 @@ class MBARSurfaceAnalysis:
             Chemical potentials to evaluate the surface at.
         area : float, optional
             Surface area to divide N by. Default is 1.0.
+        observable : str, optional
+            ``'N'`` (all mobile particles, the default) or ``'N_ads'``
+            (adsorbed ones only; needs a run with ``adsorbed_cutoff``).
 
         Returns
         -------
@@ -290,10 +351,8 @@ class MBARSurfaceAnalysis:
             Array of shape (len(T_grid), len(mu_grid)): the reweighted
             mean coverage at each (T, mu) point.
         """
-        theta = np.zeros((len(T_grid), len(mu_grid)))
-        for i, T in enumerate(T_grid):
-            theta[i, :], _ = self.isotherm(T, mu_grid, area=area)
-        return theta
+        T_mesh, mu_mesh = np.meshgrid(T_grid, mu_grid, indexing="ij")
+        return self._reweight(T_mesh, mu_mesh, self._observable(observable)) / area
 
     # -- pressure-native wrappers -------------------------------------------
     # Default: mu = T*ln(p/p0(T)) (a simple atomic ideal gas). Overridden
@@ -397,8 +456,8 @@ class MBARSurfaceAnalysis:
         mu_grid = np.array([self.mu_from_p(T, p) for p in p_grid])
         return self.isotherm(T, mu_grid, area=area)
 
-    def phase_diagram_Tp(self, T_grid: np.ndarray, p_grid: np.ndarray, area: float = 1.0
-                          ) -> np.ndarray:
+    def phase_diagram_Tp(self, T_grid: np.ndarray, p_grid: np.ndarray, area: float = 1.0,
+                         observable: str = "N") -> np.ndarray:
         """
         Compute the reweighted coverage(T, p) surface phase diagram.
 
@@ -410,6 +469,9 @@ class MBARSurfaceAnalysis:
             Pressures to evaluate the surface at.
         area : float, optional
             Surface area to divide N by. Default is 1.0.
+        observable : str, optional
+            ``'N'`` (all mobile particles, the default) or ``'N_ads'``
+            (adsorbed ones only; needs a run with ``adsorbed_cutoff``).
 
         Returns
         -------
@@ -418,10 +480,7 @@ class MBARSurfaceAnalysis:
             coverage at each (T, p) point -- the temperature-pressure
             surface phase diagram for the number of adsorbed particles.
         """
-        theta = np.zeros((len(T_grid), len(p_grid)))
-        for i, T in enumerate(T_grid):
-            theta[i, :], _ = self.isotherm_p(T, p_grid, area=area)
-        return theta
+        return self._reweight(*self._Tp_mesh(T_grid, p_grid), self._observable(observable)) / area
 
     def _log_weights(self, T: float, mu: float) -> np.ndarray:
         """
@@ -441,7 +500,93 @@ class MBARSurfaceAnalysis:
         lw -= lw.max()
         return lw - np.log(np.exp(lw).sum())
 
-    def most_probable_N(self, T_grid: np.ndarray, mu_grid: np.ndarray) -> np.ndarray:
+    def _reweight(self, T: np.ndarray, mu: np.ndarray, A: np.ndarray,
+                  max_elements: int = 2 ** 24) -> np.ndarray:
+        """
+        MBAR expectations of sample observables at many (T, mu) at once.
+
+        The reduced potential is linear in (U, N) -- u = beta*U + c*N with
+        c = -beta*mu + ln Lambda^3(T) -- so the log-weights of every sample
+        at a whole block of target states are one rank-2 outer product
+        (`_log_weights`, batched). Blocks are sized to keep the weight
+        matrix under `max_elements` entries.
+
+        Parameters
+        ----------
+        T, mu : numpy.ndarray
+            Target states, any (common) shape S.
+        A : numpy.ndarray
+            Observable per sample, shape (n_samples,) or (n_samples, m).
+        max_elements : int, optional
+            Largest weight-matrix block. Default 2**24 (128 MB of float64).
+
+        Returns
+        -------
+        numpy.ndarray
+            <A> at every target state, shape S (or S + (m,)).
+        """
+        T = np.asarray(T, dtype=float)
+        mu = np.broadcast_to(np.asarray(mu, dtype=float), T.shape).ravel()
+        T_flat = T.ravel()
+        T_unique, inverse = np.unique(T_flat, return_inverse=True)
+        log_lam3 = np.log([self.lambda_cubed_of_T(t) for t in T_unique])[inverse.ravel()]
+        beta = 1.0 / T_flat
+        c = -beta * mu + log_lam3
+        out = np.empty((T_flat.size,) + A.shape[1:])
+        block = max(1, max_elements // self.U_all.size)
+        for i in range(0, T_flat.size, block):
+            sl = slice(i, i + block)
+            lw = -(np.outer(beta[sl], self.U_all) + np.outer(c[sl], self.N_all)) - self._log_den
+            lw -= lw.max(axis=1, keepdims=True)
+            w = np.exp(lw, out=lw)
+            out[sl] = (w @ A) / w.sum(axis=1).reshape((-1,) + (1,) * (A.ndim - 1))
+        return out.reshape(T.shape + A.shape[1:])
+
+    def _most_probable_N_at(self, T: np.ndarray, mu: np.ndarray,
+                            observable: str = "N") -> np.ndarray:
+        """
+        argmax_N P(N) at every (T, mu) of two same-shaped arrays.
+
+        Parameters
+        ----------
+        T, mu : numpy.ndarray
+            Target states, common shape S.
+        observable : str, optional
+            ``'N'`` (all mobile particles, the default) or ``'N_ads'``
+            (adsorbed ones only; needs a run with ``adsorbed_cutoff``).
+
+        Returns
+        -------
+        numpy.ndarray
+            Integer array of shape S.
+        """
+        N_int = np.rint(self._observable(observable)).astype(int)
+        one_hot = np.zeros((N_int.size, N_int.max() + 1))
+        one_hot[np.arange(N_int.size), N_int] = 1.0
+        return np.argmax(self._reweight(T, mu, one_hot), axis=-1)
+
+    def _Tp_mesh(self, T_grid: np.ndarray, p_grid: np.ndarray
+                 ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        (T, mu) meshes, shape (len(T_grid), len(p_grid)), for a (T, p) mesh.
+
+        Parameters
+        ----------
+        T_grid, p_grid : numpy.ndarray
+            The mesh axes (p in the units `mu_from_p` expects).
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            ``(T_mesh, mu_mesh)``, each mu via `mu_from_p`.
+        """
+        mu_mesh = np.array([[self.mu_from_p(T, p) for p in p_grid] for T in T_grid],
+                           dtype=float).reshape(len(T_grid), len(p_grid))
+        T_mesh = np.broadcast_to(np.asarray(T_grid, dtype=float)[:, None], mu_mesh.shape)
+        return T_mesh, mu_mesh
+
+    def most_probable_N(self, T_grid: np.ndarray, mu_grid: np.ndarray,
+                        observable: str = "N") -> np.ndarray:
         """
         The most stable phase, labelled by N, on a (T, mu) mesh.
 
@@ -452,21 +597,20 @@ class MBARSurfaceAnalysis:
         ----------
         T_grid, mu_grid : numpy.ndarray
             The mesh axes.
+        observable : str, optional
+            ``'N'`` (all mobile particles, the default) or ``'N_ads'``
+            (adsorbed ones only; needs a run with ``adsorbed_cutoff``).
 
         Returns
         -------
         numpy.ndarray
             Integer array of shape (len(T_grid), len(mu_grid)).
         """
-        N_int = np.rint(self.N_all).astype(int)
-        out = np.empty((len(T_grid), len(mu_grid)), dtype=int)
-        for i, T in enumerate(T_grid):
-            for j, mu in enumerate(mu_grid):
-                pN = np.bincount(N_int, weights=np.exp(self._log_weights(T, mu)))
-                out[i, j] = int(np.argmax(pN))
-        return out
+        T_mesh, mu_mesh = np.meshgrid(T_grid, mu_grid, indexing="ij")
+        return self._most_probable_N_at(T_mesh, mu_mesh, observable)
 
-    def most_probable_N_Tp(self, T_grid: np.ndarray, p_grid: np.ndarray) -> np.ndarray:
+    def most_probable_N_Tp(self, T_grid: np.ndarray, p_grid: np.ndarray,
+                           observable: str = "N") -> np.ndarray:
         """
         `most_probable_N` on a (T, p) mesh ([ZSG] Fig. 3).
 
@@ -477,17 +621,16 @@ class MBARSurfaceAnalysis:
         ----------
         T_grid, p_grid : numpy.ndarray
             The mesh axes (p in the units `mu_from_p` expects).
+        observable : str, optional
+            ``'N'`` (all mobile particles, the default) or ``'N_ads'``
+            (adsorbed ones only; needs a run with ``adsorbed_cutoff``).
 
         Returns
         -------
         numpy.ndarray
             Integer array of shape (len(T_grid), len(p_grid)).
         """
-        out = np.empty((len(T_grid), len(p_grid)), dtype=int)
-        for i, T in enumerate(T_grid):
-            mus = np.array([self.mu_from_p(T, p) for p in p_grid])
-            out[i, :] = self.most_probable_N(np.array([T]), mus)[0]
-        return out
+        return self._most_probable_N_at(*self._Tp_mesh(T_grid, p_grid), observable)
 
     def lowest_energy_per_N(self) -> Tuple[np.ndarray, np.ndarray]:
         """

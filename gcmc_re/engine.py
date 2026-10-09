@@ -116,7 +116,7 @@ class ReplicaExchangeGCMC:
                  seed: int = 0, max_disp: float = 0.2, n_workers: int = 1,
                  lambda_cubed_of_T: Callable[[float], float] = lambda T: 1.0,
                  hmc_enabled: bool = False, hmc_leapfrog_steps: int = 10,
-                 hmc_dt: float = 0.005):
+                 hmc_dt: float = 0.005, adsorbed_cutoff: Optional[float] = None):
         """
         Construct the replica-exchange ladder.
 
@@ -156,6 +156,12 @@ class ReplicaExchangeGCMC:
         hmc_dt : float, optional
             Leapfrog integration timestep for HMC, passed to every
             `Replica`. Default is 0.005.
+        adsorbed_cutoff : float, optional
+            If given, every sample also records
+            ``system.n_adsorbed(adsorbed_cutoff)`` under ``'N_ads'``, so
+            the adsorbed count can be reweighted like N (see
+            `MBARSurfaceAnalysis`, ``observable='N_ads'``). Default None
+            (not recorded).
 
         Raises
         ------
@@ -176,6 +182,7 @@ class ReplicaExchangeGCMC:
         self.shape = self.mu_grid.shape
         self.n_workers = n_workers
         self.lambda_cubed_of_T = lambda_cubed_of_T  # also read by MBARSurfaceAnalysis
+        self.adsorbed_cutoff = adsorbed_cutoff
         self._executor: Optional[ProcessPoolExecutor] = None
 
         master_rng = np.random.default_rng(seed)
@@ -190,7 +197,8 @@ class ReplicaExchangeGCMC:
                                             hmc_enabled=hmc_enabled,
                                             hmc_leapfrog_steps=hmc_leapfrog_steps,
                                             hmc_dt=hmc_dt)
-            self.samples[(it, imu)] = {'U': [], 'N': []}
+            self.samples[(it, imu)] = ({'U': [], 'N': []} if adsorbed_cutoff is None
+                                       else {'U': [], 'N': [], 'N_ads': []})
         # drawn after the replicas' seeds, so their streams are unchanged by it
         self.rng = np.random.default_rng(master_rng.integers(0, 2 ** 62))
         self.swap_stats = {t: [0, 0] for t in SWAP_TYPES}  # type -> [attempts, accepts]
@@ -501,6 +509,8 @@ class ReplicaExchangeGCMC:
                 for key, r in self.grid.items():
                     self.samples[key]['U'].append(r.energy)
                     self.samples[key]['N'].append(r.system.n)
+                    if self.adsorbed_cutoff is not None:
+                        self.samples[key]['N_ads'].append(r.system.n_adsorbed(self.adsorbed_cutoff))
 
             if trajectory_dir is not None and cycle % trajectory_every == 0:
                 for key, r in self.grid.items():
@@ -644,12 +654,14 @@ class ReplicaExchangeGCMC:
                     break
             self._local_call('regc_local_block', gc_flags=flags, first_step=first,
                              record_every=record_every, burn_in_steps=burn_in_steps,
-                             mode=diffusion, n=diffusion_steps, **diffusion_kwargs)
+                             adsorbed_cutoff=self.adsorbed_cutoff, mode=diffusion, n=diffusion_steps, **diffusion_kwargs)
             step = first + len(flags) - 1
             for key, r in self.grid.items():
-                for U, N in r.block_samples:
+                for U, N, N_ads in r.block_samples:
                     self.samples[key]['U'].append(U)
                     self.samples[key]['N'].append(N)
+                    if N_ads is not None:
+                        self.samples[key]['N_ads'].append(N_ads)
 
             if trajectory_dir is not None and step % trajectory_every == 0:
                 for key, r in self.grid.items():
@@ -659,6 +671,8 @@ class ReplicaExchangeGCMC:
                 mean_n = np.mean([r.system.n for r in self.grid.values()])
                 print(f"step {step:7d}/{n_steps} | mean N across grid = {mean_n:6.2f}")
 
+            # check if a convergence check is set and terminate run if reached and at least the burn_in steps 
+            # have already been performed
             if (convergence_every is not None and step > burn_in_steps
                     and step % convergence_every == 0):
                 n_now = len(next(iter(self.samples.values()))['U'])
@@ -777,6 +791,9 @@ class ReplicaExchangeGCMC:
         for key in mine:
             if not np.allclose(np.asarray(mine[key]), np.asarray(theirs[key]), rtol=1e-12, atol=1e-12):
                 raise ValueError(f"checkpoint {path}: '{key}' differs from this simulation's")
+        if self.adsorbed_cutoff is not None and any('N_ads' not in v for v in st["samples"].values()):
+            raise ValueError(f"checkpoint {path} has no 'N_ads' samples; it was written "
+                             f"without adsorbed_cutoff and can't be continued with it")
         self.grid, self.samples = st["grid"], st["samples"]
         self.swap_stats, self.convergence_history = st["swap_stats"], st["convergence_history"]
         self.rng.bit_generator.state = st["rng_state"]
