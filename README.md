@@ -49,7 +49,9 @@ alone.
 ### Command line
 
 The install also provides `gcmc-re-run config.yaml`: the config-driven
-pipeline (structure file -> REGC -> MBAR -> (T, p) phase diagram), see
+pipeline (structure -> REGC -> MBAR -> (T, p) phase diagram) with any of
+the package's calculators (LAMMPS included), checkpoints and resubmission;
+see [Config-file-driven runs](#config-file-driven-runs-runnerpy) and
 `examples/pd111_emt_example.yaml`.
 
 ## Layout
@@ -318,8 +320,8 @@ look like ~10^55 bar in earlier versions of these examples. With it,
 1e-4 to 1e6 atm H2 at 350-450 K is mu_H ~ +0.3 to +0.75 eV, inside the
 mu_H windows examples 05-08 simulate (see
 `examples/06_real_units_phase_diagram.py`). The YAML runner evaluates
-e_atom with the configured calculator unless `diatomic_reservoir.e_atom_eV`
-is given.
+e_atom with the configured calculator unless `reservoir.e_atom_eV` is
+given.
 
 ## A general (T, mu) -> (T, p) conversion for `MBARSurfaceAnalysis`
 
@@ -562,33 +564,49 @@ a bulk cube is periodic in all three axes, a slab only in x, y).
 
 ## Config-file-driven runs (`runner.py`)
 
-For running a real structure end-to-end without writing Python each time:
-`gcmc_re.runner.run_from_config` takes one config dict (or load one from a
-JSON or YAML file with `load_config`) specifying an ASE-readable structure
-file, the gas species, the (T, mu) replica ladder, and the (T, p) mesh for
-the final phase diagram, and does everything -- read the structure, run
-GCMC (with optional trajectory saving), compute D0 self-consistently (for
-EMT; other calculators need `diatomic_reservoir.D0_eV` given explicitly)
-and the isolated-atom energy e_atom (with the configured calculator, unless
-`diatomic_reservoir.e_atom_eV` is given), run MBAR, and save the plot plus
-raw `.npz` data. See
-`examples/09_config_driven_run.py` (the CLI wrapper: `python
-09_config_driven_run.py your_config.yaml`) and
-`examples/pd111_emt_example.yaml` (an annotated example config; see its
-own comments for why Pd+EMT+H gives unphysically large coverage) for the
-full schema. A relative `structure.file` is resolved against the config
-file's directory. The structure's cell must be orthogonal
-(diagonal) -- build one via e.g. `ase.build.fcc111(..., orthogonal=True)`
-if you don't have one already; the runner raises a clear error otherwise.
+`gcmc-re-run config.yaml` (or `gcmc_re.runner.run_from_config` on a dict,
+`load_config` for a YAML/JSON file) runs the whole pipeline of example 13
+from one config file: structure -> REGC -> MBAR -> (T, p) phase diagram.
+Two annotated configs cover every key:
+`examples/pd111_emt_example.yaml` (small, EMT) and
+`examples/fe100_h_eam_example.yaml` (Fe(100) + H with the Wen EAM through
+LAMMPS, checkpointed: the setup of example 13).
 
-One YAML gotcha worth knowing if you write your own config: PyYAML only
-recognizes scientific notation as a float when the exponent has an
-explicit sign -- `1.0e-4` parses fine, but `1.0e6` (no `+`) silently parses
-as the *string* `"1.0e6"`. The runner defensively re-parses the fields most
-likely to hit this (pressures, D0) using Python's own `float()` (which has
-no such restriction), so this specific mistake self-corrects rather than
-causing a confusing failure -- but it's simplest to just always write the
-sign (`1.0e+6`) in fields you add yourself.
+| Section | What it sets |
+|---|---|
+| `structure` | `file` (any ASE-readable slab) or `build` (an `ase.build` surface function; `a: auto` fits the lattice constant to the potential); `n_frozen_layers` (the rest are displaceable), `headroom_angstrom`. Laid out by `slab_geometry_from_atoms`, so rectangular and oblique (hexagonal) cells both work. |
+| `gas` | `species` (one, or a list), `mass_amu`, `insertion_z_range_above_surface`, `composition` (feed mole fractions for several species). |
+| `calculator` | `EMT`, `LJ`, `PairLJ` (`pair_params: [[a, b, eps, sigma], ...]`), `LAMMPS` (`potential: *.eam.fs` or `pair_style`/`pair_coeff` + `species`, `min_distance`), `ASE` (`class: ase.calculators.eam.EAM`, `kwargs`). |
+| `reservoir` | `type: diatomic` (`d0: self \| experimental \| <eV>`, `e_atom_eV`, spectroscopic constants) or `monatomic`; keyed by species for several. `d0: self` and the default `e_atom_eV` evaluate the potential itself. |
+| `replica_exchange` | `temperatures_K` plus `pressures` + `pressure_unit` (ladder from the reservoir) or `mu_eV`; `scheme: regc` (`n_steps`, `x0`, `diffusion: mc \| mc_moves \| hmc \| md`, `md:`, `hmc:`, convergence, `displace_substrate`, `swap_types`) or `sweep`; `adsorbed_cutoff` (records `N_ads`), `seed`, `n_workers` (or `auto`). |
+| `checkpoint` | regc only: `chunk`, `time_limit_s`. Runs through `run_with_checkpoints`: `--resume`, `--time-limit` (exit code 75 = resubmit). |
+| `trajectory` | `save`, `directory`, `every`. |
+| `phase_diagram` | T and p mesh (`pressure_unit`), `observable: N \| N_ads \| N_<species>`, `coverage_per: area \| surface_atom \| none`, `most_probable`, `discard`. Optional: without it the run only samples. |
+| `output` | `directory`, `plot_filename`, `save_raw_data`. |
+
+```
+gcmc-re-run config.yaml --check          # build and print the setup and the mu ladder; no sampling
+gcmc-re-run config.yaml --workers 36     # run, then analyse
+gcmc-re-run config.yaml --resume --time-limit 85000   # continue a checkpointed run
+gcmc-re-run config.yaml --analyze-only   # phase diagram from the saved samples, no calculator needed
+```
+
+Every run writes `samples.npz` and `run_metadata.json` (the ladder, the
+reservoirs and the cell area) to `output.directory`, so the analysis can be
+redone with other `phase_diagram` settings. A resumed run must match the
+saved setup; `n_steps` may grow. Unknown keys are an error, so typos fail
+loudly. Relative structure and potential paths are resolved against the
+config file's directory. Configs written for the earlier runner
+(`diatomic_reservoir`, `p_min_atm`/`p_max_atm`, the scheme inferred from
+`n_cycles`/`n_steps`) still run, with one change: positions now follow
+`slab_geometry_from_atoms`, with `headroom_angstrom` instead of
+`extra_vacuum_angstrom`, and insertions use the whole box unless
+`insertion_z_range_above_surface` is given.
+
+YAML gotcha: PyYAML reads `1.0e-4` as a float but `1.0e6` (no sign on the
+exponent) as the *string* `"1.0e6"`. The runner coerces every numeric field
+with Python's `float()`, so this corrects itself, but writing the sign
+(`1.0e+6`) is safest.
 
 ## Extending
 

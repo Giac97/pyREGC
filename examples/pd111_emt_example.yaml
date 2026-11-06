@@ -1,67 +1,94 @@
-# Example config for gcmc_re.runner -- Pd(111) + H via EMT.
+# Example config for gcmc_re.runner (gcmc-re-run): Pd(111) + H via EMT.
 #
-# Read examples/05-08 first. The runner maps p(H2) to mu_H with EMT's own
-# H2 dissociation energy D0 and EMT's own isolated-H energy e_atom (+3.21 eV,
-# the zero of every GCMC energy difference); 1e-4 to 1e6 atm at 350-450 K is
-# then mu_H ~ +0.3 to +0.75 eV, inside the mu_eV grid below. Expect large,
-# unphysical H uptake (several H per surface Pd): EMT's H parameters are
-# "not for any serious use", whatever the metal. Use a real Pd-H EAM/MLIP for
-# physical results, and check that coverage has plateaued before trusting it.
+# Run with:   gcmc-re-run pd111_emt_example.yaml            (or python 09_config_driven_run.py ...)
+# First:      gcmc-re-run pd111_emt_example.yaml --check    (setup + mu ladder, no sampling)
+# Re-analyse: gcmc-re-run pd111_emt_example.yaml --analyze-only
 #
-# Run with:  python 09_config_driven_run.py pd111_emt_example.yaml
+# Read examples/05-08 first. The H2 reservoir uses EMT's own H2 dissociation
+# energy D0 and EMT's own isolated-H energy e_atom (+3.21 eV, the zero of every
+# GCMC energy difference), so 1e-4 to 1e6 atm at 350-450 K is mu_H ~ +0.3 to
+# +0.75 eV. Expect large, unphysical H uptake (several H per surface Pd): EMT's
+# H parameters are "not for any serious use", whatever the metal. Use a real
+# Pd-H EAM/MLIP (calculator.type LAMMPS or ASE, see fe100_h_eam_example.yaml)
+# for physical results, and check that coverage has plateaued before trusting it.
+#
+# Unknown keys are an error. Write exponents with a sign (1.0e+6): PyYAML reads
+# a bare 1.0e6 as a string (the runner corrects it, but don't rely on that).
 
 structure:
-  file: data/pd111_slab.xyz   # relative paths are resolved against this file's directory
-  # extra_vacuum_angstrom: 0.0   # add headroom above the file's own cell if needed
+  file: data/pd111_slab.xyz     # any ASE-readable slab; relative to this file's directory
+  # build:                      # ...or build one with an ase.build surface function:
+  #   surface: fcc111           #   fcc111, fcc100, bcc110, bcc100, hcp0001, ...
+  #   symbol: Pd
+  #   size: [2, 2, 4]
+  #   a: auto                   #   lattice constant fitted to the potential (fcc/bcc), or a number
+  #   orthogonal: true          #   any other keyword goes to the ase.build function
+  # n_frozen_layers: 2          # bottom layers rigid, the rest displaceable (default: all rigid)
+  headroom_angstrom: 5.0        # space for the gas above the topmost atom
 
 gas:
-  species: H
-  # mass_amu: null                        # auto-looked-up from ase.data if omitted
-  insertion_z_range_above_surface: [1.0, 3.0]   # Angstrom above the structure's own top layer
+  species: H                    # or a list, e.g. [O, Cl], with composition: {O: 0.999, Cl: 0.001}
+  # mass_amu: 1.008             # default: ASE's tables
+  insertion_z_range_above_surface: [1.0, 3.0]   # A above the top atom; default: the whole box
 
 calculator:
   type: EMT
-  # For quick pipeline testing without EMT's cost, use instead:
-  #   type: LJ
-  #   lj_sigma: 1.0
-  #   lj_epsilon: 0.3
-  #   lj_r_cut: 3.0
-  # (LJCalculator ignores the frozen substrate entirely -- ase structure
-  # atoms become inert placeholders -- so this is for exercising the
-  # pipeline's mechanics only, never for physically meaningful results.)
+  # Other types (see fe100_h_eam_example.yaml for LAMMPS):
+  #   type: LAMMPS, potential: FeH_Wen.eam.fs           (or pair_style + pair_coeff + species)
+  #   type: ASE, class: ase.calculators.eam.EAM, kwargs: {potential: FeH_Wen.eam.fs}
+  #   type: PairLJ, pair_params: [[Pd, H, 0.1, 2.0], [H, H, 0.01, 1.0]]   ([a, b, eps_eV, sigma_A])
+  #   type: LJ, lj_sigma: 1.0, lj_epsilon: 0.3, lj_r_cut: 3.0
+  #     (LJ ignores the slab entirely: for exercising the pipeline only)
+
+reservoir:
+  type: diatomic                # H2 gas exchanging H atoms; or monatomic
+  d0: self                      # D0 from the potential's own H2; or experimental (4.478 eV), or a number
+  # e_atom_eV: 3.21             # default: evaluated with the calculator
+  # bond_length_angstrom: 0.741          # default for H; required for other elements
+  # vibrational_wavenumber_cm: 4401.2    # default for H; required for other elements
+  # symmetry_number: 2
 
 replica_exchange:
   temperatures_K: [350, 400, 450]
-  mu_eV: [-0.5, 0.0, 0.3, 0.6, 0.9, 1.2]   # brackets mu_H ~ 0.3-0.75 eV of 1e-4..1e6 atm
-  n_cycles: 300
-  sweeps_per_cycle: 30
-  burn_in_cycles: 60
-  record_every: 3
-  exchange_every: 1
+  pressures: [1.0e-4, 1.0e-2, 1.0, 1.0e+2, 1.0e+4, 1.0e+6]   # H2 pressure ladder...
+  pressure_unit: atm                                        # Pa, bar or atm
+  # mu_eV: [0.3, 0.45, 0.6, 0.75]   # ...or explicit chemical potentials instead of pressures
+  scheme: regc                  # [ZSG] REGC loop; or sweep (n_cycles, sweeps_per_cycle, ...)
+  n_steps: 3000
+  x0: 0.9                       # probability of a GC step (else a replica swap)
+  diffusion: mc                 # mc, mc_moves, hmc or md
+  diffusion_steps: 2
+  record_every: 10
+  burn_in_steps: 500
+  # convergence_every: 1000     # stop early when rho(u) stops changing
+  # convergence_tol: 0.05
+  # adsorbed_cutoff: 2.0        # also record N_ads (H within 2 A of a Pd atom)
+  # md: {timestep_fs: 0.5, thermostat: bussi, taut_fs: 20.0}     # for diffusion: md
+  # hmc: {leapfrog_steps: 10, timestep_fs: 0.5}                  # for diffusion: hmc
   max_disp: 0.3
   seed: 42
-  n_workers: 1   # bump this on a multi-core machine; see engine.py's parallelization notes
+  n_workers: 1                  # or auto (all cores); --workers on the command line overrides
 
 trajectory:
   save: true
-  directory: trajectories   # written under output.directory
-  every: 30                # cycles; omit to default to record_every
+  directory: trajectories       # under output.directory
+  every: 300                    # steps; default record_every
 
-diatomic_reservoir:
-  # D0_eV: null              # omit (or set null) to compute self-consistently via EMT
-  # e_atom_eV: null          # isolated-atom energy; omit to evaluate it with the calculator
-  bond_length_angstrom: 0.741
-  vibrational_wavenumber_cm: 4401.2
-  symmetry_number: 2
-  # mass_molecule_amu: null  # defaults to 2 * gas.mass_amu
+# checkpoint:                   # long runs: chunks + checkpoint.pkl; --resume, --time-limit
+#   chunk: 1000
 
 phase_diagram:
   T_min_K: 350
   T_max_K: 450
   n_T: 12
-  p_min_atm: 1.0e-4
-  p_max_atm: 1.0e+6
+  p_min: 1.0e-4
+  p_max: 1.0e+6
   n_p: 30
+  pressure_unit: atm            # default: the ladder's unit
+  observable: N                 # N, N_ads (needs adsorbed_cutoff) or N_<species>
+  coverage_per: surface_atom    # area (per A^2), surface_atom or none
+  most_probable: true           # also plot the most probable N ([ZSG] Fig. 3)
+  # discard: 0.2                # fraction of each replica's samples dropped as equilibration
 
 output:
   directory: output_pd111_emt

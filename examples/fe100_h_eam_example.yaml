@@ -1,0 +1,75 @@
+# H on Fe(100) with the Wen (2021) Fe-H EAM through LAMMPS: the setup of
+# examples/13_fe_h_eam_surface.py as a config file. Needs the LAMMPS Python module.
+#
+#   gcmc-re-run fe100_h_eam_example.yaml --check                     # setup, D0, mu ladder
+#   gcmc-re-run fe100_h_eam_example.yaml --workers 36                # run + analysis
+#   gcmc-re-run fe100_h_eam_example.yaml --resume --time-limit 85000 # batch jobs: exit 75 = resubmit
+#   gcmc-re-run fe100_h_eam_example.yaml --analyze-only              # re-analyse saved samples
+#
+# Potential: M. Wen, Comput. Mater. Sci. 197, 110640 (2021): a = 2.855 A, H2
+# r0 = 0.739 A, D0 = 4.46 eV, so d0: self is appropriate. For a GRACE/ACE
+# model use pair_style/pair_coeff (and min_distance, a hard core keeping GCMC
+# insertions out of off-training-set configurations).
+
+structure:
+  build:
+    surface: bcc100
+    symbol: Fe
+    size: [3, 3, 4]
+    a: auto                     # bcc lattice constant of the potential itself
+    orthogonal: true
+  n_frozen_layers: 2            # bottom 2 rigid, top 2 displaceable (MD/HMC move them)
+  headroom_angstrom: 5.0        # H lives in z in (0, top + 5 A]: subsurface sites included
+
+gas:
+  species: H
+  mass_amu: 1.008
+
+calculator:
+  type: LAMMPS
+  potential: FeH_Wen.eam.fs     # *.eam.fs / *.eam.alloy: pair style inferred
+  species: [Fe, H]              # LAMMPS atom-type order
+  # pair_style: grace/fs        # ...or any pair style (needs a LAMMPS built with it):
+  # pair_coeff: "* * model.yaml Fe H"
+  # min_distance: 0.6
+
+reservoir:
+  type: diatomic
+  d0: self                      # or experimental, for potentials with a poor H2
+
+replica_exchange:
+  temperatures_K: [300, 372.7, 463.1, 575.4, 714.9, 900]
+  pressures: [1.0e-8, 2.5e-6, 6.3e-4, 0.158, 39.8, 1.0e+4]
+  pressure_unit: bar
+  scheme: regc
+  n_steps: 20000
+  x0: 0.9
+  diffusion: md                 # Bussi NVT MD, native in LAMMPS; or hmc
+  diffusion_steps: 40
+  md: {timestep_fs: 0.5, thermostat: bussi, taut_fs: 20.0}
+  hmc: {leapfrog_steps: 10, timestep_fs: 0.5}     # used with diffusion: hmc
+  record_every: 10
+  convergence_every: 2000
+  convergence_tol: 0.05
+  adsorbed_cutoff: 2.5          # record N_ads: H within 2.5 A of an Fe atom
+  max_disp: 0.3
+  seed: 0
+  n_workers: auto
+
+checkpoint:
+  chunk: 1000                   # samples.npz + checkpoint.pkl every 1000 steps
+
+phase_diagram:
+  T_min_K: 300
+  T_max_K: 900
+  n_T: 120
+  p_min: 1.0e-12
+  p_max: 1.0e+4
+  n_p: 150
+  observable: N_ads
+  coverage_per: surface_atom    # H per surface Fe
+  most_probable: true
+  discard: 0.2
+
+output:
+  directory: output_fe100_h_eam

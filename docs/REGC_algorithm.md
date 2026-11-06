@@ -311,9 +311,11 @@ Each move satisfies detailed balance, and a fixed-order composition of such move
 the paper's protocol; §4.2 is usually more efficient for cheap force fields.
 
 The YAML runner selects between them with `replica_exchange.scheme: sweep | regc`. The
-`regc` scheme reads `n_steps`, `x0`, `diffusion`, `diffusion_steps`, `record_every`,
-`burn_in_steps`, `convergence_every`, `convergence_tol`, and an optional `md:` block
-(`timestep_fs`, `thermostat`, `taut_fs`, `friction_per_fs`).
+`regc` scheme reads `n_steps`, `x0`, `diffusion` (`mc`, `mc_moves`, `hmc`, `md`),
+`diffusion_steps`, `record_every`, `burn_in_steps`, `convergence_every`, `convergence_tol`,
+`swap_types`, `displace_substrate`, an optional `md:` block (`timestep_fs`, `thermostat`,
+`taut_fs`, `friction_per_fs`) and an `hmc:` block (`leapfrog_steps`, `timestep_fs`). With a
+`checkpoint:` section it runs through `run_with_checkpoints` (resumable, wall-time aware).
 
 ---
 

@@ -8,7 +8,8 @@ Read examples/05, 06 and 07 first. The runner maps p(H2) to mu_H with
 EMT's own H2 dissociation energy D0 AND EMT's own isolated-H energy e_atom
 (+3.21 eV, the zero of every GCMC energy difference; see
 gcmc_re/reservoir.py). With both, 1e-4 to 1e6 atm at 350-450 K corresponds
-to mu_H ~ +0.3 to +0.75 eV, inside the simulated mu_H grid.
+to mu_H ~ +0.3 to +0.75 eV; the replica ladder is laid directly on that
+pressure window (replica_exchange.pressures).
 
 What to expect: large H uptake across the whole window -- on this small
 2x2 Pd(111) cell, roughly 10-25 H atoms, i.e. several H per surface Pd,
@@ -34,15 +35,20 @@ from gcmc_re.runner import run_from_config
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 config = {
-    "structure": {"file": os.path.join(HERE, "data", "pd111_slab.xyz")},
+    "structure": {"file": os.path.join(HERE, "data", "pd111_slab.xyz"),
+                  "headroom_angstrom": 5.0},
     "gas": {
         "species": "H",
         "insertion_z_range_above_surface": [1.0, 3.0],  # Angstrom above the top Pd layer
     },
     "calculator": {"type": "EMT"},
+    "reservoir": {"type": "diatomic", "d0": "self"},  # D0 and e_atom from EMT itself (printed below)
     "replica_exchange": {
         "temperatures_K": [350.0, 450.0],
-        "mu_eV": [-0.5, 0.0, 0.3, 0.6, 0.9, 1.2],  # brackets mu_H ~ 0.3-0.75 eV of 1e-4..1e6 atm
+        # H2 pressure ladder: mu_H from the reservoir at every (T, p) grid point
+        "pressures": [1.0e-4, 1.0e-2, 1.0, 1.0e+2, 1.0e+4, 1.0e+6],
+        "pressure_unit": "atm",
+        "scheme": "sweep",
         "n_cycles": 80,
         "sweeps_per_cycle": 15,
         "burn_in_cycles": 20,
@@ -51,10 +57,10 @@ config = {
         "n_workers": 1,  # bump this on a multi-core machine
     },
     "trajectory": {"save": True, "directory": "trajectories", "every": 15},
-    "diatomic_reservoir": {},  # D0 and e_atom computed self-consistently via EMT (printed below)
     "phase_diagram": {
         "T_min_K": 350, "T_max_K": 450, "n_T": 4,
-        "p_min_atm": 1.0e-4, "p_max_atm": 1.0e6, "n_p": 8,
+        "p_min": 1.0e-4, "p_max": 1.0e+6, "n_p": 8, "pressure_unit": "atm",
+        "coverage_per": "surface_atom",
     },
     "output": {"directory": os.path.join(HERE, "output_08_pd_emt")},
 }
@@ -64,7 +70,7 @@ if __name__ == "__main__":
 
     theta = result["theta_grid"]
     print(f"\nCoverage range across the whole (T, p) grid: "
-          f"{theta.min():.3e} to {theta.max():.3e} particles/Angstrom^2")
+          f"{theta.min():.3f} to {theta.max():.3f} H per surface Pd")
     print(f"\nSelf-consistent D0 (EMT's own H2): {result['D0_eV']:.4f} eV; "
           f"EMT isolated-H energy (zero of the mu scale): {result['e_atom_eV']:.4f} eV")
     print("Outputs (plot, raw .npz, trajectories) are in", config["output"]["directory"])

@@ -10,7 +10,10 @@ import numpy as np
 
 def plot_phase_diagram(T_grid: np.ndarray, p_grid: np.ndarray, theta: np.ndarray,
                         coexistence: Optional[List[Tuple[float, float]]] = None,
-                        save_path: str = "phase_diagram.png") -> None:
+                        save_path: str = "phase_diagram.png",
+                        colorbar_label: str = "coverage (particles / area)",
+                        xlabel: str = "pressure p", ylabel: str = "temperature T",
+                        title: str = "Reweighted surface coverage $\\theta(T, p)$") -> None:
     """
     Plot and save a coverage(T, p) heatmap.
 
@@ -43,6 +46,12 @@ def plot_phase_diagram(T_grid: np.ndarray, p_grid: np.ndarray, theta: np.ndarray
         overlay).
     save_path : str, optional
         Path to save the figure to. Default is ``"phase_diagram.png"``.
+    colorbar_label : str, optional
+        Colorbar label. Default ``"coverage (particles / area)"``.
+    xlabel, ylabel : str, optional
+        Axis labels. Defaults ``"pressure p"`` and ``"temperature T"``.
+    title : str, optional
+        Plot title. Default: reweighted surface coverage theta(T, p).
 
     Returns
     -------
@@ -61,10 +70,10 @@ def plot_phase_diagram(T_grid: np.ndarray, p_grid: np.ndarray, theta: np.ndarray
     mesh = ax.pcolormesh(log_p, T_grid, theta, shading='auto', cmap='viridis')
     ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True, nbins=8))
     ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, pos: f"$10^{{{x:.0f}}}$"))
-    ax.set_xlabel('pressure p')
-    ax.set_ylabel('temperature T')
-    ax.set_title('Reweighted surface coverage $\\theta(T, p)$')
-    fig.colorbar(mesh, ax=ax, label='coverage (particles / area)')
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    fig.colorbar(mesh, ax=ax, label=colorbar_label)
 
     if coexistence:
         Tc, pc = zip(*coexistence)
@@ -74,4 +83,5 @@ def plot_phase_diagram(T_grid: np.ndarray, p_grid: np.ndarray, theta: np.ndarray
 
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
+    plt.close(fig)
     print(f"Saved phase diagram to {save_path}")
