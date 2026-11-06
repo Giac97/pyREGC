@@ -14,11 +14,11 @@ potential, sample I/O and checkpoints -- checked against exact results:
 import numpy as np
 import pytest
 
-from gcmc_re import (LJCalculator, PairLJCalculator, ReplicaExchangeGCMC, SlabSystem,
+from regc import (LJCalculator, PairLJCalculator, ReplicaExchangeGCMC, SlabSystem,
                      SpeciesLambdaCubed, ThermalWavelengthCubed, ThermoState, load_samples,
                      save_samples)
-from gcmc_re.calculators import Calculator
-from gcmc_re.replica import Replica
+from regc.calculators import Calculator
+from regc.replica import Replica
 
 SPECIES = ("O", "Cl")
 
@@ -137,7 +137,7 @@ def test_ideal_gas_ladder_with_species_and_T_dependent_lambda():
         np.testing.assert_allclose(got, expected, rtol=0.08, atol=0.1)
         assert np.array_equal(np.sum(smp["N_s"], axis=1), smp["N"])
 
-    from gcmc_re import MBARSurfaceAnalysis
+    from regc import MBARSurfaceAnalysis
     pytest.importorskip("pymbar")
     an = MBARSurfaceAnalysis(sim)
     T, mu = 1.08, np.array([-1.8, -2.2])  # off the grid
@@ -205,7 +205,7 @@ def test_one_element_species_list_is_the_single_species_code_path():
 # ------------------------------------------------------- I/O and checkpoints
 def test_save_load_samples_roundtrip(tmp_path):
     pytest.importorskip("pymbar")
-    from gcmc_re import MBARSurfaceAnalysis
+    from regc import MBARSurfaceAnalysis
     lam = SpeciesLambdaCubed([ThermalWavelengthCubed(16.0), ThermalWavelengthCubed(35.45)])
     T = [1.0, 1.4]
     mus = np.array([[-2.0, -2.5], [-1.0, -1.5]]) + np.log(lam(1.2))

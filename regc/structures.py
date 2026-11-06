@@ -40,7 +40,7 @@ def cubic_lattice_constant(ase_calculator, symbol: str, crystal: str = "bcc",
     ----------
     ase_calculator : ase.calculators.calculator.Calculator
         The potential (e.g. ASE's EAM, or
-        `gcmc_re.lammps_backend.lammps_ase_calculator`).
+        `regc.lammps_backend.lammps_ase_calculator`).
     symbol : str
         Element symbol.
     crystal : {'bcc', 'fcc', 'sc'}, optional

@@ -16,7 +16,7 @@ relax toward it -- not just "doesn't crash".
 import numpy as np
 import pytest
 
-from gcmc_re import LJCalculator, LJSystem, ThermoState, Replica
+from regc import LJCalculator, LJSystem, ThermoState, Replica
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +41,7 @@ def test_full_configuration_orders_frozen_substrate_mobile():
 def test_generic_displace_substrate_dU_energy_bookkeeping_stays_exact():
     ase = pytest.importorskip("ase", reason="pip install ase to run this test")
     from ase.calculators.lj import LennardJones as ASELennardJones
-    from gcmc_re import ASECalculatorAdapter
+    from regc import ASECalculatorAdapter
 
     calc = ASECalculatorAdapter(
         ASELennardJones(sigma=1.0, epsilon=1.0, rc=2.5, smooth=False, shift=True),
@@ -77,7 +77,7 @@ def test_substrate_masses_and_mass_of_species():
 def test_ase_calculator_adapter_substrate_forces_match_numerical_gradient():
     ase = pytest.importorskip("ase", reason="pip install ase to run this test")
     from ase.calculators.lj import LennardJones as ASELennardJones
-    from gcmc_re import ASECalculatorAdapter
+    from regc import ASECalculatorAdapter
 
     calc = ASECalculatorAdapter(
         ASELennardJones(sigma=1.0, epsilon=1.0, rc=2.5, smooth=False, shift=True),
@@ -127,7 +127,7 @@ def test_lj_calculator_with_substrate_and_hmc_fails_clearly_not_silently():
 def _stretched_two_atom_system(r_start, mass=1.0):
     ase = pytest.importorskip("ase", reason="pip install ase to run this test")
     from ase.calculators.lj import LennardJones as ASELennardJones
-    from gcmc_re import ASECalculatorAdapter
+    from regc import ASECalculatorAdapter
 
     calc = ASECalculatorAdapter(
         ASELennardJones(sigma=1.0, epsilon=1.0, rc=2.5, smooth=False, shift=True),
@@ -176,11 +176,11 @@ def test_plain_mc_substrate_moves_also_relax_stretched_substrate():
 # Engine-level wiring: p_displace_substrate reaches Replica.sweep via run()
 # ---------------------------------------------------------------------------
 def test_engine_run_forwards_p_displace_substrate():
-    from gcmc_re import ReplicaExchangeGCMC
+    from regc import ReplicaExchangeGCMC
 
     ase = pytest.importorskip("ase", reason="pip install ase to run this test")
     from ase.calculators.lj import LennardJones as ASELennardJones
-    from gcmc_re import ASECalculatorAdapter
+    from regc import ASECalculatorAdapter
 
     def make_system(rng):
         calc = ASECalculatorAdapter(

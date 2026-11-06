@@ -121,7 +121,7 @@ class MBARSurfaceAnalysis:
 
         The simplest way to get pressures right in real units is to pass the
         gas reservoir the simulation's mu grid came from (`reservoir`, a
-        `gcmc_re.reservoir.Reservoir`): it sets `mu_of_Tp`/`p_of_Tmu`, with
+        `regc.reservoir.Reservoir`): it sets `mu_of_Tp`/`p_of_Tmu`, with
         pressures in `pressure_unit`. The lower-level options below remain
         for other conventions.
 
@@ -141,7 +141,7 @@ class MBARSurfaceAnalysis:
 
         Parameters
         ----------
-        sim : ReplicaExchangeGCMC or gcmc_re.io.SampleSet
+        sim : ReplicaExchangeGCMC or regc.io.SampleSet
             The finished simulation (or its saved samples, `load_samples`);
             must have recorded samples (`sim.samples[key]['U'/'N']`) for
             every grid point.
@@ -167,7 +167,7 @@ class MBARSurfaceAnalysis:
             reduced potential as ``N * ln(Lambda^3(T))`` (see `_u_of_state`).
             Default is None, which uses ``sim.lambda_cubed_of_T`` if the
             simulation has one, else Lambda^3 = 1 (reduced units).
-        reservoir : gcmc_re.reservoir.Reservoir, optional
+        reservoir : regc.reservoir.Reservoir, optional
             Sets `mu_of_Tp` and `p_of_Tmu` (unless given explicitly) from
             `Reservoir.analysis_functions`. Default None.
         pressure_unit : str, optional

@@ -9,7 +9,7 @@ touching engine.py.
 import numpy as np
 import pytest
 
-from gcmc_re import LJCalculator, LJSystem, ReplicaExchangeGCMC
+from regc import LJCalculator, LJSystem, ReplicaExchangeGCMC
 
 
 def make_bulk(rng: np.random.Generator) -> LJSystem:
@@ -72,7 +72,7 @@ def test_lambda_cubed_of_T_is_applied_per_temperature():
 
 
 def test_insertion_z_range_restricts_sampling_and_volume():
-    from gcmc_re import SlabLJSystem
+    from regc import SlabLJSystem
 
     system = SlabLJSystem(Lx=10.0, Ly=10.0, Lz=20.0, calculator=LJCalculator(),
                            insertion_z_range=(5.0, 8.0))
@@ -85,7 +85,7 @@ def test_insertion_z_range_restricts_sampling_and_volume():
 
 
 def test_insertion_z_range_defaults_to_full_box():
-    from gcmc_re import SlabLJSystem
+    from regc import SlabLJSystem
 
     system = SlabLJSystem(Lx=5.0, Ly=5.0, Lz=12.0, calculator=LJCalculator())
     assert system.insertion_z_range == (0.0, 12.0)
@@ -104,7 +104,7 @@ def test_parallel_emt_via_factory_does_not_reproduce_the_pickling_bug():
     from ase.build import fcc111
     from ase.calculators.emt import EMT
 
-    from gcmc_re import ASECalculatorAdapter, SlabLJSystem, kelvin_to_eV
+    from regc import ASECalculatorAdapter, SlabLJSystem, kelvin_to_eV
 
     slab = fcc111("Pd", size=(2, 2, 2), vacuum=6.0, orthogonal=True, periodic=False)
     Lx, Ly, Lz = slab.cell[0, 0], slab.cell[1, 1], slab.cell[2, 2]

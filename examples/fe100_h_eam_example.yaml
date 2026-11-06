@@ -1,10 +1,10 @@
 # H on Fe(100) with the Wen (2021) Fe-H EAM through LAMMPS: the setup of
 # examples/13_fe_h_eam_surface.py as a config file. Needs the LAMMPS Python module.
 #
-#   gcmc-re-run fe100_h_eam_example.yaml --check                     # setup, D0, mu ladder
-#   gcmc-re-run fe100_h_eam_example.yaml --workers 36                # run + analysis
-#   gcmc-re-run fe100_h_eam_example.yaml --resume --time-limit 85000 # batch jobs: exit 75 = resubmit
-#   gcmc-re-run fe100_h_eam_example.yaml --analyze-only              # re-analyse saved samples
+#   regc-run fe100_h_eam_example.yaml --check                     # setup, D0, mu ladder
+#   regc-run fe100_h_eam_example.yaml --workers 36                # run + analysis
+#   regc-run fe100_h_eam_example.yaml --resume --time-limit 85000 # batch jobs: exit 75 = resubmit
+#   regc-run fe100_h_eam_example.yaml --analyze-only              # re-analyse saved samples
 #
 # Potential: M. Wen, Comput. Mater. Sci. 197, 110640 (2021): a = 2.855 A, H2
 # r0 = 0.739 A, D0 = 4.46 eV, so d0: self is appropriate. For a GRACE/ACE

@@ -1,9 +1,9 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = ["setuptools>=64", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gcmc-re"
+name = "regc"
 dynamic = ["version"]
 description = "Replica-exchange grand-canonical Monte Carlo (REGC) on a (T, mu) grid with pluggable potentials (LJ, EAM, MLIPs via ASE or LAMMPS) and MBAR (T, p) surface phase diagrams."
 readme = "README.md"
@@ -36,20 +36,30 @@ dependencies = ["numpy>=1.22"]
 ase = ["ase>=3.23"]                          # EAM/EMT/MLIP calculators, structures, trajectories
 mbar = ["pymbar>=4.0", "scipy>=1.7"]         # MBAR reweighting / phase diagrams
 plot = ["matplotlib>=3.5"]
-yaml = ["pyyaml>=6.0"]                       # YAML configs for gcmc-re-run
-all = ["gcmc-re[ase,mbar,plot,yaml]"]
-dev = ["gcmc-re[all]", "pytest>=7.0", "build"]
+yaml = ["pyyaml>=6.0"]                       # YAML configs for regc-run
+all = ["regc[ase,mbar,plot,yaml]"]
+dev = ["regc[all]", "pytest>=7.0", "build"]
 # LAMMPS (LammpsCalculator) is deliberately not an extra: install it from conda-forge
 # (see environment.yml) or build it yourself (hpc/build_lammps.sh, e.g. for grace/fs).
 
 [project.scripts]
-gcmc-re-run = "gcmc_re.runner:main"
+regc-run = "regc.runner:main"
+gcmc-re-run = "regc.runner:main"          # former name, kept for existing batch scripts
 
-[tool.setuptools.dynamic]
-version = { attr = "gcmc_re.__version__" }
+[tool.setuptools_scm]
+# The version comes from git: a tag vX.Y.Z gives X.Y.Z; commits after it give
+# X.Y.(Z+1).devN+g<hash> (plus .d<date> with uncommitted changes). Release by
+# tagging: git tag -a v0.4.0 -m "regc 0.4.0". Without git metadata (e.g. a
+# plain source copy) the fallback below is used.
+version_file = "regc/_version.py"
+version_file_template = '''"""The package version, written by setuptools-scm from git at install time. Do not edit."""
+__version__ = version = "{version}"
+__version_tuple__ = version_tuple = {version_tuple}
+'''
+fallback_version = "0.3.0"
 
 [tool.setuptools.packages.find]
-include = ["gcmc_re*"]
+include = ["regc*", "gcmc_re"]               # gcmc_re: deprecated alias of regc (old pickles, scripts)
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

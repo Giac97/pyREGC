@@ -108,7 +108,7 @@ class ReplicaExchangeGCMC:
     wavelength cubed (see `ThermoState.lambda_cubed`); the default (always
     1.0) is correct for reduced LJ units and a no-op for existing code. Real-
     units setups (e.g. an ASE EMT/EAM/MLIP calculator) should pass the true
-    value -- see `gcmc_re.units.thermal_wavelength_cubed_angstrom3`.
+    value -- see `regc.units.thermal_wavelength_cubed_angstrom3`.
 
     `hmc_enabled=True` (with `hmc_leapfrog_steps`/`hmc_dt`) replaces every
     replica's single-particle random displacement move with Hybrid Monte

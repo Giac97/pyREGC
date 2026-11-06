@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from gcmc_re import (
+from regc import (
     invert_mu_of_Tp,
     mu_from_pressure,
     mu_grid_from_pressures,

@@ -44,7 +44,7 @@ class ThermoState:
         works in real physical units (e.g. ASE's EMT or a real EAM/MLIP,
         which report energies in eV using positions in Angstrom). There,
         supply the real value (see
-        `gcmc_re.units.thermal_wavelength_cubed_angstrom3`) so the
+        `regc.units.thermal_wavelength_cubed_angstrom3`) so the
         insertion/deletion acceptance formulas in `replica.py` stay
         dimensionally correct.
     """

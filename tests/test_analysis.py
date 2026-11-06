@@ -13,7 +13,7 @@ import pytest
 
 pytest.importorskip("pymbar", reason="pip install pymbar to run this test")
 
-from gcmc_re import (
+from regc import (
     MBARSurfaceAnalysis,
     mu_from_pressure,
     p0_reduced_units,
@@ -121,7 +121,7 @@ def test_most_probable_N_Tp_routes_through_mu_from_p(tiny_sim):
 def test_newton_warm_start_matches_pymbar_solution(tiny_sim):
     from pymbar import MBAR
 
-    from gcmc_re.analysis import _mbar_free_energies_newton
+    from regc.analysis import _mbar_free_energies_newton
 
     analysis = MBARSurfaceAnalysis(tiny_sim)
     reference = MBAR(analysis.u_kn, analysis.Nk).f_k

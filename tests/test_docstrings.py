@@ -13,9 +13,9 @@ import pathlib
 import re
 from typing import List, Set
 
-import gcmc_re  # noqa: E402  -- check the package that is actually imported (repo or installed)
+import regc  # noqa: E402  -- check the package that is actually imported (repo or installed)
 
-PACKAGE = pathlib.Path(gcmc_re.__file__).resolve().parent
+PACKAGE = pathlib.Path(regc.__file__).resolve().parent
 SECTION = re.compile(r"^\s*([A-Z][A-Za-z ]+)\n\s*-{3,}\s*$", re.M)
 
 
@@ -166,7 +166,7 @@ def collect_problems(package_dir: pathlib.Path = PACKAGE) -> List[str]:
     Parameters
     ----------
     package_dir : pathlib.Path, optional
-        Directory of ``*.py`` files. Default: the gcmc_re package.
+        Directory of ``*.py`` files. Default: the regc package.
 
     Returns
     -------

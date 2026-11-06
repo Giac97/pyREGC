@@ -13,10 +13,10 @@ import pytest
 lammps = pytest.importorskip("lammps", reason="LAMMPS Python module not installed")
 pytest.importorskip("ase", reason="pip install ase")
 
-from gcmc_re import ReplicaExchangeGCMC, SlabLJSystem, kelvin_to_eV  # noqa: E402
-from gcmc_re.lammps_backend import LammpsCalculator  # noqa: E402
-from gcmc_re.replica import Replica  # noqa: E402
-from gcmc_re.state import ThermoState  # noqa: E402
+from regc import ReplicaExchangeGCMC, SlabLJSystem, kelvin_to_eV  # noqa: E402
+from regc.lammps_backend import LammpsCalculator  # noqa: E402
+from regc.replica import Replica  # noqa: E402
+from regc.state import ThermoState  # noqa: E402
 
 
 def _write_toy_eam(path):
@@ -124,7 +124,7 @@ def test_box_handling_matches_pair_lj_exactly(hexagonal):
     """Analytic LJ (no tables): LAMMPS lj/cut (shifted) must equal the native
     PairLJCalculator to round-off, incl. a triclinic hexagonal cell and frozen
     atoms below z = 0."""
-    from gcmc_re import PairLJCalculator
+    from regc import PairLJCalculator
     # cutoffs (2.5 sigma <= 3.25 A) inside the cells' minimum-image radius (>= 3.40 A)
     params = {("Fe", "H"): (0.66, 1.3), ("H", "H"): (0.01, 1.2), ("Fe", "Fe"): (0.3, 1.3)}
     lmp_calc = LammpsCalculator(
@@ -217,7 +217,7 @@ def test_pickle_and_parallel_equals_serial(eam_file):
 
 
 def test_native_lj_refuses_cutoff_beyond_min_image_radius():
-    from gcmc_re import LJCalculator, LJSystem, PairLJCalculator
+    from regc import LJCalculator, LJSystem, PairLJCalculator
     big = SlabLJSystem(None, None, 8.0, PairLJCalculator({("B", "B"): (0.01, 2.3)}),
                        exchange_species="B", cell_xy=np.array([[7.86, 0.0], [3.93, 6.81]]),
                        positions=[[1.0, 1.0, 2.0], [3.0, 1.0, 2.0]])

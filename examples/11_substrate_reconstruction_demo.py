@@ -32,7 +32,7 @@ here; this all works identically with EAM or an MLIP for a real surface).
 
 import numpy as np
 
-from gcmc_re import ASECalculatorAdapter, BulkSystem, ReplicaExchangeGCMC, ThermoState, Replica
+from regc import ASECalculatorAdapter, BulkSystem, ReplicaExchangeGCMC, ThermoState, Replica
 
 SIGMA, EPSILON, R_CUT = 1.0, 1.0, 2.5
 R_NATURAL = 2 ** (1.0 / 6.0) * SIGMA  # the LJ potential's known equilibrium separation

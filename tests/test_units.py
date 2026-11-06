@@ -2,7 +2,7 @@
 
 import pytest
 
-from gcmc_re import kelvin_to_eV, thermal_wavelength_angstrom
+from regc import kelvin_to_eV, thermal_wavelength_angstrom
 
 
 def test_kelvin_to_eV_matches_textbook_value():

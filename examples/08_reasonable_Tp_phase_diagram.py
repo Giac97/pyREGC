@@ -1,13 +1,13 @@
 """
 Pd(111) + H via EMT on a realistic (T, p) window, using the config-driven
-pipeline (gcmc_re.runner) programmatically -- built as an inline dict here
+pipeline (regc.runner) programmatically -- built as an inline dict here
 rather than loaded from a file (see examples/09_config_driven_run.py +
 pd111_emt_example.yaml for the file-based version of the same thing).
 
 Read examples/05, 06 and 07 first. The runner maps p(H2) to mu_H with
 EMT's own H2 dissociation energy D0 AND EMT's own isolated-H energy e_atom
 (+3.21 eV, the zero of every GCMC energy difference; see
-gcmc_re/reservoir.py). With both, 1e-4 to 1e6 atm at 350-450 K corresponds
+regc/reservoir.py). With both, 1e-4 to 1e6 atm at 350-450 K corresponds
 to mu_H ~ +0.3 to +0.75 eV; the replica ladder is laid directly on that
 pressure window (replica_exchange.pressures).
 
@@ -30,7 +30,7 @@ Requires: pip install ase pymbar matplotlib
 
 import os
 
-from gcmc_re.runner import run_from_config
+from regc.runner import run_from_config
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 

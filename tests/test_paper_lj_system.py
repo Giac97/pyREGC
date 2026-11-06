@@ -11,12 +11,12 @@ import itertools
 import numpy as np
 import pytest
 
-from gcmc_re import (LJCalculator, LJSystem, PairLJCalculator, ReplicaExchangeGCMC,
+from regc import (LJCalculator, LJSystem, PairLJCalculator, ReplicaExchangeGCMC,
                      SlabLJSystem)
-from gcmc_re.calculators import Calculator
-from gcmc_re.engine import SWAP_TYPES
-from gcmc_re.replica import Replica
-from gcmc_re.state import ThermoState
+from regc.calculators import Calculator
+from regc.engine import SWAP_TYPES
+from regc.replica import Replica
+from regc.state import ThermoState
 
 PAPER_PARAMS = {("A", "B"): (0.66, 1.91), ("B", "B"): (0.01, 1.2)}
 L_HEX = 11.489

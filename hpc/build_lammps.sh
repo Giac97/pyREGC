@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Build LAMMPS as a shared library + Python module for gcmc_re's LammpsCalculator.
+# Build LAMMPS as a shared library + Python module for regc's LammpsCalculator.
 #
-# Run inside the activated gcmc_re environment, on a node with the compilers you
+# Run inside the activated regc environment, on a node with the compilers you
 # want (login node is usually fine):    bash hpc/build_lammps.sh
 #
-# Styles gcmc_re needs (hpc/check_env.py verifies them after the build):
+# Styles regc needs (hpc/check_env.py verifies them after the build):
 #   pair  eam/fs, eam/alloy           -> package MANYBODY
 #   pair  grace/fs (GRACE-FS models)  -> ML-PACE with GRACE support: follow the GRACE /
 #                                        tensorpotential documentation for the LAMMPS

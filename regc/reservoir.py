@@ -410,7 +410,7 @@ class Reservoir:
         pressures : sequence of float
             Pressures, in `unit`.
         unit : str, optional
-            Pressure unit (see `gcmc_re.units.PRESSURE_UNITS`). Default ``'Pa'``.
+            Pressure unit (see `regc.units.PRESSURE_UNITS`). Default ``'Pa'``.
 
         Returns
         -------
@@ -694,7 +694,7 @@ class DiatomicReservoir(Reservoir):
         ----------
         ase_calculator : ase.calculators.calculator.Calculator
             The potential the simulation uses (e.g. ASE's EAM, or
-            `gcmc_re.lammps_backend.lammps_ase_calculator`).
+            `regc.lammps_backend.lammps_ase_calculator`).
         symbol : str, optional
             Element of the homonuclear molecule. Default ``'H'``.
         d0 : {'self', 'experimental'} or float, optional

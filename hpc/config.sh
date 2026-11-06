@@ -11,7 +11,7 @@ setup_environment() {
 }
 
 # ---- paths -----------------------------------------------------------------------------
-# EDIT: where the gcmc_re checkout lives, and where results go. On clusters with
+# EDIT: where the repository checkout lives, and where results go. On clusters with
 # workspaces/scratch, put OUT there (large checkpoint.pkl files, many writes).
 PROJECT_DIR="$HOME/gcmc_re"
 OUT="$PROJECT_DIR/runs/fe110_h"

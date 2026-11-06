@@ -14,7 +14,7 @@ to guard against, not paper over with a looser tolerance).
 import numpy as np
 import pytest
 
-from gcmc_re import LJCalculator, LJSystem, ThermoState, Replica
+from regc import LJCalculator, LJSystem, ThermoState, Replica
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +72,7 @@ def test_ase_calculator_adapter_forces_match_ase_lj():
     ase = pytest.importorskip("ase", reason="pip install ase to run this test")
     from ase.calculators.lj import LennardJones as ASELennardJones
 
-    from gcmc_re import ASECalculatorAdapter
+    from regc import ASECalculatorAdapter
 
     sigma, epsilon, r_cut = 1.0, 1.0, 2.5
     rng = np.random.default_rng(2)
@@ -94,7 +94,7 @@ def test_ase_calculator_adapter_forces_match_ase_lj():
 # Masses
 # ---------------------------------------------------------------------------
 def test_default_mass_amu_real_element_vs_fallback():
-    from gcmc_re.units import default_mass_amu
+    from regc.units import default_mass_amu
 
     assert default_mass_amu("H") == pytest.approx(1.008, abs=0.01)
     assert default_mass_amu("Fe") == pytest.approx(55.845, abs=0.01)
@@ -120,7 +120,7 @@ def test_particle_system_masses_default_is_one_for_generic_species():
 # HMC construction and bookkeeping
 # ---------------------------------------------------------------------------
 def test_hmc_requires_a_force_capable_calculator():
-    from gcmc_re.calculators import Calculator
+    from regc.calculators import Calculator
 
     class NoForcesCalculator(Calculator):
         def total_energy(self, system):

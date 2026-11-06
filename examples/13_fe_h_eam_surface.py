@@ -43,12 +43,12 @@ import time
 
 import numpy as np
 
-from gcmc_re import (EXIT_RESUBMIT, H2_D0_EXPERIMENTAL_EV, ASECalculatorAdapter, DiatomicReservoir,
+from regc import (EXIT_RESUBMIT, H2_D0_EXPERIMENTAL_EV, ASECalculatorAdapter, DiatomicReservoir,
                      LammpsCalculator, MBARSurfaceAnalysis, ReplicaExchangeGCMC, cubic_lattice_constant,
                      eam_pair_commands, insertion_energy_scan, kelvin_to_eV, lammps_ase_calculator,
                      load_samples, run_with_checkpoints, slab_geometry_from_atoms)
-from gcmc_re.replica import Replica
-from gcmc_re.state import ThermoState
+from regc.replica import Replica
+from regc.state import ThermoState
 
 # ---- system --------------------------------------------------------------------
 SPECIES = ["Fe", "H"]          # LAMMPS atom types 1, 2 (element order in pair_coeff)

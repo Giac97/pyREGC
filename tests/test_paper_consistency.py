@@ -12,10 +12,10 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from gcmc_re import LJSystem, ReplicaExchangeGCMC, SlabLJSystem
-from gcmc_re.calculators import Calculator
-from gcmc_re.replica import Replica
-from gcmc_re.state import ThermoState
+from regc import LJSystem, ReplicaExchangeGCMC, SlabLJSystem
+from regc.calculators import Calculator
+from regc.replica import Replica
+from regc.state import ThermoState
 
 
 class ZeroCalculator(Calculator):
@@ -127,7 +127,7 @@ def test_mbar_includes_lambda_cubed_term():
     generated with a T-dependent Lambda and check the reweighted <N> at an
     unsampled (T, mu)."""
     pytest.importorskip("pymbar", reason="pip install pymbar to run this test")
-    from gcmc_re import MBARSurfaceAnalysis
+    from regc import MBARSurfaceAnalysis
 
     V = 10.0
     lam3 = lambda T: 0.2 * T ** -1.5

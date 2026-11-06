@@ -8,7 +8,7 @@ import pickle
 import numpy as np
 import pytest
 
-from gcmc_re import (BulkSystem, DiatomicReservoir, LJCalculator, LJSystem,
+from regc import (BulkSystem, DiatomicReservoir, LJCalculator, LJSystem,
                      MonatomicIdealGasReservoir, ReplicaExchangeGCMC, SampleSet, SlabLJSystem,
                      SlabSystem, ThermalWavelengthCubed, eV_to_kelvin, kelvin_to_eV, load_samples,
                      pascal_per, run_with_checkpoints, save_samples,
@@ -68,7 +68,7 @@ def test_slab_geometry_layout():
     pytest.importorskip("ase")
     from ase.build import bcc110, fcc111
 
-    from gcmc_re import PairLJCalculator, slab_geometry_from_atoms
+    from regc import PairLJCalculator, slab_geometry_from_atoms
     g = slab_geometry_from_atoms(bcc110("Fe", size=(3, 4, 6), a=2.86, vacuum=None, orthogonal=True),
                                  n_frozen_layers=3, headroom=5.0)
     assert len(g.frozen_positions) == 36 and len(g.substrate_positions) == 36
@@ -146,7 +146,7 @@ def test_driver_guards(tmp_path):
 
 def test_lowest_energy_map():
     pytest.importorskip("pymbar")
-    from gcmc_re import MBARSurfaceAnalysis
+    from regc import MBARSurfaceAnalysis
     samples = {(0, 0): {'U': [0.0, -1.0, -1.5, -2.2], 'N': [0, 1, 2, 3]},
                (0, 1): {'U': [-0.5, -1.4, -2.3, -2.9], 'N': [1, 2, 3, 3]}}
     a = MBARSurfaceAnalysis(SampleSet([1.0], np.array([[-1.0, 0.0]]), samples))

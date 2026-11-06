@@ -1,8 +1,8 @@
-# Example config for gcmc_re.runner (gcmc-re-run): Pd(111) + H via EMT.
+# Example config for regc.runner (regc-run): Pd(111) + H via EMT.
 #
-# Run with:   gcmc-re-run pd111_emt_example.yaml            (or python 09_config_driven_run.py ...)
-# First:      gcmc-re-run pd111_emt_example.yaml --check    (setup + mu ladder, no sampling)
-# Re-analyse: gcmc-re-run pd111_emt_example.yaml --analyze-only
+# Run with:   regc-run pd111_emt_example.yaml            (or python 09_config_driven_run.py ...)
+# First:      regc-run pd111_emt_example.yaml --check    (setup + mu ladder, no sampling)
+# Re-analyse: regc-run pd111_emt_example.yaml --analyze-only
 #
 # Read examples/05-08 first. The H2 reservoir uses EMT's own H2 dissociation
 # energy D0 and EMT's own isolated-H energy e_atom (+3.21 eV, the zero of every

@@ -5,7 +5,7 @@ import pytest
 ase = pytest.importorskip("ase", reason="pip install ase to run this test")
 from ase.calculators.lj import LennardJones as ASELennardJones  # noqa: E402
 
-from gcmc_re import (
+from regc import (
     H2_BOND_LENGTH_ANGSTROM,
     H2_MASS_AMU,
     H2_VIBRATIONAL_WAVENUMBER_CM,
@@ -35,7 +35,7 @@ def test_mu_atom_is_on_the_calculators_energy_scale():
     to (1/2)(mu_mol_rel - D0) + e_atom; dropping e_atom shifts it by e_atom."""
     from ase.calculators.emt import EMT
 
-    from gcmc_re import diatomic_gas_mu_eV
+    from regc import diatomic_gas_mu_eV
 
     info = diatomic_dissociation_energy_eV(EMT(), "H")
     assert info["e_atom_eV"] == pytest.approx(3.21, abs=0.01)  # EMT's H is far from 0

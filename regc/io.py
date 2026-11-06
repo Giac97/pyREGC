@@ -7,7 +7,7 @@ Saving and loading REGC samples and checkpoints.
   `MBARSurfaceAnalysis` accepts in place of a live `ReplicaExchangeGCMC`, so
   a run can be analysed (and re-analysed) without re-running it.
 * `atomic_pickle` / `load_pickle` -- crash-safe pickling for checkpoints
-  (see `ReplicaExchangeGCMC.save_checkpoint` and `gcmc_re.driver`).
+  (see `ReplicaExchangeGCMC.save_checkpoint` and `regc.driver`).
 """
 
 from __future__ import annotations

@@ -2,17 +2,17 @@
 A short bulk LJ fluid replica-exchange GCMC run on the parallel engine.
 
 n_workers > 1 uses a ProcessPoolExecutor across replicas -- see
-gcmc_re/engine.py's module docstring for what does and doesn't parallelize.
+regc/engine.py's module docstring for what does and doesn't parallelize.
 Speedup requires actual spare CPU cores and a per-replica cost that
 dominates the pool's own overhead; worthwhile with an EAM/MLIP calculator,
 not necessarily with the fast native LJCalculator used here.
 
-Requires: only numpy (gcmc_re's core).
+Requires: only numpy (regc's core).
 """
 
 import numpy as np
 
-from gcmc_re import LJCalculator, BulkSystem, ReplicaExchangeGCMC
+from regc import LJCalculator, BulkSystem, ReplicaExchangeGCMC
 
 
 def make_bulk(rng: np.random.Generator) -> BulkSystem:

@@ -15,7 +15,7 @@ Requires: pip install ase
 import numpy as np
 from ase.calculators.lj import LennardJones as ASELennardJones
 
-from gcmc_re import ASECalculatorAdapter, Replica, SlabSystem, ThermoState
+from regc import ASECalculatorAdapter, Replica, SlabSystem, ThermoState
 
 rng = np.random.default_rng(3)
 

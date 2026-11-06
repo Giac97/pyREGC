@@ -19,7 +19,7 @@ LAMMPS doing energies, forces and MD). Everything cluster-specific is in
 ## One-time setup
 
 ```bash
-git clone <your gcmc_re repo> ~/gcmc_re && cd ~/gcmc_re      # or copy the directory
+git clone <your repository> ~/gcmc_re && cd ~/gcmc_re      # or copy the directory
 mamba env create -f hpc/environment.yml
 conda activate gcmc_re
 pip install -e .
@@ -33,7 +33,7 @@ Then edit `hpc/config.sh` (`setup_environment`, `PROJECT_DIR`, `OUT`,
 
 ### LAMMPS
 
-`gcmc_re.LammpsCalculator` uses the LAMMPS **Python module**, so LAMMPS must be
+`regc.LammpsCalculator` uses the LAMMPS **Python module**, so LAMMPS must be
 built as a shared library (`build_lammps.sh` does it with CMake and installs the
 module into the active environment). Required styles:
 

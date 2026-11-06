@@ -1,7 +1,7 @@
-# REGC algorithm as implemented in `gcmc_re`
+# REGC algorithm as implemented in `regc`
 
 This document states the replica-exchange grand-canonical (REGC) Monte Carlo algorithm
-that `gcmc_re` implements, with every acceptance rule written out, and relates it to
+that `regc` implements, with every acceptance rule written out, and relates it to
 
 > Y. Zhou, M. Scheffler, L. M. Ghiringhelli, *Determining surface phase diagrams including
 > anharmonic effects*, Phys. Rev. B **100**, 174106 (2019) — referred to below as **[ZSG]**.
@@ -109,7 +109,7 @@ over replicas. Three modes are available:
     ($z\to 2z_\text{wall}-z$, $v_z\to -v_z$), the analogue of the reflecting boundaries that
     [ZSG] impose with PLUMED.
   * After the segment, $E$ is recomputed with the system's calculator.
-  * With `LammpsCalculator` (`gcmc_re/lammps_backend.py`) the whole segment runs natively in
+  * With `LammpsCalculator` (`regc/lammps_backend.py`) the whole segment runs natively in
     LAMMPS: `velocity create`, `fix nve` + `fix temp/csvr` (Bussi), `fix wall/reflect`, with
     frozen atoms excluded. Any LAMMPS pair style works this way (EAM, GRACE-FS `grace/fs`,
     ACE, ...). It is about $10^3\times$ faster than ASE for an EAM slab.

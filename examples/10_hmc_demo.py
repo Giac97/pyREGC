@@ -17,13 +17,13 @@ just "run some MD"), and its current limitation (forces don't include any
 external_energy field, e.g. a continuum wall -- fine for this bulk demo,
 worth knowing before enabling HMC on a SlabSystem with wall_epsilon > 0).
 
-Requires: only numpy (gcmc_re's core) -- no ASE needed for this one, since
+Requires: only numpy (regc's core) -- no ASE needed for this one, since
 it uses the native LJCalculator throughout.
 """
 
 import numpy as np
 
-from gcmc_re import LJCalculator, BulkSystem, ReplicaExchangeGCMC
+from regc import LJCalculator, BulkSystem, ReplicaExchangeGCMC
 
 T = 1.0
 MU = -3.6  # chosen so the system equilibrates quickly at this box size/T

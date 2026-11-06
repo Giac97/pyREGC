@@ -5,8 +5,8 @@ Run from the repository root after changing a public signature or docstring:
 
     python docs/build_api_reference.py
 
-Every public name in ``gcmc_re.__all__`` is documented, grouped by module, plus
-the public functions of ``gcmc_re.runner``. Docstring sections (Parameters,
+Every public name in ``regc.__all__`` is documented, grouped by module, plus
+the public functions of ``regc.runner``. Docstring sections (Parameters,
 Returns, Raises, ...) become Markdown lists; everything else is kept as text.
 """
 
@@ -21,8 +21,8 @@ from typing import List
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-import gcmc_re  # noqa: E402
-from gcmc_re import runner  # noqa: E402
+import regc  # noqa: E402
+from regc import runner  # noqa: E402
 
 MODULE_ORDER = [
     ("calculators", "Calculators"),
@@ -268,13 +268,13 @@ def main() -> None:
     None
     """
     by_module = {}
-    for name in gcmc_re.__all__:
-        obj = getattr(gcmc_re, name)
+    for name in regc.__all__:
+        obj = getattr(regc, name)
         mod = getattr(obj, "__module__", None) or ""
-        if not mod.startswith("gcmc_re."):
+        if not mod.startswith("regc."):
             # constants: find the defining module by attribute lookup
-            mod = next((f"gcmc_re.{m}" for m, _ in MODULE_ORDER
-                        if name in vars(__import__(f"gcmc_re.{m}", fromlist=["x"]))), "gcmc_re")
+            mod = next((f"regc.{m}" for m, _ in MODULE_ORDER
+                        if name in vars(__import__(f"regc.{m}", fromlist=["x"]))), "regc")
         by_module.setdefault(mod.split(".", 1)[-1], []).append((name, obj))
 
     toc, body = [], []
@@ -282,26 +282,26 @@ def main() -> None:
         entries = by_module.pop(mod, [])
         if not entries:
             continue
-        anchor = re.sub(r"[^a-z0-9 _-]", "", f"{title} gcmc_re.{mod}".lower()).replace(" ", "-")
-        toc.append(f"- [{title} (`gcmc_re.{mod}`)](#{anchor}): "
+        anchor = re.sub(r"[^a-z0-9 _-]", "", f"{title} regc.{mod}".lower()).replace(" ", "-")
+        toc.append(f"- [{title} (`regc.{mod}`)](#{anchor}): "
                    + ", ".join(f"`{n}`" for n, _ in entries))
-        body.append(f"## {title} (`gcmc_re.{mod}`)\n\n"
+        body.append(f"## {title} (`regc.{mod}`)\n\n"
                     + "\n\n---\n\n".join(document(o, n) for n, o in entries))
     for mod, entries in by_module.items():  # anything not in MODULE_ORDER
-        body.append(f"## `gcmc_re.{mod}`\n\n" + "\n\n---\n\n".join(document(o, n) for n, o in entries))
+        body.append(f"## `regc.{mod}`\n\n" + "\n\n---\n\n".join(document(o, n) for n, o in entries))
 
-    toc.append("- [Config runner (`gcmc_re.runner`)](#config-runner-gcmc_rerunner): "
+    toc.append("- [Config runner (`regc.runner`)](#config-runner-regcrunner): "
                + ", ".join(f"`{n}`" for n in RUNNER_FUNCS))
-    body.append("## Config runner (`gcmc_re.runner`)\n\n"
-                "Not exported at the package top level: `from gcmc_re.runner import ...`. "
+    body.append("## Config runner (`regc.runner`)\n\n"
+                "Not exported at the package top level: `from regc.runner import ...`. "
                 "The config file format is in MANUAL.md, Part II.\n\n"
                 + "\n\n---\n\n".join(document(getattr(runner, n), n) for n in RUNNER_FUNCS))
 
-    header = ("# gcmc_re API reference\n\n"
-              f"Generated from the docstrings of gcmc_re {gcmc_re.__version__} by "
+    header = ("# regc API reference\n\n"
+              "Generated from the docstrings of regc by "
               "`docs/build_api_reference.py`; do not edit by hand. For how to use these "
               "pieces together, see [MANUAL.md](MANUAL.md).\n\n"
-              "Everything below is importable as `from gcmc_re import <name>`, except the "
+              "Everything below is importable as `from regc import <name>`, except the "
               "runner functions at the end.\n\n## Contents\n\n" + "\n".join(toc))
     with open(os.path.join(HERE, "API_REFERENCE.md"), "w") as f:
         f.write(header + "\n\n" + "\n\n".join(body) + "\n")

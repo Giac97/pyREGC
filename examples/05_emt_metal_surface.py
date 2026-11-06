@@ -15,7 +15,7 @@ import numpy as np
 from ase.build import fcc111
 from ase.calculators.emt import EMT
 
-from gcmc_re import (
+from regc import (
     ASECalculatorAdapter,
     MBARSurfaceAnalysis,
     ReplicaExchangeGCMC,
@@ -97,7 +97,7 @@ def make_system(rng: np.random.Generator) -> SlabSystem:
 # (ThermoState.beta = 1/temperature), and the historical Lambda=1 convention
 # baked into Replica's insertion/deletion formulas is wrong here -- H's
 # actual thermal de Broglie wavelength depends on its mass and T. Both are
-# handled by gcmc_re.units.
+# handled by regc.units.
 # =============================================================================
 temperatures_K = [350.0, 450.0]
 temperatures_eV = [kelvin_to_eV(T) for T in temperatures_K]

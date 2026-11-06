@@ -16,7 +16,7 @@ mu_H window (-0.2 to 0.8 eV), i.e. roughly 1e-22 to 1e8 bar: it contains
 the lab-relevant 1e-4 to 1e6 atm range, so the coverage in that range is
 interpolated by MBAR between simulated states, not extrapolated. Both the
 dissociation energy D0 and the isolated-atom energy e_atom must come from
-EMT itself (see gcmc_re/reservoir.py).
+EMT itself (see regc/reservoir.py).
 
 Requires: pip install ase pymbar matplotlib
 """
@@ -25,7 +25,7 @@ import numpy as np
 from ase.build import fcc111
 from ase.calculators.emt import EMT
 
-from gcmc_re import (
+from regc import (
     ASECalculatorAdapter,
     DiatomicReservoir,
     MBARSurfaceAnalysis,

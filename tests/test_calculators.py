@@ -10,7 +10,7 @@ systems.py or calculators.py.
 import numpy as np
 import pytest
 
-from gcmc_re import LJCalculator, LJSystem, ASECalculatorAdapter
+from regc import LJCalculator, LJSystem, ASECalculatorAdapter
 
 ase = pytest.importorskip("ase", reason="pip install ase to run this test")
 from ase.calculators.lj import LennardJones as ASELennardJones  # noqa: E402
@@ -68,7 +68,7 @@ def test_frozen_substrate_energy_bookkeeping_stays_exact():
     """Species + frozen-substrate plumbing: after many generic-path moves,
     the incrementally-tracked energy must still match a fresh total_energy()
     recomputation (no silent drift bug)."""
-    from gcmc_re import Replica, SlabLJSystem, ThermoState
+    from regc import Replica, SlabLJSystem, ThermoState
 
     rng = np.random.default_rng(3)
     nx, ny, a = 4, 4, 1.2
@@ -104,7 +104,7 @@ def test_emt_au_h_smoke():
     from ase.build import fcc111
     from ase.calculators.emt import EMT
 
-    from gcmc_re import (Replica, SlabLJSystem, ThermoState,
+    from regc import (Replica, SlabLJSystem, ThermoState,
                           kelvin_to_eV, thermal_wavelength_cubed_angstrom3)
 
     slab = fcc111("Au", size=(2, 2, 2), vacuum=6.0, orthogonal=True, periodic=False)

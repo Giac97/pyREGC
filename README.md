@@ -1,4 +1,4 @@
-# gcmc_re
+# regc
 
 Multidimensional replica-exchange grand canonical Monte Carlo: a 2D ladder
 of replicas over (temperature, chemical potential), a pluggable energy
@@ -6,6 +6,11 @@ backend (fast pairwise Lennard-Jones, or *any* ASE-compatible potential --
 EAM, MACE, NequIP, Allegro, ...), optional process-pool parallelism across
 replicas, and MBAR-based reweighting into smooth coverage(T, mu)/(T, p)
 surface phase diagrams.
+
+The package was formerly called `gcmc_re`. `import gcmc_re` and the
+`gcmc-re-run` command still work as deprecated aliases of `regc` and
+`regc-run`, so old scripts and saved checkpoints keep loading. The conda
+environment keeps its old name, `gcmc_re`.
 
 ## Install
 
@@ -20,7 +25,7 @@ pytest                                  # optional: the test suite (~1 min)
 This installs Python 3.11 with numpy, scipy, ASE, pymbar, matplotlib, PyYAML,
 pytest and **LAMMPS from conda-forge**, a serial CPU build with the Python
 module that `LammpsCalculator` uses. It also installs this package in
-editable mode (`pip install -e .`), so edits to `gcmc_re/` take effect
+editable mode (`pip install -e .`), so edits to `regc/` take effect
 immediately. After changing `environment.yml`, run
 `mamba env update -f environment.yml --prune`.
 
@@ -43,12 +48,12 @@ scipy: phase diagrams), `plot` (matplotlib), `yaml` (YAML configs), `all`,
 
 The core (engine, LJ calculators, geometries, units, reservoirs, driver,
 sample I/O) needs only numpy. Every optional dependency is imported lazily,
-inside the function that needs it, so `import gcmc_re` works with numpy
+inside the function that needs it, so `import regc` works with numpy
 alone.
 
 ### Command line
 
-The install also provides `gcmc-re-run config.yaml`: the config-driven
+The install also provides `regc-run config.yaml`: the config-driven
 pipeline (structure -> REGC -> MBAR -> (T, p) phase diagram) with any of
 the package's calculators (LAMMPS included), checkpoints and resubmission;
 see [Config-file-driven runs](#config-file-driven-runs-runnerpy) and
@@ -57,7 +62,7 @@ see [Config-file-driven runs](#config-file-driven-runs-runnerpy) and
 ## Layout
 
 ```
-gcmc_re/
+regc/
 ├── calculators.py     Calculator, LJCalculator, PairLJCalculator, ASECalculatorAdapter
 ├── lammps_backend.py  LammpsCalculator (any LAMMPS pair style, native MD),
 │                      eam_pair_commands, lammps_ase_calculator
@@ -92,7 +97,7 @@ tests/        pytest checks, incl. NumPy-docstring validation of the package
 
 ```python
 from ase.build import bcc110
-from gcmc_re import (DiatomicReservoir, LammpsCalculator, ReplicaExchangeGCMC,
+from regc import (DiatomicReservoir, LammpsCalculator, ReplicaExchangeGCMC,
                      cubic_lattice_constant, eam_pair_commands, kelvin_to_eV,
                      lammps_ase_calculator, run_with_checkpoints, slab_geometry_from_atoms,
                      load_samples, MBARSurfaceAnalysis)
@@ -125,13 +130,13 @@ in `Replica`'s GCMC formulas need real values to match:
 
 - **Temperature**: `ThermoState.beta = 1/temperature` needs `temperature`
   in eV, since it multiplies energies the calculator reports in eV. Use
-  `gcmc_re.units.kelvin_to_eV(T_kelvin)`.
+  `regc.units.kelvin_to_eV(T_kelvin)`.
 - **Thermal de Broglie wavelength**: the insertion/deletion acceptance
   formulas contain a `log(V / ((N+1) * Lambda^3))` term. The historical
   default `Lambda^3 = 1` is a correct, self-consistent convention in
   reduced LJ units, but not in real units -- a real particle's Lambda
   depends on its mass and T. Pass `lambda_cubed_of_T` to
-  `ReplicaExchangeGCMC` using `gcmc_re.units.thermal_wavelength_cubed_angstrom3`.
+  `ReplicaExchangeGCMC` using `regc.units.thermal_wavelength_cubed_angstrom3`.
 
 See `examples/05_emt_metal_surface.py` for both in use, on a real Au(111)
 slab (built with `ase.build.fcc111`) with H gas via ASE's EMT calculator --
@@ -425,7 +430,7 @@ theta_cl = analysis.phase_diagram_Tp(T_grid, p_grid, observable="N_Cl")
 ## A real structure through the config pipeline: `examples/08_reasonable_Tp_phase_diagram.py`
 
 Example 08 runs Pd(111) + H via EMT (structure read from
-`examples/data/pd111_slab.xyz`) through `gcmc_re.runner`, on the realistic
+`examples/data/pd111_slab.xyz`) through `regc.runner`, on the realistic
 1e-4 to 1e6 atm window, with D0 and e_atom both computed from EMT. The
 replica ladder is laid on that pressure window directly. Expect large, unphysical H
 uptake: roughly 10-25 H on the 2x2 Pd(111) cell, i.e. several H per surface
@@ -460,7 +465,7 @@ the sampled (T, mu) window, where MBAR extrapolates. Run it with
 `--analyze-only` to re-analyze saved samples. A full 1.2e5-step run takes
 hours.
 
-## LAMMPS backend (`gcmc_re.LammpsCalculator`)
+## LAMMPS backend (`regc.LammpsCalculator`)
 
 `LammpsCalculator(pair_commands, species)` runs any LAMMPS pair style:
 EAM (`eam/fs`, `eam/alloy`), GRACE-FS (`grace/fs`), ACE (`pace`), and so
@@ -521,7 +526,7 @@ self-resubmitting production job. See `hpc/README.md`.
 
 ```python
 import numpy as np
-from gcmc_re import BulkSystem, LJCalculator, ReplicaExchangeGCMC
+from regc import BulkSystem, LJCalculator, ReplicaExchangeGCMC
 
 def make_bulk(rng):
     return BulkSystem(box_length=7.0, calculator=LJCalculator(sigma=1.0, epsilon=1.0, r_cut=2.5))
@@ -565,7 +570,7 @@ a bulk cube is periodic in all three axes, a slab only in x, y).
 
 ## Config-file-driven runs (`runner.py`)
 
-`gcmc-re-run config.yaml` (or `gcmc_re.runner.run_from_config` on a dict,
+`regc-run config.yaml` (or `regc.runner.run_from_config` on a dict,
 `load_config` for a YAML/JSON file) runs the whole pipeline of example 13
 from one config file: structure -> REGC -> MBAR -> (T, p) phase diagram.
 Two annotated configs cover every key:
@@ -586,10 +591,10 @@ LAMMPS, checkpointed: the setup of example 13).
 | `output` | `directory`, `plot_filename`, `save_raw_data`. |
 
 ```
-gcmc-re-run config.yaml --check          # build and print the setup and the mu ladder; no sampling
-gcmc-re-run config.yaml --workers 36     # run, then analyse
-gcmc-re-run config.yaml --resume --time-limit 85000   # continue a checkpointed run
-gcmc-re-run config.yaml --analyze-only   # phase diagram from the saved samples, no calculator needed
+regc-run config.yaml --check          # build and print the setup and the mu ladder; no sampling
+regc-run config.yaml --workers 36     # run, then analyse
+regc-run config.yaml --resume --time-limit 85000   # continue a checkpointed run
+regc-run config.yaml --analyze-only   # phase diagram from the saved samples, no calculator needed
 ```
 
 Every run writes `samples.npz` and `run_metadata.json` (the ladder, the
@@ -611,10 +616,10 @@ with Python's `float()`, so this corrects itself, but writing the sign
 
 ## Extending
 
-- **Docstrings**: every function and method in `gcmc_re/` uses numpy-style
+- **Docstrings**: every function and method in `regc/` uses numpy-style
   docstrings (Parameters/Returns/Raises sections), validated structurally
   with `numpydoc.validate`. If you add a new function, match that
-  convention -- `help(gcmc_re.SomeClass.some_method)` is the quick way to
+  convention -- `help(regc.SomeClass.some_method)` is the quick way to
   check the rendered result looks right.
 - **New potential**: subclass `Calculator`. If it's pairwise, implement
   `pair_energy_of` and set `supports_incremental = True` for the fast path

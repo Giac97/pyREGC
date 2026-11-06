@@ -1,4 +1,4 @@
-# conda/mamba environment for gcmc_re on a cluster where LAMMPS is built from
+# conda/mamba environment for regc on a cluster where LAMMPS is built from
 # source (e.g. for pair_style grace/fs):
 #   mamba env create -f hpc/environment.yml && mamba activate gcmc_re && pip install -e .
 #   bash hpc/build_lammps.sh        # installs the `lammps` Python module into this env

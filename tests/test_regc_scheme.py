@@ -10,9 +10,9 @@ import itertools
 import numpy as np
 import pytest
 
-from gcmc_re import LJSystem, ReplicaExchangeGCMC, SlabLJSystem
-from gcmc_re.calculators import Calculator
-from gcmc_re.engine import SWAP_TYPES
+from regc import LJSystem, ReplicaExchangeGCMC, SlabLJSystem
+from regc.calculators import Calculator
+from regc.engine import SWAP_TYPES
 
 
 class ZeroCalculator(Calculator):
@@ -110,7 +110,7 @@ def test_md_diffusion_with_ase_slab():
     from ase.build import fcc111
     from ase.calculators.emt import EMT
 
-    from gcmc_re import ASECalculatorAdapter, kelvin_to_eV
+    from regc import ASECalculatorAdapter, kelvin_to_eV
 
     slab = fcc111("Pd", size=(2, 2, 2), vacuum=None, orthogonal=True, periodic=True)
     slab.positions[:, 2] += 1.0
@@ -151,7 +151,7 @@ def test_md_reflects_at_hard_walls():
     pytest.importorskip("ase", reason="pip install ase to run this test")
     from ase.calculators.emt import EMT
 
-    from gcmc_re import ASECalculatorAdapter, kelvin_to_eV
+    from regc import ASECalculatorAdapter, kelvin_to_eV
 
     Lx = Ly = 6.0
     Lz = 2.5
@@ -175,7 +175,7 @@ def test_md_rejects_non_ase_calculator():
 
 
 def _bulk_lj(rng):
-    from gcmc_re import LJCalculator
+    from regc import LJCalculator
     return LJSystem(6.0, LJCalculator(sigma=1.0, epsilon=1.0, r_cut=2.5))
 
 

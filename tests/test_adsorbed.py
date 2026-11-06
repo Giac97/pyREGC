@@ -7,7 +7,7 @@ MBARSurfaceAnalysis (observable='N_ads').
 import numpy as np
 import pytest
 
-from gcmc_re import LJCalculator, ReplicaExchangeGCMC, SlabSystem
+from regc import LJCalculator, ReplicaExchangeGCMC, SlabSystem
 
 
 def _slab(rng=None):
@@ -44,8 +44,8 @@ def test_adsorbed_cutoff_records_N_ads_alongside_N(mode):
 
 def test_N_ads_survives_save_load_and_reweights(tmp_path):
     pytest.importorskip("pymbar", reason="pip install pymbar to run this test")
-    from gcmc_re import MBARSurfaceAnalysis
-    from gcmc_re.io import load_samples, save_samples
+    from regc import MBARSurfaceAnalysis
+    from regc.io import load_samples, save_samples
 
     with ReplicaExchangeGCMC([1.0, 1.5], [-2.0, 0.0], _slab, seed=3,
                              adsorbed_cutoff=2.0) as sim:
@@ -66,7 +66,7 @@ def test_N_ads_survives_save_load_and_reweights(tmp_path):
 
 def test_N_ads_missing_is_a_clear_error():
     pytest.importorskip("pymbar", reason="pip install pymbar to run this test")
-    from gcmc_re import MBARSurfaceAnalysis
+    from regc import MBARSurfaceAnalysis
 
     with ReplicaExchangeGCMC([1.0], [-2.0, 0.0], _slab, seed=3) as sim:
         sim.run(n_cycles=10, sweeps_per_cycle=5, record_every=2, verbose=False)

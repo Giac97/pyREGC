@@ -1,5 +1,5 @@
 """
-End-to-end tests for gcmc_re.runner, using the fast native LJCalculator
+End-to-end tests for regc.runner, using the fast native LJCalculator
 (not EMT) so these run in a couple of seconds. Real EMT usage is exercised
 manually in examples/09 (too slow for the routine test suite).
 """
@@ -12,7 +12,7 @@ import pytest
 ase = pytest.importorskip("ase", reason="pip install ase to run this test")
 pytest.importorskip("pymbar", reason="pip install pymbar to run this test")
 
-from gcmc_re.runner import (analyze_from_config, load_config, main, run_from_config,  # noqa: E402
+from regc.runner import (analyze_from_config, load_config, main, run_from_config,  # noqa: E402
                             setup_from_config)
 
 
@@ -176,8 +176,8 @@ def test_keys_of_the_other_scheme_are_rejected(base_config):
 
 
 def test_bad_phase_diagram_fails_before_sampling(base_config, monkeypatch):
-    import gcmc_re.engine
-    monkeypatch.setattr(gcmc_re.engine.ReplicaExchangeGCMC, "run",
+    import regc.engine
+    monkeypatch.setattr(regc.engine.ReplicaExchangeGCMC, "run",
                         lambda *a, **k: pytest.fail("sampled before validating"))
     base_config["phase_diagram"]["coverage_per"] = "volume"
     with pytest.raises(ValueError, match="coverage_per"):
@@ -209,7 +209,7 @@ def _pair_lj_config(tmp_path):
 
 
 def test_pressure_ladder_pair_lj_n_ads(tmp_path):
-    from gcmc_re import DiatomicReservoir, kelvin_to_eV
+    from regc import DiatomicReservoir, kelvin_to_eV
     cfg = _pair_lj_config(tmp_path)
     result = run_from_config(cfg, verbose=False)
     setup = result["setup"]

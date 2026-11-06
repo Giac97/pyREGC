@@ -45,10 +45,10 @@ import os
 import numpy as np
 from ase.build import fcc111
 
-from gcmc_re import (MBARSurfaceAnalysis, MonatomicIdealGasReservoir, PairLJCalculator,
+from regc import (MBARSurfaceAnalysis, MonatomicIdealGasReservoir, PairLJCalculator,
                      ReplicaExchangeGCMC, kelvin_to_eV, load_samples, run_with_checkpoints,
                      slab_geometry_from_atoms)
-from gcmc_re.io import load_pickle
+from regc.io import load_pickle
 
 LATTICE_VECTOR = 11.489                      # A, 3x3 hexagonal surface cell
 PAIR_PARAMS = {("A", "B"): (0.66, 1.91), ("B", "B"): (0.01, 1.2)}   # (eps eV, sigma A)

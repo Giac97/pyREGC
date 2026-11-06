@@ -8,7 +8,7 @@ import pytest
 ase = pytest.importorskip("ase", reason="pip install ase to run this test")
 from ase.io import read  # noqa: E402
 
-from gcmc_re import LJCalculator, LJSystem, ReplicaExchangeGCMC, SlabLJSystem
+from regc import LJCalculator, LJSystem, ReplicaExchangeGCMC, SlabLJSystem
 
 
 def test_trajectory_files_and_frame_count(tmp_path):

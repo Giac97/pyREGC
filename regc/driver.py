@@ -3,7 +3,7 @@ Long REGC runs: chunks, checkpoints, convergence, wall-time limits.
 
 `run_with_checkpoints` drives `ReplicaExchangeGCMC.run_regc` in chunks.
 After every chunk it writes the samples (``samples.npz``, see
-`gcmc_re.io`) and a full checkpoint (``checkpoint.pkl``); it applies
+`regc.io`) and a full checkpoint (``checkpoint.pkl``); it applies
 [ZSG]'s convergence criterion (the reduced-energy densities rho(u) stop
 changing, `ReplicaExchangeGCMC.rho_u_change`) and can stop cleanly before a
 time limit. Called again on the same directory with ``resume=True`` it

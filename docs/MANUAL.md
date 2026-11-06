@@ -1,6 +1,6 @@
-# gcmc_re user manual
+# regc user manual
 
-`gcmc_re` computes surface phase diagrams: the coverage of an adsorbate on
+`regc` computes surface phase diagrams: the coverage of an adsorbate on
 a slab as a function of temperature T and gas pressure p. It runs
 replica-exchange grand-canonical Monte Carlo (REGC) on a grid of
 (T, mu) replicas, as in Zhou, Scheffler and Ghiringhelli, Phys. Rev. B
@@ -12,7 +12,7 @@ You can use it in two ways:
 - **As a Python library** (Part I): you build the structure, potential,
   gas reservoir and replica grid yourself, and keep full control.
 - **As a standalone program** (Part II): you describe the study in one
-  YAML (or JSON) file and run `gcmc-re-run config.yaml`.
+  YAML (or JSON) file and run `regc-run config.yaml`.
 
 Both use the same code, and the same study gives the same kind of
 output either way. Part III collects practical advice and
@@ -68,6 +68,10 @@ mamba activate gcmc_re
 pytest                                  # optional: the test suite, about 1 minute
 ```
 
+The environment keeps the package's former name, `gcmc_re`. The package
+itself is `regc`. `import gcmc_re` and `gcmc-re-run` still work as
+deprecated aliases, so old scripts and checkpoints keep loading.
+
 With pip:
 
 ```bash
@@ -88,7 +92,7 @@ yourself (`hpc/build_lammps.sh`) for pair styles that conda-forge lacks,
 such as `grace/fs`.
 
 The core needs only numpy. Every optional dependency is imported inside
-the function that needs it, so `import gcmc_re` always works.
+the function that needs it, so `import regc` always works.
 
 ### Units
 
@@ -239,7 +243,7 @@ monatomic gas. It needs `ase`, `pymbar` and `matplotlib`, and takes about
 import os
 import numpy as np
 from ase.build import fcc100
-from gcmc_re import (MBARSurfaceAnalysis, MonatomicIdealGasReservoir, PairLJCalculator,
+from regc import (MBARSurfaceAnalysis, MonatomicIdealGasReservoir, PairLJCalculator,
                      ReplicaExchangeGCMC, kelvin_to_eV, load_samples, plot_phase_diagram,
                      save_samples, slab_geometry_from_atoms)
 
@@ -380,7 +384,7 @@ Build the slab at the potential's own lattice constant, otherwise the
 slab carries strain:
 
 ```python
-from gcmc_re import cubic_lattice_constant
+from regc import cubic_lattice_constant
 a = cubic_lattice_constant(ase_calc, "Fe", crystal="bcc", a_range=(2.3, 3.5))
 ```
 
@@ -428,7 +432,7 @@ numbers. Lower `r_cut` / `r_cut_factor`, or use a larger cell.
 ### 3.2 LAMMPS
 
 ```python
-from gcmc_re import LammpsCalculator, eam_pair_commands, lammps_ase_calculator
+from regc import LammpsCalculator, eam_pair_commands, lammps_ase_calculator
 
 pair = eam_pair_commands("FeH_Wen.eam.fs", ["Fe", "H"])    # style from the file name
 pair = ["pair_style pace", "pair_coeff * * FeH.yace Fe H"]   # ...or any pair style
@@ -454,7 +458,7 @@ ase_calc = lammps_ase_calculator(pair, ["Fe", "H"])         # same potential, AS
 ```python
 import functools
 from ase.calculators.eam import EAM
-from gcmc_re import ASECalculatorAdapter
+from regc import ASECalculatorAdapter
 
 factory = functools.partial(EAM, potential="FeH_Wen.eam.fs")
 calc = ASECalculatorAdapter(factory, cell=[geometry.cell_xy[0, 0], geometry.cell_xy[1, 1], geometry.Lz],
@@ -493,7 +497,7 @@ Build it from the same potential as the slab.
 ### 4.1 Diatomic gases (H2, O2, ...)
 
 ```python
-from gcmc_re import DiatomicReservoir
+from regc import DiatomicReservoir
 
 h2 = DiatomicReservoir.from_calculator(ase_calc, "H", d0="self")
 print(h2.D0_eV, h2.e_atom_eV, h2.calculator_info)
@@ -536,7 +540,7 @@ shifts μ_O by −½ kT ln 3, about −0.02 eV at 500 K.
 ### 4.2 Monatomic gases
 
 ```python
-from gcmc_re import MonatomicIdealGasReservoir
+from regc import MonatomicIdealGasReservoir
 ar = MonatomicIdealGasReservoir(mass_amu=39.95, e_atom_eV=0.0)
 ```
 
@@ -551,7 +555,7 @@ ar = MonatomicIdealGasReservoir(mass_amu=39.95, e_atom_eV=0.0)
 | `mu_at_T_eV(T_eV, p, unit="Pa")` | μ with the engine's temperature unit |
 | `analysis_functions(unit="Pa")` | `(mu_of_Tp, p_of_Tmu)` for MBAR |
 
-For lower-level work, `gcmc_re.reservoir` also has
+For lower-level work, `regc.reservoir` also has
 `diatomic_dissociation_energy_eV`, `diatomic_gas_mu_eV`,
 `mu_atomic_from_diatomic_reservoir_eV` and
 `pressure_from_atomic_mu_reservoir_pascal`.
@@ -678,7 +682,7 @@ checkpoints.
 ## 7. Long runs: checkpoints and batch jobs
 
 ```python
-from gcmc_re import run_with_checkpoints, EXIT_RESUBMIT
+from regc import run_with_checkpoints, EXIT_RESUBMIT
 
 status = run_with_checkpoints(sim, "run_dir", n_steps=20000, chunk=1000,
                               x0=0.9, diffusion="md", diffusion_steps=40, record_every=10,
@@ -722,7 +726,7 @@ For finer control there are `sim.save_checkpoint(path, extra=None)` and
 ## 8. Saving and loading samples
 
 ```python
-from gcmc_re import save_samples, load_samples
+from regc import save_samples, load_samples
 save_samples(sim, "samples.npz")
 samples = load_samples("samples.npz", discard=0.2)   # drop the first 20% per replica
 ```
@@ -736,7 +740,7 @@ finished simulation. `samples.discard(fraction)` drops more data later.
 ## 9. Analysis with MBAR
 
 ```python
-from gcmc_re import MBARSurfaceAnalysis
+from regc import MBARSurfaceAnalysis
 analysis = MBARSurfaceAnalysis(samples, reservoir=h2, pressure_unit="bar")
 ```
 
@@ -783,7 +787,7 @@ adsorbed.
 **Plotting.**
 
 ```python
-from gcmc_re import plot_phase_diagram
+from regc import plot_phase_diagram
 plot_phase_diagram(T_grid_K, p_grid, theta, save_path="theta.png",
                    colorbar_label="H per surface Fe", xlabel="p(H2) (bar)", ylabel="T (K)",
                    coexistence=None)
@@ -857,7 +861,7 @@ structure file.
 import numpy as np
 from ase.io import read
 from ase.calculators.emt import EMT
-from gcmc_re import (ASECalculatorAdapter, DiatomicReservoir, MBARSurfaceAnalysis,
+from regc import (ASECalculatorAdapter, DiatomicReservoir, MBARSurfaceAnalysis,
                      ReplicaExchangeGCMC, kelvin_to_eV, load_samples, save_samples,
                      slab_geometry_from_atoms)
 
@@ -920,7 +924,7 @@ the same grid with substrate MC moves and with HMC.
 ```python
 import numpy as np
 from ase.build import fcc100
-from gcmc_re import (MonatomicIdealGasReservoir, PairLJCalculator, ReplicaExchangeGCMC,
+from regc import (MonatomicIdealGasReservoir, PairLJCalculator, ReplicaExchangeGCMC,
                      kelvin_to_eV, slab_geometry_from_atoms)
 
 slab = fcc100("Cu", size=(3, 3, 3), a=3.6, vacuum=None, orthogonal=True)
@@ -968,7 +972,7 @@ What to notice:
 
 ```python
 from ase.build import fcc100
-from gcmc_re import (MonatomicIdealGasReservoir, PairLJCalculator, ReplicaExchangeGCMC,
+from regc import (MonatomicIdealGasReservoir, PairLJCalculator, ReplicaExchangeGCMC,
                      kelvin_to_eV, run_with_checkpoints, slab_geometry_from_atoms)
 
 geometry = slab_geometry_from_atoms(fcc100("Cu", size=(3, 3, 2), a=3.6, vacuum=None,
@@ -1034,7 +1038,7 @@ The samples of §1, analysed in more ways:
 
 ```python
 import numpy as np
-from gcmc_re import MBARSurfaceAnalysis, MonatomicIdealGasReservoir, kelvin_to_eV, load_samples
+from regc import MBARSurfaceAnalysis, MonatomicIdealGasReservoir, kelvin_to_eV, load_samples
 
 gas = MonatomicIdealGasReservoir(mass_amu=1.008)
 samples = load_samples("tutorial/samples.npz")
@@ -1108,7 +1112,7 @@ reservoir. The ladder runs along the total pressure.
 ```python
 import numpy as np
 from ase.build import fcc100
-from gcmc_re import (MBARSurfaceAnalysis, MonatomicIdealGasReservoir, PairLJCalculator,
+from regc import (MBARSurfaceAnalysis, MonatomicIdealGasReservoir, PairLJCalculator,
                      ReplicaExchangeGCMC, kelvin_to_eV, load_samples, save_samples,
                      slab_geometry_from_atoms)
 
@@ -1169,7 +1173,7 @@ comes from the potential itself. It needs LAMMPS and a cluster node:
 ```python
 import numpy as np
 from ase.build import bcc100
-from gcmc_re import (DiatomicReservoir, LammpsCalculator, MBARSurfaceAnalysis, ReplicaExchangeGCMC,
+from regc import (DiatomicReservoir, LammpsCalculator, MBARSurfaceAnalysis, ReplicaExchangeGCMC,
                      cubic_lattice_constant, eam_pair_commands, kelvin_to_eV,
                      lammps_ase_calculator, load_samples, run_with_checkpoints,
                      slab_geometry_from_atoms)
@@ -1217,7 +1221,7 @@ reservoir from the saved numbers:
 
 # Part II: the standalone program (YAML)
 
-The `gcmc-re-run` command (installed with the package) runs the whole
+The `regc-run` command (installed with the package) runs the whole
 pipeline from one config file: structure → calculator → reservoir →
 REGC → MBAR → plot. Configs can be YAML (`.yaml`/`.yml`, needs PyYAML)
 or JSON (`.json`).
@@ -1276,7 +1280,7 @@ First check the setup. This builds everything and prints the μ ladder,
 but samples nothing:
 
 ```
-$ gcmc-re-run tutorial.yaml --check
+$ regc-run tutorial.yaml --check
 slab: 18 frozen + 0 displaceable slab atoms, 9 per surface layer, cell |a1| = 7.637 A, |a2| = 7.637 A (rectangular), mobile species in z in (0, 4.00] A
 H reservoir (MonatomicIdealGasReservoir): e_atom = 0.0000 eV
 replica grid: 3 T x 4 p = 12 replicas
@@ -1293,7 +1297,7 @@ bare-slab energy: 0.0000 eV (PAIRLJ calculator works)
 Then run it:
 
 ```
-$ gcmc-re-run tutorial.yaml
+$ regc-run tutorial.yaml
 ...
 Saved phase diagram to tutorial_yaml/phase_diagram.png
 $ ls tutorial_yaml
@@ -1480,7 +1484,7 @@ directory then holds `checkpoint.pkl`, `samples.npz`,
 ## 13. Command-line reference
 
 ```
-gcmc-re-run CONFIG [--check | --analyze-only] [--resume] [--overwrite]
+regc-run CONFIG [--check | --analyze-only] [--resume] [--overwrite]
                    [--time-limit SECONDS] [--workers N] [-q]
 ```
 
@@ -1732,7 +1736,7 @@ A job that resubmits itself until the run is complete:
 #SBATCH --cpus-per-task=36
 #SBATCH --time=24:00:00
 set -uo pipefail
-gcmc-re-run fe100.yaml --resume --workers "$SLURM_CPUS_PER_TASK" --time-limit 85800
+regc-run fe100.yaml --resume --workers "$SLURM_CPUS_PER_TASK" --time-limit 85800
 rc=$?
 if [ $rc -eq 75 ]; then sbatch "$0"; exit 0; fi      # not finished: next job continues
 exit $rc
@@ -1753,7 +1757,7 @@ exit $rc
 The runner is an ordinary module. A config is just a dict:
 
 ```python
-from gcmc_re.runner import (load_config, validate_config, setup_from_config,
+from regc.runner import (load_config, validate_config, setup_from_config,
                             run_from_config, analyze_from_config, check_config)
 
 config = load_config("tutorial.yaml")        # YAML or JSON; resolves relative paths

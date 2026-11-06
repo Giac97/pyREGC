@@ -1,5 +1,5 @@
 """
-Check that this environment can run gcmc_re's Fe-H example on the cluster.
+Check that this environment can run regc's Fe-H example on the cluster.
 
     python hpc/check_env.py            # EAM styles
     python hpc/check_env.py --grace    # also require pair_style grace/fs
@@ -26,7 +26,7 @@ def report(name: str, good: bool, detail: str = "") -> None:
 
 
 print("Python packages:")
-for mod in ("numpy", "scipy", "ase", "pymbar", "matplotlib", "gcmc_re"):
+for mod in ("numpy", "scipy", "ase", "pymbar", "matplotlib", "regc"):
     try:
         m = importlib.import_module(mod)
         report(mod, True, getattr(m, "__version__", ""))

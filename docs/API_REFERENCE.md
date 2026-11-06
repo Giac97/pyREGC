@@ -1,28 +1,28 @@
-# gcmc_re API reference
+# regc API reference
 
-Generated from the docstrings of gcmc_re 0.2.0 by `docs/build_api_reference.py`; do not edit by hand. For how to use these pieces together, see [MANUAL.md](MANUAL.md).
+Generated from the docstrings of regc by `docs/build_api_reference.py`; do not edit by hand. For how to use these pieces together, see [MANUAL.md](MANUAL.md).
 
-Everything below is importable as `from gcmc_re import <name>`, except the runner functions at the end.
+Everything below is importable as `from regc import <name>`, except the runner functions at the end.
 
 ## Contents
 
-- [Calculators (`gcmc_re.calculators`)](#calculators-gcmc_recalculators): `Calculator`, `LJCalculator`, `PairLJCalculator`, `ASECalculatorAdapter`
-- [LAMMPS backend (`gcmc_re.lammps_backend`)](#lammps-backend-gcmc_relammps_backend): `LammpsCalculator`, `eam_pair_commands`, `lammps_ase_calculator`
-- [Systems (`gcmc_re.systems`)](#systems-gcmc_resystems): `ParticleSystem`, `BulkSystem`, `SlabSystem`, `LJSystem`, `SlabLJSystem`
-- [Structures and slab geometry (`gcmc_re.structures`)](#structures-and-slab-geometry-gcmc_restructures): `cubic_lattice_constant`, `slab_geometry_from_atoms`, `SlabGeometry`, `insertion_energy_scan`
-- [Thermodynamic state (`gcmc_re.state`)](#thermodynamic-state-gcmc_restate): `ThermoState`
-- [Replicas (`gcmc_re.replica`)](#replicas-gcmc_rereplica): `Replica`
-- [The replica-exchange engine (`gcmc_re.engine`)](#the-replica-exchange-engine-gcmc_reengine): `ReplicaExchangeGCMC`, `SWAP_TYPES`
-- [Checkpointed runs (`gcmc_re.driver`)](#checkpointed-runs-gcmc_redriver): `run_with_checkpoints`, `RunStatus`, `EXIT_RESUBMIT`
-- [Sample I/O (`gcmc_re.io`)](#sample-io-gcmc_reio): `save_samples`, `load_samples`, `SampleSet`
-- [Units (`gcmc_re.units`)](#units-gcmc_reunits): `kelvin_to_eV`, `eV_to_kelvin`, `pascal_per`, `PRESSURE_UNITS`, `ThermalWavelengthCubed`, `SpeciesLambdaCubed`, `thermal_wavelength_angstrom`, `thermal_wavelength_cubed_angstrom3`, `default_mass_amu`
-- [Reduced-unit pressure conventions (`gcmc_re.pressure`)](#reduced-unit-pressure-conventions-gcmc_repressure): `p0_reduced_units`, `p0_ideal_gas_wavelength`, `mu_from_pressure`, `pressure_from_mu`, `mu_grid_from_pressures`, `invert_mu_of_Tp`
-- [Gas reservoirs (`gcmc_re.reservoir`)](#gas-reservoirs-gcmc_rereservoir): `Reservoir`, `MonatomicIdealGasReservoir`, `DiatomicReservoir`, `diatomic_dissociation_energy_eV`, `diatomic_gas_mu_eV`, `mu_atomic_from_diatomic_reservoir_eV`, `pressure_from_atomic_mu_reservoir_pascal`, `H2_BOND_LENGTH_ANGSTROM`, `H2_VIBRATIONAL_WAVENUMBER_CM`, `H_MASS_AMU`, `H2_MASS_AMU`, `H2_D0_EXPERIMENTAL_EV`
-- [MBAR analysis (`gcmc_re.analysis`)](#mbar-analysis-gcmc_reanalysis): `MBARSurfaceAnalysis`
-- [Plotting (`gcmc_re.plotting`)](#plotting-gcmc_replotting): `plot_phase_diagram`
-- [Config runner (`gcmc_re.runner`)](#config-runner-gcmc_rerunner): `load_config`, `validate_config`, `setup_from_config`, `run_from_config`, `analyze_from_config`, `check_config`, `main`
+- [Calculators (`regc.calculators`)](#calculators-regccalculators): `Calculator`, `LJCalculator`, `PairLJCalculator`, `ASECalculatorAdapter`
+- [LAMMPS backend (`regc.lammps_backend`)](#lammps-backend-regclammps_backend): `LammpsCalculator`, `eam_pair_commands`, `lammps_ase_calculator`
+- [Systems (`regc.systems`)](#systems-regcsystems): `ParticleSystem`, `BulkSystem`, `SlabSystem`, `LJSystem`, `SlabLJSystem`
+- [Structures and slab geometry (`regc.structures`)](#structures-and-slab-geometry-regcstructures): `cubic_lattice_constant`, `slab_geometry_from_atoms`, `SlabGeometry`, `insertion_energy_scan`
+- [Thermodynamic state (`regc.state`)](#thermodynamic-state-regcstate): `ThermoState`
+- [Replicas (`regc.replica`)](#replicas-regcreplica): `Replica`
+- [The replica-exchange engine (`regc.engine`)](#the-replica-exchange-engine-regcengine): `ReplicaExchangeGCMC`, `SWAP_TYPES`
+- [Checkpointed runs (`regc.driver`)](#checkpointed-runs-regcdriver): `run_with_checkpoints`, `RunStatus`, `EXIT_RESUBMIT`
+- [Sample I/O (`regc.io`)](#sample-io-regcio): `save_samples`, `load_samples`, `SampleSet`
+- [Units (`regc.units`)](#units-regcunits): `kelvin_to_eV`, `eV_to_kelvin`, `pascal_per`, `PRESSURE_UNITS`, `ThermalWavelengthCubed`, `SpeciesLambdaCubed`, `thermal_wavelength_angstrom`, `thermal_wavelength_cubed_angstrom3`, `default_mass_amu`
+- [Reduced-unit pressure conventions (`regc.pressure`)](#reduced-unit-pressure-conventions-regcpressure): `p0_reduced_units`, `p0_ideal_gas_wavelength`, `mu_from_pressure`, `pressure_from_mu`, `mu_grid_from_pressures`, `invert_mu_of_Tp`
+- [Gas reservoirs (`regc.reservoir`)](#gas-reservoirs-regcreservoir): `Reservoir`, `MonatomicIdealGasReservoir`, `DiatomicReservoir`, `diatomic_dissociation_energy_eV`, `diatomic_gas_mu_eV`, `mu_atomic_from_diatomic_reservoir_eV`, `pressure_from_atomic_mu_reservoir_pascal`, `H2_BOND_LENGTH_ANGSTROM`, `H2_VIBRATIONAL_WAVENUMBER_CM`, `H_MASS_AMU`, `H2_MASS_AMU`, `H2_D0_EXPERIMENTAL_EV`
+- [MBAR analysis (`regc.analysis`)](#mbar-analysis-regcanalysis): `MBARSurfaceAnalysis`
+- [Plotting (`regc.plotting`)](#plotting-regcplotting): `plot_phase_diagram`
+- [Config runner (`regc.runner`)](#config-runner-regcrunner): `load_config`, `validate_config`, `setup_from_config`, `run_from_config`, `analyze_from_config`, `check_config`, `main`
 
-## Calculators (`gcmc_re.calculators`)
+## Calculators (`regc.calculators`)
 
 ### `Calculator`
 
@@ -368,7 +368,7 @@ that order -- what `Replica`'s HMC move expects.
 
 - *numpy.ndarray*: Array of shape (n_substrate + n_mobile, 3): the force on each substrate atom (first) and mobile particle (last), as reported by the wrapped ASE calculator's `get_forces()`.
 
-## LAMMPS backend (`gcmc_re.lammps_backend`)
+## LAMMPS backend (`regc.lammps_backend`)
 
 ### `LammpsCalculator`
 
@@ -507,7 +507,7 @@ simulation's `LammpsCalculator` uses.
 
 - *ase.calculators.lammpslib.LAMMPSlib*: The calculator.
 
-## Systems (`gcmc_re.systems`)
+## Systems (`regc.systems`)
 
 ### `ParticleSystem`
 
@@ -1274,7 +1274,7 @@ Alias of [`BulkSystem`](#bulksystem), kept for older scripts.
 
 Alias of [`SlabSystem`](#slabsystem), kept for older scripts.
 
-## Structures and slab geometry (`gcmc_re.structures`)
+## Structures and slab geometry (`regc.structures`)
 
 ### `cubic_lattice_constant`
 
@@ -1289,7 +1289,7 @@ a finer scan around it is fitted with a parabola.
 
 **Parameters**
 
-- `ase_calculator` (*ase.calculators.calculator.Calculator*): The potential (e.g. ASE's EAM, or `gcmc_re.lammps_backend.lammps_ase_calculator`).
+- `ase_calculator` (*ase.calculators.calculator.Calculator*): The potential (e.g. ASE's EAM, or `regc.lammps_backend.lammps_ase_calculator`).
 - `symbol` (*str*): Element symbol.
 - `crystal` (*{'bcc', 'fcc', 'sc'}, optional*): Crystal structure. Default `'bcc'`.
 - `a_range` (*tuple of float, optional*): Range (A) of the coarse scan. Default (2.3, 3.5).
@@ -1419,7 +1419,7 @@ energies).
 
 - *numpy.ndarray*: Shape (len(xy_points), len(z_values)): insertion energies in eV. Points where the calculator returns NaN (e.g. exactly on top of an atom, r = 0) are reported as +inf, so `argmin` finds real minima.
 
-## Thermodynamic state (`gcmc_re.state`)
+## Thermodynamic state (`regc.state`)
 
 ### `ThermoState`
 
@@ -1443,7 +1443,7 @@ exactly as before.
 - `temperature` (*float*): Temperature, in the same energy-like units as the Calculator's reported energies (e.g. eV for EMT/EAM/MLIP calculators, or reduced units for `LJCalculator`).
 - `mu` (*float or numpy.ndarray*): Chemical potential, in the same units as `temperature`; one per exchanged species if there are several.
 - `label` (*tuple of int*): The (temperature_index, mu_index) position of this state in the replica-exchange grid.
-- `lambda_cubed` (*float or numpy.ndarray, optional*): Thermal de Broglie wavelength cubed, in whatever length units the system's volume/positions use (one per exchanged species if there are several). Default is 1.0, the correct, self-consistent choice in reduced Lennard-Jones units (it's equivalent to defining the LJ length unit sigma as the wavelength scale too) -- but it is NOT generally correct when a Calculator works in real physical units (e.g. ASE's EMT or a real EAM/MLIP, which report energies in eV using positions in Angstrom). There, supply the real value (see `gcmc_re.units.thermal_wavelength_cubed_angstrom3`) so the insertion/deletion acceptance formulas in `replica.py` stay dimensionally correct.
+- `lambda_cubed` (*float or numpy.ndarray, optional*): Thermal de Broglie wavelength cubed, in whatever length units the system's volume/positions use (one per exchanged species if there are several). Default is 1.0, the correct, self-consistent choice in reduced Lennard-Jones units (it's equivalent to defining the LJ length unit sigma as the wavelength scale too) -- but it is NOT generally correct when a Calculator works in real physical units (e.g. ASE's EMT or a real EAM/MLIP, which report energies in eV using positions in Angstrom). There, supply the real value (see `regc.units.thermal_wavelength_cubed_angstrom3`) so the insertion/deletion acceptance formulas in `replica.py` stay dimensionally correct.
 
 #### `ThermoState.beta` (property)
 
@@ -1461,7 +1461,7 @@ numpy.ndarray: `mu` as a 1D array (length 1 for one species).
 
 numpy.ndarray: `lambda_cubed` as a 1D array, broadcast to `mu_vec`.
 
-## Replicas (`gcmc_re.replica`)
+## Replicas (`regc.replica`)
 
 ### `Replica`
 
@@ -1642,7 +1642,7 @@ Compute the acceptance rate of each move type attempted so far.
 
 - *dict of str to float*: One entry per move type (`'displace'`, `'insert'`, `'delete'`, `'hmc'`, `'displace_substrate'`, and with several exchanged species `'insert_<s>'`/`'delete_<s>'`): the fraction of attempts of that type that were accepted (0.0 for a move type never attempted).
 
-## The replica-exchange engine (`gcmc_re.engine`)
+## The replica-exchange engine (`regc.engine`)
 
 ### `ReplicaExchangeGCMC`
 
@@ -1680,7 +1680,7 @@ under `'N_s'`. With one species everything is exactly as before.
 wavelength cubed (see `ThermoState.lambda_cubed`); the default (always
 1.0) is correct for reduced LJ units and a no-op for existing code. Real-
 units setups (e.g. an ASE EMT/EAM/MLIP calculator) should pass the true
-value -- see `gcmc_re.units.thermal_wavelength_cubed_angstrom3`.
+value -- see `regc.units.thermal_wavelength_cubed_angstrom3`.
 
 `hmc_enabled=True` (with `hmc_leapfrog_steps`/`hmc_dt`) replaces every
 replica's single-particle random displacement move with Hybrid Monte
@@ -1965,7 +1965,7 @@ Build a per-grid-point summary of the current simulation state.
 SWAP_TYPES = ('T', 'mu', 'cross_left', 'cross_right')
 ```
 
-## Checkpointed runs (`gcmc_re.driver`)
+## Checkpointed runs (`regc.driver`)
 
 ### `run_with_checkpoints`
 
@@ -2026,7 +2026,7 @@ Outcome of `run_with_checkpoints`.
 EXIT_RESUBMIT = 75
 ```
 
-## Sample I/O (`gcmc_re.io`)
+## Sample I/O (`regc.io`)
 
 ### `save_samples`
 
@@ -2134,7 +2134,7 @@ Drop the first part of every replica's samples (equilibration).
 
 - *ValueError*: If `fraction` is not in [0, 1).
 
-## Units (`gcmc_re.units`)
+## Units (`regc.units`)
 
 ### `kelvin_to_eV`
 
@@ -2230,7 +2230,7 @@ The callable `ReplicaExchangeGCMC`'s and `MBARSurfaceAnalysis`'s
 this package are k_B*T in eV, lengths in Angstrom. Unlike an ad-hoc
 lambda it is picklable, valid at any temperature (MBAR evaluates it off
 the replica ladder), and records its mass, so saved samples can restore
-it (see `gcmc_re.io`).
+it (see `regc.io`).
 
 **Parameters**
 
@@ -2263,7 +2263,7 @@ Lambda^3(T) of several exchanged species, as one callable.
 What `ReplicaExchangeGCMC`'s `lambda_cubed_of_T` takes when more than
 one species is exchanged (e.g. O and Cl): calling it returns one
 Lambda^3 per species, in the order of `system.exchange_species`.
-Picklable, and saved/restored by `gcmc_re.io` when every entry is a
+Picklable, and saved/restored by `regc.io` when every entry is a
 `ThermalWavelengthCubed`.
 
 **Parameters**
@@ -2356,7 +2356,7 @@ not given an explicit `mass_of_species` entry.
 
 - *float*: The real atomic mass in atomic mass units, looked up via ASE's data tables, if `species` is a recognized element symbol and ASE is installed. Otherwise 1.0 -- the reduced-units convention this package's LJ examples already assume, where mass=1 alongside sigma=epsilon=1.
 
-## Reduced-unit pressure conventions (`gcmc_re.pressure`)
+## Reduced-unit pressure conventions (`regc.pressure`)
 
 ### `p0_reduced_units`
 
@@ -2505,7 +2505,7 @@ root-finding in p itself is numerically hopeless.
 
 - *RuntimeError*: If `p_bracket`, even after `max_bracket_expansions` geometric expansions in each direction, does not bracket a sign change.
 
-## Gas reservoirs (`gcmc_re.reservoir`)
+## Gas reservoirs (`regc.reservoir`)
 
 ### `Reservoir`
 
@@ -2581,7 +2581,7 @@ Chemical potentials of a (temperature x pressure) replica ladder.
 
 - `temperatures_K` (*sequence of float*): Temperatures, in Kelvin.
 - `pressures` (*sequence of float*): Pressures, in `unit`.
-- `unit` (*str, optional*): Pressure unit (see `gcmc_re.units.PRESSURE_UNITS`). Default `'Pa'`.
+- `unit` (*str, optional*): Pressure unit (see `regc.units.PRESSURE_UNITS`). Default `'Pa'`.
 
 **Returns**
 
@@ -2803,7 +2803,7 @@ calculator; D0 does too unless `d0` says otherwise.
 
 **Parameters**
 
-- `ase_calculator` (*ase.calculators.calculator.Calculator*): The potential the simulation uses (e.g. ASE's EAM, or `gcmc_re.lammps_backend.lammps_ase_calculator`).
+- `ase_calculator` (*ase.calculators.calculator.Calculator*): The potential the simulation uses (e.g. ASE's EAM, or `regc.lammps_backend.lammps_ase_calculator`).
 - `symbol` (*str, optional*): Element of the homonuclear molecule. Default `'H'`.
 - `d0` (*{'self', 'experimental'} or float, optional*): `'self'`: the potential's D0 (default, consistent); `'experimental'`: 4.478 eV (H2 only), for potentials whose molecule is poor; a number: that D0 in eV.
 - `bond_length_angstrom, vib_wavenumber_cm` (*float, optional*): Spectroscopic constants of the real molecule; default to H2's for `symbol='H'`, required otherwise.
@@ -2986,7 +2986,7 @@ H2_MASS_AMU = 2.016
 H2_D0_EXPERIMENTAL_EV = 4.478
 ```
 
-## MBAR analysis (`gcmc_re.analysis`)
+## MBAR analysis (`regc.analysis`)
 
 ### `MBARSurfaceAnalysis`
 
@@ -3005,7 +3005,7 @@ Fit an MBAR reweighting model to a finished simulation's samples.
 
 The simplest way to get pressures right in real units is to pass the
 gas reservoir the simulation's mu grid came from (`reservoir`, a
-`gcmc_re.reservoir.Reservoir`): it sets `mu_of_Tp`/`p_of_Tmu`, with
+`regc.reservoir.Reservoir`): it sets `mu_of_Tp`/`p_of_Tmu`, with
 pressures in `pressure_unit`. The lower-level options below remain
 for other conventions.
 
@@ -3025,13 +3025,13 @@ the root sits at an extreme pressure, just more expensive per call.
 
 **Parameters**
 
-- `sim` (*ReplicaExchangeGCMC or gcmc_re.io.SampleSet*): The finished simulation (or its saved samples, `load_samples`); must have recorded samples (`sim.samples[key]['U'/'N']`) for every grid point.
+- `sim` (*ReplicaExchangeGCMC or regc.io.SampleSet*): The finished simulation (or its saved samples, `load_samples`); must have recorded samples (`sim.samples[key]['U'/'N']`) for every grid point.
 - `solver_protocol` (*str, optional*): The pymbar solver protocol to use. Default is `"robust"`.
 - `p0_of_T` (*callable, optional*): A function `p0_of_T(T) -> float` giving the reference pressure at temperature T, for the default simple ideal-gas mu-pressure relationship. Default is `p0_reduced_units`. Ignored if `mu_of_Tp` is given.
 - `mu_of_Tp` (*callable, optional*): A function `mu_of_Tp(T, p) -> mu` overriding `p0_of_T` entirely, for a reservoir with a non-simple mu-pressure relationship. Default is None.
 - `p_of_Tmu` (*callable, optional*): A function `p_of_Tmu(T, mu) -> p`, the inverse of `mu_of_Tp`. Default is None, which falls back to numerically inverting `mu_of_Tp` (or, with neither given, the closed-form inverse of `p0_of_T`'s relationship).
 - `lambda_cubed_of_T` (*callable, optional*): A function `lambda_cubed_of_T(T) -> float` giving the thermal de Broglie wavelength cubed used during sampling. It enters the reduced potential as `N * ln(Lambda^3(T))` (see `_u_of_state`). Default is None, which uses `sim.lambda_cubed_of_T` if the simulation has one, else Lambda^3 = 1 (reduced units).
-- `reservoir` (*gcmc_re.reservoir.Reservoir, optional*): Sets `mu_of_Tp` and `p_of_Tmu` (unless given explicitly) from `Reservoir.analysis_functions`. Default None.
+- `reservoir` (*regc.reservoir.Reservoir, optional*): Sets `mu_of_Tp` and `p_of_Tmu` (unless given explicitly) from `Reservoir.analysis_functions`. Default None.
 - `pressure_unit` (*str, optional*): Pressure unit for `reservoir` (`'Pa'`, `'bar'`, `'atm'`). Default `'Pa'`.
 
 **Raises**
@@ -3445,7 +3445,7 @@ The phase boundary on the (T, p) diagram.
 
 - *list of tuple of float*: `(T, p_coex)` pairs, one per T in `T_grid` where a coexistence pressure was found. Skips (and reports, if `verbose`) any T where no bimodal crossing is found, rather than raising.
 
-## Plotting (`gcmc_re.plotting`)
+## Plotting (`regc.plotting`)
 
 ### `plot_phase_diagram`
 
@@ -3484,9 +3484,9 @@ linear) edge-averaging is exactly right.
 
 - *None*: Saves the figure to `save_path` and returns nothing.
 
-## Config runner (`gcmc_re.runner`)
+## Config runner (`regc.runner`)
 
-Not exported at the package top level: `from gcmc_re.runner import ...`. The config file format is in MANUAL.md, Part II.
+Not exported at the package top level: `from regc.runner import ...`. The config file format is in MANUAL.md, Part II.
 
 ### `load_config`
 
@@ -3594,7 +3594,7 @@ MBAR (T, p) phase diagram from the samples a run saved.
 Reads `samples.npz` and `run_metadata.json` from
 `output.directory` (no calculator is needed: the reservoirs are
 rebuilt from the metadata), so a finished run can be re-analysed with
-other `phase_diagram` settings (`gcmc-re-run --analyze-only`).
+other `phase_diagram` settings (`regc-run --analyze-only`).
 
 **Parameters**
 
@@ -3636,7 +3636,7 @@ Build the setup and print it, with the mu ladder, without sampling.
 main(argv: Optional[list] = None) -> int
 ```
 
-Command-line entry point: `gcmc-re-run config.yaml`.
+Command-line entry point: `regc-run config.yaml`.
 
 Runs the structure -> REGC -> MBAR -> (T, p) phase diagram pipeline of
 `run_from_config` for one config file; `--check` only builds and

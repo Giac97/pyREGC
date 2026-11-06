@@ -202,7 +202,7 @@ class ThermalWavelengthCubed:
     this package are k_B*T in eV, lengths in Angstrom. Unlike an ad-hoc
     lambda it is picklable, valid at any temperature (MBAR evaluates it off
     the replica ladder), and records its mass, so saved samples can restore
-    it (see `gcmc_re.io`).
+    it (see `regc.io`).
 
     Parameters
     ----------
@@ -262,7 +262,7 @@ class SpeciesLambdaCubed:
     What `ReplicaExchangeGCMC`'s ``lambda_cubed_of_T`` takes when more than
     one species is exchanged (e.g. O and Cl): calling it returns one
     Lambda^3 per species, in the order of ``system.exchange_species``.
-    Picklable, and saved/restored by `gcmc_re.io` when every entry is a
+    Picklable, and saved/restored by `regc.io` when every entry is a
     `ThermalWavelengthCubed`.
 
     Parameters

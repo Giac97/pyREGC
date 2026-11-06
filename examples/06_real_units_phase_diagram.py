@@ -20,7 +20,7 @@ import numpy as np
 from ase.build import fcc111
 from ase.calculators.emt import EMT
 
-from gcmc_re import (
+from regc import (
     ASECalculatorAdapter,
     DiatomicReservoir,
     MBARSurfaceAnalysis,

@@ -2,7 +2,7 @@
 Config-file-driven end-to-end runner: structure -> REGC -> MBAR -> (T, p)
 surface phase diagram, all from one YAML or JSON file.
 
-``gcmc-re-run config.yaml`` (or `run_from_config` on a dict) does what
+``regc-run config.yaml`` (or `run_from_config` on a dict) does what
 ``examples/13_fe_h_eam_surface.py`` does in Python:
 
 1. **structure** -- read any ASE-readable slab (``structure.file``) or build
@@ -1345,7 +1345,7 @@ def analyze_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[st
     Reads ``samples.npz`` and ``run_metadata.json`` from
     ``output.directory`` (no calculator is needed: the reservoirs are
     rebuilt from the metadata), so a finished run can be re-analysed with
-    other ``phase_diagram`` settings (``gcmc-re-run --analyze-only``).
+    other ``phase_diagram`` settings (``regc-run --analyze-only``).
 
     Parameters
     ----------
@@ -1473,7 +1473,7 @@ def check_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def main(argv: Optional[list] = None) -> int:
     """
-    Command-line entry point: ``gcmc-re-run config.yaml``.
+    Command-line entry point: ``regc-run config.yaml``.
 
     Runs the structure -> REGC -> MBAR -> (T, p) phase diagram pipeline of
     `run_from_config` for one config file; ``--check`` only builds and
@@ -1494,7 +1494,7 @@ def main(argv: Optional[list] = None) -> int:
 
     from .driver import EXIT_RESUBMIT
     parser = argparse.ArgumentParser(
-        prog="gcmc-re-run",
+        prog="regc-run",
         description="Structure -> replica-exchange GCMC -> MBAR -> (T, p) phase diagram, "
                     "from a YAML/JSON config (see examples/pd111_emt_example.yaml).")
     parser.add_argument("config", help="config file (.yaml/.yml or .json)")

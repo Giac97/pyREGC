@@ -13,7 +13,7 @@ Requires: pip install pymbar matplotlib
 
 import numpy as np
 
-from gcmc_re import (
+from regc import (
     LJCalculator,
     MBARSurfaceAnalysis,
     ReplicaExchangeGCMC,

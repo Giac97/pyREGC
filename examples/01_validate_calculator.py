@@ -12,7 +12,7 @@ Requires: pip install ase
 import numpy as np
 from ase.calculators.lj import LennardJones as ASELennardJones
 
-from gcmc_re import ASECalculatorAdapter, LJCalculator, BulkSystem
+from regc import ASECalculatorAdapter, LJCalculator, BulkSystem
 
 rng = np.random.default_rng(0)
 L = 6.0
