@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
+
 # CODATA 2018 values (the same ones ASE's own ase.units module uses)
 PLANCK_H = 6.62607015e-34          # J s
 BOLTZMANN_K_SI = 1.380649e-23      # J / K
@@ -251,3 +253,74 @@ class ThermalWavelengthCubed:
             ``ThermalWavelengthCubed(mass_amu=...)``.
         """
         return f"ThermalWavelengthCubed(mass_amu={self.mass_amu})"
+
+
+class SpeciesLambdaCubed:
+    """
+    Lambda^3(T) of several exchanged species, as one callable.
+
+    What `ReplicaExchangeGCMC`'s ``lambda_cubed_of_T`` takes when more than
+    one species is exchanged (e.g. O and Cl): calling it returns one
+    Lambda^3 per species, in the order of ``system.exchange_species``.
+    Picklable, and saved/restored by `gcmc_re.io` when every entry is a
+    `ThermalWavelengthCubed`.
+
+    Parameters
+    ----------
+    per_species : sequence of callable
+        One ``lambda_cubed_of_T(T) -> float`` per exchanged species, e.g.
+        ``[ThermalWavelengthCubed(15.999), ThermalWavelengthCubed(35.45)]``
+        or each reservoir's `Reservoir.lambda_cubed_of_T()`.
+
+    Examples
+    --------
+    >>> lam3 = SpeciesLambdaCubed([ThermalWavelengthCubed(15.999),
+    ...                            ThermalWavelengthCubed(35.45)])
+    >>> lam3(kelvin_to_eV(300.0)).shape
+    (2,)
+    """
+
+    def __init__(self, per_species):
+        """
+        Store the per-species callables.
+
+        Parameters
+        ----------
+        per_species : sequence of callable
+            One ``lambda_cubed_of_T(T) -> float`` per exchanged species.
+        """
+        self.per_species = tuple(per_species)
+
+    def __call__(self, T: float) -> np.ndarray:
+        """
+        Evaluate every species' Lambda^3 at one temperature.
+
+        Parameters
+        ----------
+        T : float
+            Temperature, in the package's energy units.
+
+        Returns
+        -------
+        numpy.ndarray
+            Shape (n_species,).
+        """
+        return np.array([float(f(T)) for f in self.per_species])
+
+    @property
+    def masses_amu(self):
+        """list of float or None: per-species masses, if all are `ThermalWavelengthCubed`."""
+        if all(isinstance(f, ThermalWavelengthCubed) for f in self.per_species):
+            return [f.mass_amu for f in self.per_species]
+        return None
+
+    def __repr__(self) -> str:
+        """
+        Representation listing the per-species callables.
+
+        Returns
+        -------
+        str
+            ``SpeciesLambdaCubed([...])``.
+        """
+        return f"SpeciesLambdaCubed({list(self.per_species)!r})"

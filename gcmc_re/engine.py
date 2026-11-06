@@ -42,12 +42,12 @@ import itertools
 from concurrent.futures import ProcessPoolExecutor
 from typing import Callable, Dict, List, Optional, Tuple
 
-from matplotlib.cbook import index_of
 import numpy as np
 
 from .replica import Replica
 from .state import ThermoState
 from .systems import ParticleSystem
+from .units import SpeciesLambdaCubed
 
 
 def _call_worker(payload: Tuple[Replica, str, dict]) -> Replica:
@@ -94,6 +94,16 @@ class ReplicaExchangeGCMC:
     Samples for MBAR are recorded per grid point as plain (U, N) pairs after
     `burn_in_cycles`, every `record_every` cycles (see `analysis.py`).
 
+    Several exchanged species (``system.exchange_species = ['O', 'Cl']``):
+    each grid point then has one mu per species, so `mus` gets a trailing
+    species axis -- shape (n_mu, n_species), shared across temperatures, or
+    (n_T, n_mu, n_species). The ladder stays 2D: its second axis is a path
+    through (mu_O, mu_Cl, ...) space, e.g. a gas feed of fixed composition
+    at increasing pressure. `lambda_cubed_of_T` then returns one Lambda^3
+    per species (pass a list of per-species callables, or a
+    `SpeciesLambdaCubed`), and samples also record the per-species counts
+    under ``'N_s'``. With one species everything is exactly as before.
+
     `lambda_cubed_of_T(T) -> float` sets each replica's thermal de Broglie
     wavelength cubed (see `ThermoState.lambda_cubed`); the default (always
     1.0) is correct for reduced LJ units and a no-op for existing code. Real-
@@ -127,7 +137,9 @@ class ReplicaExchangeGCMC:
         mus : array_like
             Either 1D (length n_mu, shared across all temperatures) or 2D
             (shape (n_T, n_mu), an explicit mu for every grid point --
-            what a pressure ladder needs; see `pressure.py`).
+            what a pressure ladder needs; see `pressure.py`). With several
+            exchanged species, shape (n_mu, n_species) or (n_T, n_mu,
+            n_species), species in ``system.exchange_species`` order.
         system_factory : callable
             A function ``system_factory(rng) -> ParticleSystem`` that
             builds a fresh system for each grid point, given that grid
@@ -141,11 +153,13 @@ class ReplicaExchangeGCMC:
         n_workers : int, optional
             Number of worker processes for parallel local sweeps. Default
             is 1 (serial, no process pool).
-        lambda_cubed_of_T : callable, optional
+        lambda_cubed_of_T : callable or sequence of callable, optional
             A function ``lambda_cubed_of_T(T) -> float`` giving each
             replica's thermal de Broglie wavelength cubed (see
             `ThermoState.lambda_cubed`). Default always returns 1.0,
-            correct for reduced LJ units.
+            correct for reduced LJ units. With several exchanged species
+            it may return one value per species, or be a list of one
+            callable per species (wrapped in `SpeciesLambdaCubed`).
         hmc_enabled : bool, optional
             If True, every replica uses Hybrid Monte Carlo instead of
             plain single-particle MC displacement (see `Replica`'s
@@ -166,51 +180,117 @@ class ReplicaExchangeGCMC:
         Raises
         ------
         ValueError
-            If `mus` is 2D and its first dimension doesn't match
-            ``len(temperatures)``, or if `mus` is neither 1D nor 2D.
+            If `mus` doesn't have one of the shapes above (for the number
+            of exchanged species the systems declare), if the systems
+            don't all exchange the same species, or if `lambda_cubed_of_T`
+            doesn't give one value (or one per species).
         """
         self.temperatures = list(temperatures)
+        n_T = len(self.temperatures)
         mus_arr = np.asarray(mus, dtype=float)
-        if mus_arr.ndim == 1:
-            self.mu_grid = np.tile(mus_arr, (len(self.temperatures), 1))
-        elif mus_arr.ndim == 2:
-            if mus_arr.shape[0] != len(self.temperatures):
-                raise ValueError("mus.shape[0] must equal len(temperatures)")
-            self.mu_grid = mus_arr
-        else:
-            raise ValueError("mus must be 1D or 2D (n_T, n_mu)")
-        self.shape = self.mu_grid.shape
+        if not callable(lambda_cubed_of_T):
+            lambda_cubed_of_T = SpeciesLambdaCubed(lambda_cubed_of_T)
         self.n_workers = n_workers
         self.lambda_cubed_of_T = lambda_cubed_of_T  # also read by MBARSurfaceAnalysis
         self.adsorbed_cutoff = adsorbed_cutoff
         self._executor: Optional[ProcessPoolExecutor] = None
 
+        # Build the systems first (same seeds, same order as before): they
+        # tell how many species are exchanged, which fixes the shape of `mus`
         master_rng = np.random.default_rng(seed)
+        rng = np.random.default_rng(master_rng.integers(0, 2 ** 62))
+        built = [((0, 0), rng, system_factory(rng))]
+        species = built[0][2].exchange_species_list
+        self.exchange_species: Tuple[str, ...] = species
+        self.n_species = len(species)
+        self.mu_grid = self._parse_mus(mus_arr, n_T, self.n_species)
+        self.shape = self.mu_grid.shape[:2]
+        for it, imu in itertools.product(range(self.shape[0]), range(self.shape[1])):
+            if (it, imu) != (0, 0):
+                rng = np.random.default_rng(master_rng.integers(0, 2 ** 62))
+                built.append(((it, imu), rng, system_factory(rng)))
+        if any(sysm.exchange_species_list != species for _, _, sysm in built):
+            raise ValueError("every system from system_factory must exchange the same species")
+
         self.grid: Dict[Tuple[int, int], Replica] = {}
         self.samples: Dict[Tuple[int, int], Dict[str, list]] = {}
-        for it, imu in itertools.product(range(self.shape[0]), range(self.shape[1])):
-            rng = np.random.default_rng(master_rng.integers(0, 2 ** 62))
-            system = system_factory(rng)
-            state = ThermoState(self.temperatures[it], self.mu_grid[it, imu], label=(it, imu),
-                                 lambda_cubed=lambda_cubed_of_T(self.temperatures[it]))
+        for (it, imu), rng, system in built:
+            T = self.temperatures[it]
+            if self.n_species == 1:
+                mu, lam3 = self.mu_grid[it, imu], lambda_cubed_of_T(T)
+            else:
+                mu = self.mu_grid[it, imu].copy()
+                lam3 = np.asarray(lambda_cubed_of_T(T), dtype=float)
+                if lam3.ndim > 1 or lam3.size not in (1, self.n_species):
+                    raise ValueError(f"lambda_cubed_of_T must give 1 or {self.n_species} "
+                                     f"values, got shape {lam3.shape}")
+                lam3 = np.broadcast_to(lam3, (self.n_species,)).copy()
+            state = ThermoState(T, mu, label=(it, imu), lambda_cubed=lam3)
             self.grid[(it, imu)] = Replica(state, system, rng, max_disp=max_disp,
                                             hmc_enabled=hmc_enabled,
                                             hmc_leapfrog_steps=hmc_leapfrog_steps,
                                             hmc_dt=hmc_dt)
             self.samples[(it, imu)] = ({'U': [], 'N': []} if adsorbed_cutoff is None
                                        else {'U': [], 'N': [], 'N_ads': []})
+            if self.n_species > 1:
+                self.samples[(it, imu)]['N_s'] = []
         # drawn after the replicas' seeds, so their streams are unchanged by it
         self.rng = np.random.default_rng(master_rng.integers(0, 2 ** 62))
         self.swap_stats = {t: [0, 0] for t in SWAP_TYPES}  # type -> [attempts, accepts]
         self.convergence_history: List[float] = []
-    def __getitem__(self, index: Tuple[int, int]):
-        f"""Overload of getitem, returns the replica from the grid at index [i,j]
+    @staticmethod
+    def _parse_mus(mus_arr: np.ndarray, n_T: int, n_species: int) -> np.ndarray:
+        """
+        Expand the `mus` argument to one mu (vector) per grid point.
 
-        Args:
-            index (Tuple[int,int]): position on the grid to retrieve
+        Parameters
+        ----------
+        mus_arr : numpy.ndarray
+            The `mus` given to the constructor.
+        n_T : int
+            Length of the temperature ladder.
+        n_species : int
+            Number of exchanged species.
 
-        Returns:
-            Replica: Replica[i,j]
+        Returns
+        -------
+        numpy.ndarray
+            Shape (n_T, n_mu) for one species, (n_T, n_mu, n_species) for
+            several.
+
+        Raises
+        ------
+        ValueError
+            If `mus_arr` has none of the accepted shapes.
+        """
+        if n_species == 1:
+            if mus_arr.ndim == 1:
+                return np.tile(mus_arr, (n_T, 1))
+            if mus_arr.ndim == 2:
+                if mus_arr.shape[0] != n_T:
+                    raise ValueError("mus.shape[0] must equal len(temperatures)")
+                return mus_arr
+            raise ValueError("mus must be 1D or 2D (n_T, n_mu)")
+        if mus_arr.ndim == 2 and mus_arr.shape[1] == n_species:
+            return np.tile(mus_arr, (n_T, 1, 1))
+        if mus_arr.ndim == 3 and mus_arr.shape[0] == n_T and mus_arr.shape[2] == n_species:
+            return mus_arr
+        raise ValueError(f"with {n_species} exchanged species, mus must have shape "
+                         f"(n_mu, {n_species}) or (n_T, n_mu, {n_species}); got {mus_arr.shape}")
+
+    def __getitem__(self, index: Tuple[int, int]) -> Replica:
+        """
+        The replica at one grid point.
+
+        Parameters
+        ----------
+        index : tuple of int
+            ``(temperature_index, mu_index)``.
+
+        Returns
+        -------
+        Replica
+            ``self.grid[index]``.
         """
         return self.grid[index]
 
@@ -345,15 +425,22 @@ class ReplicaExchangeGCMC:
         beta_a, beta_b = ra.state.beta, rb.state.beta
         mu_a, mu_b = ra.state.mu, rb.state.mu
         Ua, Ub = ra.energy, rb.energy
-        Na, Nb = ra.system.n, rb.system.n
-
-        # log of the swap acceptance ratio (see docs/REGC_algorithm.md, Eq. (8)).
-        # The Lambda^3 prefactor uses the same lambda_cubed the insert/delete
-        # moves use, so it reduces to the paper's (beta_a/beta_b)^(3/2 dN)
-        # for a physical Lambda(T) and to 1 for the reduced-units Lambda = 1.
-        log_acc = ((beta_a - beta_b) * (Ua - Ub)
-                   - (beta_a * mu_a - beta_b * mu_b) * (Na - Nb)
-                   + (Na - Nb) * np.log(ra.state.lambda_cubed / rb.state.lambda_cubed))
+        if self.n_species == 1:
+            Na, Nb = ra.system.n, rb.system.n
+            # log of the swap acceptance ratio (see docs/REGC_algorithm.md, Eq. (8)).
+            # The Lambda^3 prefactor uses the same lambda_cubed the insert/delete
+            # moves use, so it reduces to the paper's (beta_a/beta_b)^(3/2 dN)
+            # for a physical Lambda(T) and to 1 for the reduced-units Lambda = 1.
+            log_acc = ((beta_a - beta_b) * (Ua - Ub)
+                       - (beta_a * mu_a - beta_b * mu_b) * (Na - Nb)
+                       + (Na - Nb) * np.log(ra.state.lambda_cubed / rb.state.lambda_cubed))
+        else:
+            # Eq. (8) summed over species (docs/REGC_algorithm.md, Sec. 8)
+            dN = ra.system.species_counts() - rb.system.species_counts()
+            log_acc = float((beta_a - beta_b) * (Ua - Ub)
+                            - np.dot(beta_a * ra.state.mu_vec - beta_b * rb.state.mu_vec, dN)
+                            + np.dot(dN, np.log(ra.state.lambda_cubed_vec
+                                                / rb.state.lambda_cubed_vec)))
 
         ra.exchange_attempts += 1
         rb.exchange_attempts += 1
@@ -511,6 +598,8 @@ class ReplicaExchangeGCMC:
                     self.samples[key]['N'].append(r.system.n)
                     if self.adsorbed_cutoff is not None:
                         self.samples[key]['N_ads'].append(r.system.n_adsorbed(self.adsorbed_cutoff))
+                    if self.n_species > 1:
+                        self.samples[key]['N_s'].append(r.system.species_counts().tolist())
 
             if trajectory_dir is not None and cycle % trajectory_every == 0:
                 for key, r in self.grid.items():
@@ -657,11 +746,13 @@ class ReplicaExchangeGCMC:
                              adsorbed_cutoff=self.adsorbed_cutoff, mode=diffusion, n=diffusion_steps, **diffusion_kwargs)
             step = first + len(flags) - 1
             for key, r in self.grid.items():
-                for U, N, N_ads in r.block_samples:
+                for U, N, N_ads, N_s in r.block_samples:
                     self.samples[key]['U'].append(U)
                     self.samples[key]['N'].append(N)
                     if N_ads is not None:
                         self.samples[key]['N_ads'].append(N_ads)
+                    if N_s is not None:
+                        self.samples[key]['N_s'].append(N_s)
 
             if trajectory_dir is not None and step % trajectory_every == 0:
                 for key, r in self.grid.items():
@@ -691,7 +782,8 @@ class ReplicaExchangeGCMC:
         Largest change of the reduced-energy density rho(u) between checks.
 
         For each grid point, u = beta*(U - mu*N) + N*ln(Lambda^3) of its
-        recorded samples (Eq. (9) of docs/REGC_algorithm.md) is histogrammed
+        recorded samples (Eq. (9) of docs/REGC_algorithm.md; summed over
+        species if several are exchanged) is histogrammed
         twice on common bins: using the first `n_prev` samples (the state
         at the previous check) and using all samples. Returns the maximum
         over grid points of the total-variation distance
@@ -714,8 +806,13 @@ class ReplicaExchangeGCMC:
         worst = 0.0
         for key, r in self.grid.items():
             U = np.asarray(self.samples[key]['U'], dtype=float)
-            N = np.asarray(self.samples[key]['N'], dtype=float)
-            u = r.state.beta * (U - r.state.mu * N) + N * np.log(r.state.lambda_cubed)
+            if self.n_species == 1:
+                N = np.asarray(self.samples[key]['N'], dtype=float)
+                u = r.state.beta * (U - r.state.mu * N) + N * np.log(r.state.lambda_cubed)
+            else:
+                N_s = np.asarray(self.samples[key]['N_s'], dtype=float).reshape(-1, self.n_species)
+                u = (r.state.beta * U
+                     + N_s @ (np.log(r.state.lambda_cubed_vec) - r.state.beta * r.state.mu_vec))
             edges = np.histogram_bin_edges(u, bins=bins)
             if edges[0] == edges[-1]:
                 continue  # a single repeated value: no change measurable
@@ -736,7 +833,8 @@ class ReplicaExchangeGCMC:
         """
         return {"temperatures": [float(T) for T in self.temperatures],
                 "mu_grid": np.asarray(self.mu_grid, dtype=float).tolist(),
-                "lambda_cubed": [float(self.lambda_cubed_of_T(T)) for T in self.temperatures]}
+                "lambda_cubed": [np.asarray(self.lambda_cubed_of_T(T), dtype=float).tolist()
+                                 for T in self.temperatures]}
 
     def save_checkpoint(self, path: str, extra: Optional[dict] = None) -> None:
         """
@@ -852,7 +950,8 @@ class ReplicaExchangeGCMC:
             One dict per grid point (sorted by grid coordinates), with
             keys ``'T_index'``, ``'mu_index'``, ``'T'``, ``'mu'``, ``'N'``,
             ``'energy'``, ``'n_samples'``, ``'exchange_acc'``,
-            ``'displace_acc'``, ``'insert_acc'``, ``'delete_acc'``.
+            ``'displace_acc'``, ``'insert_acc'``, ``'delete_acc'``, plus
+            ``'N_s'`` (counts per species) with several exchanged species.
         """
         rows = []
         for (it, imu), r in sorted(self.grid.items()):
@@ -867,4 +966,6 @@ class ReplicaExchangeGCMC:
                 'insert_acc': round(acc['insert'], 3),
                 'delete_acc': round(acc['delete'], 3),
             })
+            if self.n_species > 1:
+                rows[-1]['N_s'] = r.system.species_counts().tolist()
         return rows

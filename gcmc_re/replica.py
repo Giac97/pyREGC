@@ -272,11 +272,16 @@ class Replica:
         `self.energy` and the `'insert'` entries of
         `n_attempts`/`n_accepts` in place.
 
+        With several exchanged species, see `_move_insert_species`.
+
         Returns
         -------
         None
         """
         sysm = self.system
+        if sysm.n_exchange_species > 1:
+            self._move_insert_species()
+            return
         pos = sysm.random_insertion_position(self.rng)
         du = (sysm.pair_energy_of(pos) if sysm.calculator.supports_incremental
               else sysm.generic_insert_dU(pos))
@@ -304,11 +309,16 @@ class Replica:
         `n_attempts`/`n_accepts` in place. A no-op if there are no mobile
         particles in the exchange zone.
 
+        With several exchanged species, see `_move_delete_species`.
+
         Returns
         -------
         None
         """
         sysm = self.system
+        if sysm.n_exchange_species > 1:
+            self._move_delete_species()
+            return
         candidates = sysm.exchange_zone_indices()
         n = len(candidates)
         if n == 0:
@@ -326,6 +336,91 @@ class Replica:
             sysm.apply_delete(i)
             self.energy += du
             self.n_accepts['delete'] += 1
+
+    def _count(self, move: str, species: str, accepted: bool) -> None:
+        """
+        Count one attempt of a per-species move, overall and per species.
+
+        Parameters
+        ----------
+        move : str
+            ``'insert'`` or ``'delete'``.
+        species : str
+            The species moved.
+        accepted : bool
+            Whether the attempt was accepted.
+
+        Returns
+        -------
+        None
+        """
+        key = f"{move}_{species}"
+        self.n_attempts[move] += 1
+        self.n_attempts[key] = self.n_attempts.get(key, 0) + 1
+        if accepted:
+            self.n_accepts[move] += 1
+            self.n_accepts[key] = self.n_accepts.get(key, 0) + 1
+
+    def _move_insert_species(self) -> None:
+        """
+        Attempt one insertion when several species are exchanged.
+
+        Draws the species s uniformly among `system.exchange_species_list`,
+        then a position as in `_move_insert`, and accepts with
+        min(1, V / ((N_s + 1) Lambda_s^3) exp(beta (mu_s - dU))), N_s the
+        number of s particles in the exchange zone (docs/REGC_algorithm.md,
+        Sec. 8). Counted under ``'insert'`` and ``'insert_<s>'``.
+
+        Returns
+        -------
+        None
+        """
+        sysm = self.system
+        s = int(self.rng.integers(sysm.n_exchange_species))
+        sp = sysm.exchange_species_list[s]
+        pos = sysm.random_insertion_position(self.rng)
+        du = (sysm.pair_energy_of(pos, species=sp) if sysm.calculator.supports_incremental
+              else sysm.generic_insert_dU(pos, species=sp))
+        beta, mu, lam3 = self.state.beta, self.state.mu_vec[s], self.state.lambda_cubed_vec[s]
+        n = len(sysm.exchange_zone_indices(sp))
+        log_arg = beta * mu - beta * du + np.log(sysm.volume / ((n + 1) * lam3))
+        accept = bool(log_arg >= 0.0 or self.rng.random() < np.exp(log_arg))
+        if accept:
+            sysm.apply_insert(pos, species=sp)
+            self.energy += du
+        self._count('insert', sp, accept)
+
+    def _move_delete_species(self) -> None:
+        """
+        Attempt one deletion when several species are exchanged.
+
+        Draws the species s uniformly, then one s particle of the exchange
+        zone, and accepts with min(1, N_s Lambda_s^3 / V exp(-beta (mu_s +
+        dU))) -- the reverse of `_move_insert_species`. A no-op if the zone
+        holds no s particle. Counted under ``'delete'`` and
+        ``'delete_<s>'``.
+
+        Returns
+        -------
+        None
+        """
+        sysm = self.system
+        s = int(self.rng.integers(sysm.n_exchange_species))
+        sp = sysm.exchange_species_list[s]
+        candidates = sysm.exchange_zone_indices(sp)
+        n = len(candidates)
+        if n == 0:
+            return
+        i = int(candidates[self.rng.integers(n)])
+        du = (-sysm.pair_energy_of(sysm.positions[i], exclude=i)
+              if sysm.calculator.supports_incremental else sysm.generic_delete_dU(i))
+        beta, mu, lam3 = self.state.beta, self.state.mu_vec[s], self.state.lambda_cubed_vec[s]
+        log_arg = -beta * mu - beta * du + np.log(n * lam3 / sysm.volume)
+        accept = bool(log_arg >= 0.0 or self.rng.random() < np.exp(log_arg))
+        if accept:
+            sysm.apply_delete(i)
+            self.energy += du
+        self._count('delete', sp, accept)
 
     # -- [ZSG] Fig. 1 building blocks (used by ReplicaExchangeGCMC.run_regc) --
     def gc_attempt(self) -> None:
@@ -398,7 +493,9 @@ class Replica:
         -------
         Replica
             `self`, with the samples of this block in `self.block_samples`
-            as a list of ``(energy, N, N_ads)``.
+            as a list of ``(energy, N, N_ads, N_s)``; ``N_s`` is
+            `system.species_counts()` with several exchanged species, else
+            None.
         """
         self.block_samples = []
         for k, gc in enumerate(gc_flags):
@@ -407,7 +504,9 @@ class Replica:
             if step > burn_in_steps and step % record_every == 0:
                 n_ads = (None if adsorbed_cutoff is None
                          else self.system.n_adsorbed(adsorbed_cutoff))
-                self.block_samples.append((self.energy, self.system.n, n_ads))
+                n_s = (self.system.species_counts().tolist()
+                       if self.system.n_exchange_species > 1 else None)
+                self.block_samples.append((self.energy, self.system.n, n_ads, n_s))
         return self
 
     def diffuse(self, mode: str = 'mc', n: int = 10, displace_substrate: bool = False,
@@ -691,7 +790,8 @@ class Replica:
         -------
         dict of str to float
             One entry per move type (``'displace'``, ``'insert'``,
-            ``'delete'``, ``'hmc'``, ``'displace_substrate'``): the
+            ``'delete'``, ``'hmc'``, ``'displace_substrate'``, and with
+            several exchanged species ``'insert_<s>'``/``'delete_<s>'``): the
             fraction of attempts of that type that were accepted (0.0 for
             a move type never attempted).
         """

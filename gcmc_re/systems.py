@@ -30,7 +30,7 @@ classes and remain available as aliases.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -46,7 +46,8 @@ class ParticleSystem:
     physics is delegated to `calculator`.
     """
 
-    def __init__(self, calculator: Calculator, exchange_species: str = 'X',
+    def __init__(self, calculator: Calculator,
+                 exchange_species: Union[str, Sequence[str]] = 'X',
                  positions: Optional[np.ndarray] = None,
                  species: Optional[np.ndarray] = None,
                  frozen_positions: Optional[np.ndarray] = None,
@@ -61,17 +62,21 @@ class ParticleSystem:
         ----------
         calculator : Calculator
             The energy-evaluation backend all physics is delegated to.
-        exchange_species : str, optional
+        exchange_species : str or sequence of str, optional
             The species label given to newly inserted mobile particles
             (and used as the default `species` for any `positions` given
-            without an explicit `species` array). Default is ``'X'``.
+            without an explicit `species` array). Default is ``'X'``. A
+            sequence of several labels (e.g. ``['O', 'Cl']``) exchanges
+            each with its own reservoir; see `exchange_species_list`. A
+            one-element sequence is the same as its single label.
         positions : numpy.ndarray, optional
             Initial mobile (GCMC-exchangeable) particle positions, shape
             (N, 3). Default is None (no mobile particles).
         species : numpy.ndarray, optional
             Species label for each mobile particle in `positions`, shape
             (N,). Default is None, which fills every entry with
-            `exchange_species`.
+            `exchange_species` (required if several species are exchanged
+            and `positions` is not empty).
         frozen_positions : numpy.ndarray, optional
             Positions of fully rigid atoms that enter the energy
             evaluation but never move, shape (M, 3). Default is None (no
@@ -90,11 +95,25 @@ class ParticleSystem:
             used by `masses()`/`substrate_masses()` for HMC. Species not
             present in this dict fall back to `units.default_mass_amu`.
             Default is None (empty; every species falls back).
+
+        Raises
+        ------
+        ValueError
+            If `exchange_species` is an empty or repeated sequence, or names
+            several species while `positions` is given without `species`.
         """
         self.calculator = calculator
+        if not isinstance(exchange_species, str):
+            labels = tuple(str(x) for x in exchange_species)
+            if not labels or len(set(labels)) != len(labels):
+                raise ValueError(f"exchange_species must be distinct labels, got {labels}")
+            exchange_species = labels[0] if len(labels) == 1 else labels
+        # a str for one exchanged species (unchanged behaviour), a tuple for several
         self.exchange_species = exchange_species
         self.positions = (np.zeros((0, 3)) if positions is None
                            else np.array(positions, dtype=float).reshape(-1, 3))
+        if species is None and self.n_exchange_species > 1 and self.positions.shape[0]:
+            raise ValueError("several exchange_species: pass species= for the initial positions")
         self.species = (np.array([exchange_species] * self.positions.shape[0])
                          if species is None else np.asarray(species))
         self.frozen_positions = (np.zeros((0, 3)) if frozen_positions is None
@@ -113,6 +132,59 @@ class ParticleSystem:
         int: The number of mobile (GCMC-exchangeable) particles.
         """
         return self.positions.shape[0]
+
+    @property
+    def exchange_species_list(self) -> Tuple[str, ...]:
+        """tuple of str: The exchanged species, in reservoir order (length 1 for one)."""
+        if isinstance(self.exchange_species, str):
+            return (self.exchange_species,)
+        return tuple(self.exchange_species)
+
+    @property
+    def n_exchange_species(self) -> int:
+        """int: The number of exchanged species (1 unless `exchange_species` is a list)."""
+        return len(self.exchange_species_list)
+
+    def species_counts(self) -> np.ndarray:
+        """
+        Count the mobile particles of each exchanged species.
+
+        Returns
+        -------
+        numpy.ndarray
+            Integer array of length `n_exchange_species`, in the order of
+            `exchange_species_list`. With a single exchanged species this
+            is ``[n]`` (every mobile particle).
+        """
+        if self.n_exchange_species == 1:
+            return np.array([self.n])
+        return np.array([int(np.count_nonzero(self.species == s))
+                         for s in self.exchange_species_list])
+
+    def _insert_species(self, species: Optional[str]) -> str:
+        """
+        The species label of a particle about to be inserted.
+
+        Parameters
+        ----------
+        species : str or None
+            The requested label, or None for the single `exchange_species`.
+
+        Returns
+        -------
+        str
+            The label.
+
+        Raises
+        ------
+        ValueError
+            If `species` is None while several species are exchanged.
+        """
+        if species is not None:
+            return species
+        if self.n_exchange_species > 1:
+            raise ValueError("several species are exchanged: name the one to insert (species=)")
+        return self.exchange_species
 
     def n_adsorbed(self, d_max: float) -> int:
         """
@@ -375,7 +447,7 @@ class ParticleSystem:
         """
         raise NotImplementedError
 
-    def apply_insert(self, pos: np.ndarray) -> None:
+    def apply_insert(self, pos: np.ndarray, species: Optional[str] = None) -> None:
         """
         Commit the insertion of a new mobile particle.
 
@@ -384,7 +456,10 @@ class ParticleSystem:
         pos : numpy.ndarray
             The (3,) Cartesian position of the new particle, wrapped
             through the geometry's own boundary conditions before being
-            stored. Its species is `self.exchange_species`.
+            stored.
+        species : str, optional
+            Its species. Default None: `self.exchange_species` (required
+            when several species are exchanged).
 
         Returns
         -------
@@ -414,7 +489,7 @@ class ParticleSystem:
         self.positions = np.delete(self.positions, i, axis=0)
         self.species = np.delete(self.species, i)
 
-    def exchange_zone_indices(self) -> np.ndarray:
+    def exchange_zone_indices(self, species: Optional[str] = None) -> np.ndarray:
         """
         Indices of the mobile particles inside the insertion/deletion zone.
 
@@ -423,12 +498,19 @@ class ParticleSystem:
         the acceptance rules use this count, not `n`, for detailed balance.
         The base-class zone is the whole system.
 
+        Parameters
+        ----------
+        species : str, optional
+            Only particles of this species. Default None (all species).
+
         Returns
         -------
         numpy.ndarray
             Integer indices into `self.positions`.
         """
-        return np.arange(self.n)
+        if species is None:
+            return np.arange(self.n)
+        return np.flatnonzero(self.species == species)
 
     def md_z_bounds(self) -> Optional[Tuple[float, float]]:
         """
@@ -472,7 +554,8 @@ class ParticleSystem:
         return np.vstack(position_parts), np.concatenate(species_parts)
 
     # -- fast incremental path: only valid if calculator.supports_incremental
-    def pair_energy_of(self, pos: np.ndarray, exclude: Optional[int] = None) -> float:
+    def pair_energy_of(self, pos: np.ndarray, exclude: Optional[int] = None,
+                       species: Optional[str] = None) -> float:
         """
         Compute the energy of a single point with the rest of the system.
 
@@ -486,6 +569,11 @@ class ParticleSystem:
             If given, the index of a mobile particle to exclude from the
             sum (used when `pos` is a trial position for that particle
             itself). Default is None.
+        species : str, optional
+            Species of a new particle at `pos` (when `exclude` is None).
+            Default None: the calculator assumes `exchange_species`. Only
+            passed on to the calculator when given, so single-species
+            calculators need not accept it.
 
         Returns
         -------
@@ -509,7 +597,9 @@ class ParticleSystem:
         ext = self.external_energy(pos)
         if not np.isfinite(ext):
             return ext
-        return self.calculator.pair_energy_of(self, pos, exclude=exclude) + ext
+        if species is None:
+            return self.calculator.pair_energy_of(self, pos, exclude=exclude) + ext
+        return self.calculator.pair_energy_of(self, pos, exclude=exclude, species=species) + ext
 
     def total_energy(self) -> float:
         """
@@ -598,7 +688,7 @@ class ParticleSystem:
         self.substrate_positions[i] = saved
         return (u1 - u0) + (ext_new - ext_old)
 
-    def generic_insert_dU(self, pos: np.ndarray) -> float:
+    def generic_insert_dU(self, pos: np.ndarray, species: Optional[str] = None) -> float:
         """
         Compute the energy change of inserting a new mobile particle.
 
@@ -607,8 +697,10 @@ class ParticleSystem:
         Parameters
         ----------
         pos : numpy.ndarray
-            The (3,) Cartesian trial position for the new particle
-            (species `self.exchange_species`).
+            The (3,) Cartesian trial position for the new particle.
+        species : str, optional
+            Its species. Default None: `self.exchange_species` (required
+            when several species are exchanged).
 
         Returns
         -------
@@ -620,9 +712,10 @@ class ParticleSystem:
         ext = self.external_energy(pos)
         if not np.isfinite(ext):
             return np.inf
+        sp = self._insert_species(species)
         u0 = self.calculator.total_energy(self)
         self.positions = np.vstack([self.positions, pos])
-        self.species = np.append(self.species, self.exchange_species)
+        self.species = np.append(self.species, sp)
         u1 = self.calculator.total_energy(self)
         self.positions = self.positions[:-1]
         self.species = self.species[:-1]
@@ -808,7 +901,7 @@ class BulkSystem(ParticleSystem):
         """
         self.substrate_positions[i] = self._wrap(new_pos)
 
-    def apply_insert(self, pos: np.ndarray) -> None:
+    def apply_insert(self, pos: np.ndarray, species: Optional[str] = None) -> None:
         """
         Commit the insertion of a new mobile particle.
 
@@ -816,15 +909,17 @@ class BulkSystem(ParticleSystem):
         ----------
         pos : numpy.ndarray
             The (3,) Cartesian position of the new particle; wrapped into
-            the primary cell before being stored. Its species is
-            `self.exchange_species`.
+            the primary cell before being stored.
+        species : str, optional
+            Its species. Default None: `self.exchange_species` (required
+            when several species are exchanged).
 
         Returns
         -------
         None
         """
         self.positions = np.vstack([self.positions, self._wrap(pos)])
-        self.species = np.append(self.species, self.exchange_species)
+        self.species = np.append(self.species, self._insert_species(species))
 
 
 # =============================================================================
@@ -1043,7 +1138,7 @@ class SlabSystem(ParticleSystem):
         """
         return (0.0, self.Lz)
 
-    def exchange_zone_indices(self) -> np.ndarray:
+    def exchange_zone_indices(self, species: Optional[str] = None) -> np.ndarray:
         """
         Indices of the mobile particles with ``z_lo <= z < z_hi``.
 
@@ -1052,6 +1147,11 @@ class SlabSystem(ParticleSystem):
         `insertion_z_range` stay in the system but can't be deleted until
         they diffuse back in.
 
+        Parameters
+        ----------
+        species : str, optional
+            Only particles of this species. Default None (all species).
+
         Returns
         -------
         numpy.ndarray
@@ -1059,7 +1159,10 @@ class SlabSystem(ParticleSystem):
         """
         z_lo, z_hi = self.insertion_z_range
         z = self.positions[:, 2]
-        return np.flatnonzero((z >= z_lo) & (z < z_hi))
+        inside = (z >= z_lo) & (z < z_hi)
+        if species is not None:
+            inside &= self.species == species
+        return np.flatnonzero(inside)
 
     @property
     def volume(self) -> float:
@@ -1186,7 +1289,7 @@ class SlabSystem(ParticleSystem):
         """
         self.substrate_positions[i] = self._wrap(new_pos)
 
-    def apply_insert(self, pos: np.ndarray) -> None:
+    def apply_insert(self, pos: np.ndarray, species: Optional[str] = None) -> None:
         """
         Commit the insertion of a new mobile particle.
 
@@ -1194,14 +1297,17 @@ class SlabSystem(ParticleSystem):
         ----------
         pos : numpy.ndarray
             The (3,) Cartesian position of the new particle; x, y wrapped
-            into the primary cell. Its species is `self.exchange_species`.
+            into the primary cell.
+        species : str, optional
+            Its species. Default None: `self.exchange_species` (required
+            when several species are exchanged).
 
         Returns
         -------
         None
         """
         self.positions = np.vstack([self.positions, self._wrap(pos)])
-        self.species = np.append(self.species, self.exchange_species)
+        self.species = np.append(self.species, self._insert_species(species))
 
     def coverage(self) -> float:
         """

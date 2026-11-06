@@ -19,7 +19,7 @@ Requires ASE (imported lazily).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -125,7 +125,7 @@ class SlabGeometry:
         """float: Surface-cell area, in A^2."""
         return float(abs(np.linalg.det(self.cell_xy)))
 
-    def make_system(self, calculator: Calculator, exchange_species: str,
+    def make_system(self, calculator: Calculator, exchange_species: Union[str, Sequence[str]],
                     mass_of_species: Optional[dict] = None,
                     insertion_z_range: Optional[Tuple[float, float]] = None) -> SlabSystem:
         """
@@ -135,8 +135,9 @@ class SlabGeometry:
         ----------
         calculator : Calculator
             The energy backend (each system needs its own instance).
-        exchange_species : str
-            Species GCMC inserts and deletes.
+        exchange_species : str or sequence of str
+            Species GCMC inserts and deletes (several, e.g. ``['O', 'Cl']``,
+            each with its own reservoir; see `ParticleSystem`).
         mass_of_species : dict, optional
             Masses (amu) by species, for MD/HMC. Default None (ASE tables).
         insertion_z_range : tuple of float, optional

@@ -67,7 +67,8 @@ gcmc_re/
 │                      parallelism, checkpoints)
 ├── driver.py          run_with_checkpoints, RunStatus (chunked, resumable, wall-time aware)
 ├── io.py              save_samples / load_samples -> SampleSet; atomic pickling
-├── units.py           kelvin_to_eV, eV_to_kelvin, ThermalWavelengthCubed, pressure units
+├── units.py           kelvin_to_eV, eV_to_kelvin, ThermalWavelengthCubed,
+│                      SpeciesLambdaCubed, pressure units
 ├── pressure.py        simple (reduced-units) mu(p, T) <-> p conventions
 ├── reservoir.py       MonatomicIdealGasReservoir, DiatomicReservoir (e.g. H2), low-level
 │                      diatomic functions (self-consistent D0 and isolated-atom energy)
@@ -354,12 +355,76 @@ lower-pressure columns visually collapse to nothing. Fixed by plotting
 against log10(p) directly with reformatted tick labels, rather than
 plotting p on a matplotlib log-scale axis.)
 
+## Several gas reservoirs at once (O + Cl, O + CO, ...)
+
+Pass a list to `exchange_species` to exchange several species, each with
+its own chemical potential and thermal wavelength. Each species gets its
+own insertions and deletions, and the replica-exchange rule and the MBAR
+reduced potential sum over species. The equations are in
+`docs/REGC_algorithm.md`, Sec. 8. A run with a single species uses exactly
+the original code path, with bit-identical results.
+
+The (T, mu) ladder stays 2D. Its second axis becomes a **path through
+(mu_O, mu_Cl) space**. The natural path is a gas feed of fixed
+composition at increasing total pressure:
+
+```python
+x = {"O": 0.999, "Cl": 0.001}                      # feed mole fractions
+o2  = DiatomicReservoir.from_calculator(ase_calc, "O",  bond_length_angstrom=1.2075,
+                                        vib_wavenumber_cm=1580.2)
+cl2 = DiatomicReservoir.from_calculator(ase_calc, "Cl", bond_length_angstrom=1.988,
+                                        vib_wavenumber_cm=559.7)
+p = np.array(p_bar)
+mus = np.stack([o2.mu_grid(T_K, x["O"] * p, unit="bar"),          # shape (n_T, n_p, 2)
+                cl2.mu_grid(T_K, x["Cl"] * p, unit="bar")], axis=-1)
+
+sim = ReplicaExchangeGCMC(
+    [kelvin_to_eV(T) for T in T_K], mus,
+    lambda rng: geometry.make_system(LammpsCalculator(pair, ["Ag", "O", "Cl"]), ["O", "Cl"]),
+    lambda_cubed_of_T=[o2.lambda_cubed_of_T(), cl2.lambda_cubed_of_T()])
+
+def mu_of_Tp(T, p):                                # the same path, for the analysis
+    return np.array([o2.mu_at_T_eV(T, x["O"] * p, unit="bar"),
+                     cl2.mu_at_T_eV(T, x["Cl"] * p, unit="bar")])
+
+analysis = MBARSurfaceAnalysis(load_samples("run/samples.npz"), mu_of_Tp=mu_of_Tp)
+theta_cl = analysis.phase_diagram_Tp(T_grid, p_grid, observable="N_Cl")
+```
+
+- **`mus` shape:** with S species, `mus` has shape (n_mu, S) or
+  (n_T, n_mu, S), species in `exchange_species` order.
+- **Thermal wavelengths:** `lambda_cubed_of_T` takes one callable per
+  species, wrapped in `SpeciesLambdaCubed`, which `save_samples` stores
+  and `load_samples` restores.
+- **Samples:** besides the total `'N'`, the samples record per-species
+  counts under `'N_s'`.
+- **Analysis:**
+  - `mean_N_species(T, mu_vec)` gives each species' mean count.
+  - `observable='N_O'` / `'N_Cl'` selects one species in
+    `phase_diagram`, `phase_diagram_Tp`, `most_probable_N` and `pN`.
+  - `most_probable_composition` gives the argmax of the joint
+    P(N_O, N_Cl): an O-rich and a Cl-rich phase can have the same total
+    coverage.
+  - `lowest_energy_N` does the aiAT construction over compositions.
+- **Off the path:** MBAR reweights to any (T, mu_O, mu_Cl), including
+  points off the simulated path, wherever the sampled compositions
+  overlap. Check this before trusting such a point.
+- **Coexistence:** `locate_coexistence_mu` bisects a single mu and is
+  disabled here; scan `pN` along the path instead.
+- **O2 reservoir:** `DiatomicReservoir` has no electronic-degeneracy term.
+  O2's triplet ground state shifts mu_O by -(1/2) kT ln 3, about -0.02 eV
+  at 500 K. Also mind the DFT/MLIP O2 binding error in a
+  self-consistent D0: consider passing `d0=` a corrected value.
+- **Scope:** only atomic species are exchanged. Molecules (CO) and
+  identity swaps of substrate atoms (alloy segregation) are not
+  implemented yet.
+
 ## A real structure through the config pipeline: `examples/08_reasonable_Tp_phase_diagram.py`
 
 Example 08 runs Pd(111) + H via EMT (structure read from
 `examples/data/pd111_slab.xyz`) through `gcmc_re.runner`, on the realistic
 1e-4 to 1e6 atm window, with D0 and e_atom both computed from EMT. The
-whole window lies inside the simulated mu_H grid. Expect large, unphysical H
+replica ladder is laid on that pressure window directly. Expect large, unphysical H
 uptake: roughly 10-25 H on the 2x2 Pd(111) cell, i.e. several H per surface
 Pd. EMT binds H about 3.1 eV below an isolated atom, against about 2.5 eV
 per H in EMT's own H2, and its H parameters are documented as "not for any

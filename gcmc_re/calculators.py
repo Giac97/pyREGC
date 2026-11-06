@@ -151,7 +151,7 @@ class LJCalculator(Calculator):
         self.e_shift = 4.0 * epsilon * (sr6 ** 2 - sr6)  # U(r_cut) = 0
 
     def pair_energy_of(self, system: "ParticleSystem", pos: np.ndarray,
-                        exclude: Optional[int] = None) -> float:
+                        exclude: Optional[int] = None, species: Optional[str] = None) -> float:
         """
         Compute the pairwise energy of a single point with the system.
 
@@ -167,6 +167,9 @@ class LJCalculator(Calculator):
             exclude from the sum -- used when `pos` is (a trial position
             for) that particle itself, so it doesn't interact with its own
             unmoved copy. Default is None (no exclusion).
+        species : str, optional
+            Species of a new particle at `pos`. Ignored: this calculator
+            treats every mobile particle alike. Default is None.
 
         Returns
         -------
@@ -350,7 +353,7 @@ class PairLJCalculator(Calculator):
         return codes
 
     def pair_energy_of(self, system: "ParticleSystem", pos: np.ndarray,
-                       exclude: Optional[int] = None) -> float:
+                       exclude: Optional[int] = None, species: Optional[str] = None) -> float:
         """
         Energy of a (trial) mobile particle at `pos` with everything else.
 
@@ -362,8 +365,10 @@ class PairLJCalculator(Calculator):
             The (3,) position.
         exclude : int, optional
             Index of the mobile particle `pos` belongs to (its species is
-            used, and it is left out of the sum). None means a new particle
-            of `system.exchange_species`.
+            used, and it is left out of the sum). None means a new particle.
+        species : str, optional
+            Species of the new particle (when `exclude` is None). Default
+            None: `system.exchange_species`.
 
         Returns
         -------
@@ -372,7 +377,10 @@ class PairLJCalculator(Calculator):
             atoms.
         """
         _check_min_image(system, self.max_r_cut)
-        sp = system.exchange_species if exclude is None else system.species[exclude]
+        if exclude is not None:
+            sp = system.species[exclude]
+        else:
+            sp = system.exchange_species if species is None else species
         c = self._code.get(str(sp), len(self._code))
         mob, mob_c = system.positions, self._codes(system.species)
         if exclude is not None:

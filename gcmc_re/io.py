@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .units import ThermalWavelengthCubed
+from .units import SpeciesLambdaCubed, ThermalWavelengthCubed
 
 
 def _unit_lambda_cubed(T: float) -> float:
@@ -53,18 +53,25 @@ class SampleSet:
     temperatures : list of float
         The temperature ladder (k_B*T in eV, or reduced units).
     mu_grid : numpy.ndarray
-        Chemical potentials, shape (n_T, n_mu).
+        Chemical potentials, shape (n_T, n_mu), or (n_T, n_mu, n_species)
+        with several exchanged species.
     samples : dict
         ``{(it, imu): {'U': [...], 'N': [...]}}``, plus ``'N_ads'`` if
-        the run recorded it (``adsorbed_cutoff``).
+        the run recorded it (``adsorbed_cutoff``) and ``'N_s'`` (counts
+        per species) with several exchanged species.
     lambda_cubed_of_T : callable
-        Lambda^3 as a function of temperature (see `ThermalWavelengthCubed`).
+        Lambda^3 as a function of temperature (see `ThermalWavelengthCubed`,
+        `SpeciesLambdaCubed`).
+    exchange_species : tuple of str, optional
+        The exchanged species, in the order of the last axis of `mu_grid`
+        and of ``'N_s'``. None if unknown (files from older versions).
     """
 
     temperatures: List[float]
     mu_grid: np.ndarray
     samples: Dict[Tuple[int, int], Dict[str, list]]
     lambda_cubed_of_T: Callable[[float], float] = _unit_lambda_cubed
+    exchange_species: Optional[Tuple[str, ...]] = None
 
     @property
     def n_samples(self) -> int:
@@ -94,7 +101,8 @@ class SampleSet:
             raise ValueError(f"fraction must be in [0, 1), got {fraction}")
         k = int(fraction * self.n_samples)
         kept = {key: {name: list(vals[k:]) for name, vals in v.items()} for key, v in self.samples.items()}
-        return SampleSet(list(self.temperatures), np.array(self.mu_grid), kept, self.lambda_cubed_of_T)
+        return SampleSet(list(self.temperatures), np.array(self.mu_grid), kept, self.lambda_cubed_of_T,
+                         self.exchange_species)
 
 
 def save_samples(sim, path: str) -> None:
@@ -102,9 +110,10 @@ def save_samples(sim, path: str) -> None:
     Write a simulation's (or `SampleSet`'s) samples to an ``.npz`` file.
 
     The write is atomic (temporary file + rename). The Lambda^3 convention
-    is stored as the particle mass for a `ThermalWavelengthCubed`, as
-    "unit" for Lambda^3 = 1; any other callable is stored by its values on
-    the ladder and must be passed again to `load_samples`.
+    is stored as the particle mass for a `ThermalWavelengthCubed` (the
+    per-species masses for a `SpeciesLambdaCubed` of them), as "unit" for
+    Lambda^3 = 1; any other callable is stored by its values on the ladder
+    and must be passed again to `load_samples`.
 
     Parameters
     ----------
@@ -118,20 +127,27 @@ def save_samples(sim, path: str) -> None:
     lam = getattr(sim, 'lambda_cubed_of_T', _unit_lambda_cubed)
     if isinstance(lam, ThermalWavelengthCubed):
         lam_kind, lam_mass = "mass", lam.mass_amu
-    elif all(lam(T) == 1.0 for T in sim.temperatures):
+    elif isinstance(lam, SpeciesLambdaCubed) and lam.masses_amu is not None:
+        lam_kind, lam_mass = "masses", np.array(lam.masses_amu, dtype=float)
+    elif all(np.all(np.asarray(lam(T)) == 1.0) for T in sim.temperatures):
         lam_kind, lam_mass = "unit", np.nan
     else:
         lam_kind, lam_mass = "custom", np.nan
     extra = {}
     if all('N_ads' in v for v in sim.samples.values()):
         extra['N_ads'] = np.array([sim.samples[k]['N_ads'] for k in keys], dtype=float)
+    if all('N_s' in v for v in sim.samples.values()):
+        extra['N_s'] = np.array([sim.samples[k]['N_s'] for k in keys], dtype=float)
+    species = getattr(sim, 'exchange_species', None)
+    if species is not None:
+        extra['exchange_species'] = np.array(list(species), dtype=str)
     tmp = path + ".tmp.npz"
     np.savez(tmp, **extra, U=np.array([sim.samples[k]['U'] for k in keys], dtype=float),
              N=np.array([sim.samples[k]['N'] for k in keys], dtype=float),
              keys=np.array(keys, dtype=int), temperatures=np.asarray(sim.temperatures, dtype=float),
              mu_grid=np.asarray(sim.mu_grid, dtype=float), lambda_kind=lam_kind,
              lambda_mass_amu=lam_mass,
-             lambda_cubed_ladder=np.array([lam(T) for T in sim.temperatures], dtype=float))
+             lambda_cubed_ladder=np.array([np.asarray(lam(T), dtype=float) for T in sim.temperatures]))
     os.replace(tmp, path)
 
 
@@ -157,7 +173,8 @@ def load_samples(path: str, discard: float = 0.0,
         The temperature ladder; needed only for files holding only (U, N)
         (written before this format). Default None (from the file).
     mu_grid : numpy.ndarray, optional
-        The mu grid, shape (n_T, n_mu) or (n_mu,); as `temperatures`.
+        The mu grid, shape (n_T, n_mu) or (n_mu,) (with several species,
+        (n_T, n_mu, n_species) or (n_mu, n_species)); as `temperatures`.
 
     Returns
     -------
@@ -175,10 +192,17 @@ def load_samples(path: str, discard: float = 0.0,
     if "N_ads" in d:
         for i, k in enumerate(keys):
             samples[k]['N_ads'] = list(d["N_ads"][i])
+    if "N_s" in d:
+        for i, k in enumerate(keys):
+            samples[k]['N_s'] = d["N_s"][i].tolist()
+    species = tuple(str(x) for x in d["exchange_species"]) if "exchange_species" in d else None
     kind = str(d["lambda_kind"]) if "lambda_kind" in d else "unit"
     if lambda_cubed_of_T is None:
         if kind == "mass":
             lambda_cubed_of_T = ThermalWavelengthCubed(float(d["lambda_mass_amu"]))
+        elif kind == "masses":
+            lambda_cubed_of_T = SpeciesLambdaCubed(
+                [ThermalWavelengthCubed(float(m)) for m in d["lambda_mass_amu"]])
         elif kind == "unit":
             lambda_cubed_of_T = _unit_lambda_cubed
         else:
@@ -194,9 +218,10 @@ def load_samples(path: str, discard: float = 0.0,
             raise ValueError(f"{path} holds only (U, N): pass temperatures= and mu_grid=")
         mu_grid = d["mu_grid"]
     mu_grid = np.asarray(mu_grid, dtype=float)
-    if mu_grid.ndim == 1:
-        mu_grid = np.tile(mu_grid, (len(temperatures), 1))
-    out = SampleSet(list(temperatures), mu_grid, samples, lambda_cubed_of_T)
+    several = species is not None and len(species) > 1
+    if mu_grid.ndim == (2 if several else 1):
+        mu_grid = np.tile(mu_grid, (len(temperatures),) + (1,) * mu_grid.ndim)
+    out = SampleSet(list(temperatures), mu_grid, samples, lambda_cubed_of_T, species)
     return out.discard(discard) if discard else out
 
 

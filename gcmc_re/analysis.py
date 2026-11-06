@@ -10,6 +10,14 @@ MBARSurfaceAnalysis -- importing this module itself never requires pymbar).
 This only ever consumes `sim.samples[key]['U'/'N']`, `sim.temperatures`,
 `sim.mu_grid` (and `sim.lambda_cubed_of_T`, if present), so it works completely unchanged regardless of which
 Calculator produced those energies -- LJ, EAM, or an MLIP.
+
+Several exchanged species (a run whose `mu_grid` has a trailing species axis,
+see `ReplicaExchangeGCMC`): the reduced potential becomes
+beta*U - sum_s (beta*mu_s - ln Lambda_s^3) N_s, built from the per-species
+counts ``'N_s'``. Wherever a mu is taken it is then a vector (one entry per
+species, e.g. (mu_O, mu_Cl)), a "mu grid" is a path of such vectors, shape
+(n_mu, n_species), and `mu_of_Tp(T, p)` returns a vector (e.g. a gas feed of
+fixed composition). Observables ``'N_<species>'`` give each species' count.
 """
 
 from __future__ import annotations
@@ -169,7 +177,8 @@ class MBARSurfaceAnalysis:
         Raises
         ------
         ValueError
-            If any grid point in `sim` has no recorded samples.
+            If any grid point in `sim` has no recorded samples, or several
+            species are exchanged but per-species counts were not recorded.
         """
         from pymbar import MBAR  # local import: no hard dependency for the rest of the package
         if reservoir is not None:
@@ -188,6 +197,12 @@ class MBARSurfaceAnalysis:
         self.states = states
         self.betas = np.array([1.0 / sim.temperatures[it] for it, imu in states])
         self.state_mus = np.array([sim.mu_grid[it, imu] for it, imu in states])
+        mu_grid = np.asarray(sim.mu_grid)
+        self.n_species = mu_grid.shape[2] if mu_grid.ndim == 3 else 1
+        self.exchange_species = getattr(sim, "exchange_species", None)
+        if self.n_species > 1 and self.mu_of_Tp is None:
+            # the simple mu = T ln(p/p0) convention has one mu per p
+            self.mu_of_Tp = self._no_species_pressure
 
         Nk, U_chunks, N_chunks = [], [], []
         for key in states:
@@ -205,6 +220,14 @@ class MBARSurfaceAnalysis:
         self.Nk = np.array(Nk)
         self.U_all = np.concatenate(U_chunks)
         self.N_all = np.concatenate(N_chunks)
+        # counts per exchanged species, shape (n_samples, n_species)
+        if self.n_species == 1:
+            self.Ns_all = self.N_all[:, None]
+        else:
+            if not all('N_s' in sim.samples[key] for key in states):
+                raise ValueError("several exchanged species but no 'N_s' samples")
+            self.Ns_all = np.concatenate([np.asarray(sim.samples[key]['N_s'], dtype=float)
+                                          .reshape(-1, self.n_species) for key in states])
         # adsorbed count: only an observable reweighted with the same weights
         # -- the reduced potential (and so MBAR) is always in terms of N
         self.N_ads_all = (np.concatenate([np.asarray(sim.samples[key]['N_ads'], dtype=float)
@@ -226,7 +249,47 @@ class MBARSurfaceAnalysis:
         a_max = a.max(axis=0)
         self._log_den = a_max + np.log(np.exp(a - a_max).sum(axis=0))
 
-    def _u_of_state(self, T: float, mu: float) -> np.ndarray:
+    def _no_species_pressure(self, T: float, p: float):
+        """
+        Placeholder `mu_of_Tp` for several species without a reservoir.
+
+        Parameters
+        ----------
+        T, p : float
+            Temperature and pressure.
+
+        Returns
+        -------
+        numpy.ndarray
+            Never returns.
+
+        Raises
+        ------
+        ValueError
+            Always: several species need ``mu_of_Tp`` (or ``reservoir``)
+            returning one mu per species.
+        """
+        raise ValueError("several exchanged species: pass mu_of_Tp(T, p) returning one mu "
+                         "per species (e.g. a gas feed of fixed composition)")
+
+    def _log_lambda3(self, T: float) -> np.ndarray:
+        """
+        ln Lambda^3 of every exchanged species at one temperature.
+
+        Parameters
+        ----------
+        T : float
+            Temperature.
+
+        Returns
+        -------
+        numpy.ndarray
+            Shape (n_species,).
+        """
+        lam3 = np.asarray(self.lambda_cubed_of_T(T), dtype=float)
+        return np.log(np.broadcast_to(lam3, (self.n_species,)))
+
+    def _u_of_state(self, T: float, mu) -> np.ndarray:
         """
         Compute the reduced potential of every sample at a given (T, mu).
 
@@ -234,8 +297,9 @@ class MBARSurfaceAnalysis:
         ----------
         T : float
             Temperature to evaluate the reduced potential at.
-        mu : float
-            Chemical potential to evaluate the reduced potential at.
+        mu : float or array_like
+            Chemical potential to evaluate the reduced potential at (one
+            per species with several exchanged species).
 
         Returns
         -------
@@ -245,22 +309,30 @@ class MBARSurfaceAnalysis:
             simulated states. The Lambda^3 term is the part of the
             grand-canonical weight V^N / (N! Lambda^(3N)) that depends on
             the state (V^N / N! is the same at every state and cancels);
-            it vanishes for the reduced-units Lambda^3 = 1.
+            it vanishes for the reduced-units Lambda^3 = 1. With several
+            species, the mu and Lambda^3 terms are summed over species.
         """
         beta = 1.0 / T
-        return (beta * self.U_all - beta * mu * self.N_all
-                + self.N_all * np.log(self.lambda_cubed_of_T(T)))
+        if self.n_species == 1:
+            return (beta * self.U_all - beta * mu * self.N_all
+                    + self.N_all * np.log(self.lambda_cubed_of_T(T)))
+        mu = np.broadcast_to(np.asarray(mu, dtype=float), (self.n_species,))
+        return beta * self.U_all + self.Ns_all @ (self._log_lambda3(T) - beta * mu)
 
-    def mean_N(self, T: float, mu: float) -> Tuple[float, float]:
+    def mean_N(self, T: float, mu) -> Tuple[float, float]:
         """
         Compute the reweighted mean particle number at arbitrary (T, mu).
+
+        With several exchanged species, N is the total (see
+        `mean_N_species` for each species).
 
         Parameters
         ----------
         T : float
             Temperature to reweight to.
-        mu : float
-            Chemical potential to reweight to.
+        mu : float or array_like
+            Chemical potential to reweight to (one per species with
+            several exchanged species).
 
         Returns
         -------
@@ -273,6 +345,31 @@ class MBARSurfaceAnalysis:
         # unrelated to our chemical potential mu, just an unlucky key name.
         return float(result['mu'][0]), float(result['sigma'][0])
 
+    def mean_N_species(self, T: float, mu) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Reweighted mean count of each exchanged species at arbitrary (T, mu).
+
+        Parameters
+        ----------
+        T : float
+            Temperature to reweight to.
+        mu : array_like
+            One chemical potential per species (a float for one species).
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            ``(means, std_errors)``, each of shape (n_species,), in the
+            order of `exchange_species`.
+        """
+        u = self._u_of_state(T, mu)
+        means, sigmas = [], []
+        for s in range(self.n_species):
+            result = self.mbar.compute_expectations(self.Ns_all[:, s], u_kn=u)
+            means.append(float(result['mu'][0]))
+            sigmas.append(float(result['sigma'][0]))
+        return np.array(means), np.array(sigmas)
+
     def isotherm(self, T: float, mu_grid: np.ndarray, area: float = 1.0
                  ) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -283,7 +380,8 @@ class MBARSurfaceAnalysis:
         T : float
             Temperature of the isotherm.
         mu_grid : numpy.ndarray
-            Chemical potentials to evaluate the isotherm at.
+            Chemical potentials to evaluate the isotherm at (rows of one
+            mu per species, shape (n_mu, n_species), with several).
         area : float, optional
             Surface area to divide N by, giving areal coverage rather than
             raw particle count. Default is 1.0 (i.e. N itself).
@@ -308,12 +406,14 @@ class MBARSurfaceAnalysis:
         Parameters
         ----------
         name : str
-            ``'N'`` or ``'N_ads'``.
+            ``'N'``, ``'N_ads'``, or ``'N_<species>'`` (e.g. ``'N_Cl'``)
+            for one exchanged species' count.
 
         Returns
         -------
         numpy.ndarray
-            `N_all` or `N_ads_all`, shape (n_samples,).
+            `N_all`, `N_ads_all` or a column of `Ns_all`, shape
+            (n_samples,).
 
         Raises
         ------
@@ -326,7 +426,36 @@ class MBARSurfaceAnalysis:
             if self.N_ads_all is None:
                 raise ValueError("no 'N_ads' samples: run the simulation with adsorbed_cutoff=")
             return self.N_ads_all
-        raise ValueError(f"unknown observable {name!r}; choose 'N' or 'N_ads'")
+        species = list(self.exchange_species or ())
+        if name.startswith("N_") and name[2:] in species:
+            return self.Ns_all[:, species.index(name[2:])]
+        choices = ["N", "N_ads"] + [f"N_{sp}" for sp in species]
+        raise ValueError(f"unknown observable {name!r}; choose one of {choices}")
+
+    def _Tmu_mesh(self, T_grid: np.ndarray, mu_grid: np.ndarray
+                  ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        (T, mu) meshes for a temperature axis and a mu axis (or mu path).
+
+        Parameters
+        ----------
+        T_grid : numpy.ndarray
+            Temperatures, length n_T.
+        mu_grid : numpy.ndarray
+            Chemical potentials, length n_mu; with several species a path
+            of mu vectors, shape (n_mu, n_species).
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            ``(T_mesh, mu_mesh)``, shapes (n_T, n_mu) and (n_T, n_mu) or
+            (n_T, n_mu, n_species).
+        """
+        if self.n_species == 1:
+            return np.meshgrid(T_grid, mu_grid, indexing="ij")
+        path = np.asarray(mu_grid, dtype=float).reshape(-1, self.n_species)
+        T_mesh = np.broadcast_to(np.asarray(T_grid, dtype=float)[:, None], (len(T_grid), len(path)))
+        return T_mesh, np.broadcast_to(path[None], T_mesh.shape + (self.n_species,))
 
     def phase_diagram(self, T_grid: np.ndarray, mu_grid: np.ndarray, area: float = 1.0,
                       observable: str = "N") -> np.ndarray:
@@ -338,12 +467,14 @@ class MBARSurfaceAnalysis:
         T_grid : numpy.ndarray
             Temperatures to evaluate the surface at.
         mu_grid : numpy.ndarray
-            Chemical potentials to evaluate the surface at.
+            Chemical potentials to evaluate the surface at; with several
+            species a path of mu vectors, shape (n_mu, n_species).
         area : float, optional
             Surface area to divide N by. Default is 1.0.
         observable : str, optional
-            ``'N'`` (all mobile particles, the default) or ``'N_ads'``
-            (adsorbed ones only; needs a run with ``adsorbed_cutoff``).
+            ``'N'`` (all mobile particles, the default), ``'N_ads'``
+            (adsorbed ones only; needs a run with ``adsorbed_cutoff``) or
+            ``'N_<species>'``.
 
         Returns
         -------
@@ -351,7 +482,7 @@ class MBARSurfaceAnalysis:
             Array of shape (len(T_grid), len(mu_grid)): the reweighted
             mean coverage at each (T, mu) point.
         """
-        T_mesh, mu_mesh = np.meshgrid(T_grid, mu_grid, indexing="ij")
+        T_mesh, mu_mesh = self._Tmu_mesh(T_grid, mu_grid)
         return self._reweight(T_mesh, mu_mesh, self._observable(observable)) / area
 
     # -- pressure-native wrappers -------------------------------------------
@@ -402,9 +533,16 @@ class MBARSurfaceAnalysis:
             The pressure at (T, mu), via `p_of_Tmu` if given at
             construction, else by numerically inverting `mu_of_Tp` if that
             was given, else `pressure.pressure_from_mu` with `p0_of_T`.
+
+        Raises
+        ------
+        ValueError
+            With several exchanged species and no `p_of_Tmu`.
         """
         if self.p_of_Tmu is not None:
             return self.p_of_Tmu(T, mu)
+        if self.n_species > 1:
+            raise ValueError("several exchanged species: pass p_of_Tmu(T, mu_vector) -> p")
         if self.mu_of_Tp is not None:
             return invert_mu_of_Tp(self.mu_of_Tp, T, mu, p_bracket=p_bracket)
         return pressure_from_mu(T, mu, self.p0_of_T)
@@ -488,8 +626,10 @@ class MBARSurfaceAnalysis:
 
         Parameters
         ----------
-        T, mu : float
-            Target state.
+        T : float
+            Target temperature.
+        mu : float or array_like
+            Target chemical potential (one per species with several).
 
         Returns
         -------
@@ -506,7 +646,8 @@ class MBARSurfaceAnalysis:
         MBAR expectations of sample observables at many (T, mu) at once.
 
         The reduced potential is linear in (U, N) -- u = beta*U + c*N with
-        c = -beta*mu + ln Lambda^3(T) -- so the log-weights of every sample
+        c = -beta*mu + ln Lambda^3(T), a sum over species with several --
+        so the log-weights of every sample
         at a whole block of target states are one rank-2 outer product
         (`_log_weights`, batched). Blocks are sized to keep the weight
         matrix under `max_elements` entries.
@@ -514,7 +655,8 @@ class MBARSurfaceAnalysis:
         Parameters
         ----------
         T, mu : numpy.ndarray
-            Target states, any (common) shape S.
+            Target states, any (common) shape S; with several species
+            `mu` has shape S + (n_species,).
         A : numpy.ndarray
             Observable per sample, shape (n_samples,) or (n_samples, m).
         max_elements : int, optional
@@ -526,17 +668,20 @@ class MBARSurfaceAnalysis:
             <A> at every target state, shape S (or S + (m,)).
         """
         T = np.asarray(T, dtype=float)
-        mu = np.broadcast_to(np.asarray(mu, dtype=float), T.shape).ravel()
+        S = self.n_species
+        mu = np.broadcast_to(np.asarray(mu, dtype=float), T.shape + ((S,) if S > 1 else ())
+                             ).reshape(-1, S)
         T_flat = T.ravel()
         T_unique, inverse = np.unique(T_flat, return_inverse=True)
-        log_lam3 = np.log([self.lambda_cubed_of_T(t) for t in T_unique])[inverse.ravel()]
+        log_lam3 = np.array([self._log_lambda3(t) for t in T_unique])[inverse.ravel()]
         beta = 1.0 / T_flat
-        c = -beta * mu + log_lam3
+        c = -beta[:, None] * mu + log_lam3  # (n_states, n_species)
         out = np.empty((T_flat.size,) + A.shape[1:])
         block = max(1, max_elements // self.U_all.size)
         for i in range(0, T_flat.size, block):
             sl = slice(i, i + block)
-            lw = -(np.outer(beta[sl], self.U_all) + np.outer(c[sl], self.N_all)) - self._log_den
+            cN = np.outer(c[sl, 0], self.N_all) if S == 1 else c[sl] @ self.Ns_all.T
+            lw = -(np.outer(beta[sl], self.U_all) + cN) - self._log_den
             lw -= lw.max(axis=1, keepdims=True)
             w = np.exp(lw, out=lw)
             out[sl] = (w @ A) / w.sum(axis=1).reshape((-1,) + (1,) * (A.ndim - 1))
@@ -578,11 +723,13 @@ class MBARSurfaceAnalysis:
         Returns
         -------
         tuple of numpy.ndarray
-            ``(T_mesh, mu_mesh)``, each mu via `mu_from_p`.
+            ``(T_mesh, mu_mesh)``, each mu via `mu_from_p` (mu_mesh with a
+            trailing species axis with several species).
         """
+        shape = (len(T_grid), len(p_grid))
         mu_mesh = np.array([[self.mu_from_p(T, p) for p in p_grid] for T in T_grid],
-                           dtype=float).reshape(len(T_grid), len(p_grid))
-        T_mesh = np.broadcast_to(np.asarray(T_grid, dtype=float)[:, None], mu_mesh.shape)
+                           dtype=float).reshape(shape + ((self.n_species,) if self.n_species > 1 else ()))
+        T_mesh = np.broadcast_to(np.asarray(T_grid, dtype=float)[:, None], shape)
         return T_mesh, mu_mesh
 
     def most_probable_N(self, T_grid: np.ndarray, mu_grid: np.ndarray,
@@ -596,18 +743,47 @@ class MBARSurfaceAnalysis:
         Parameters
         ----------
         T_grid, mu_grid : numpy.ndarray
-            The mesh axes.
+            The mesh axes (`mu_grid` a path of mu vectors, shape (n_mu,
+            n_species), with several species).
         observable : str, optional
-            ``'N'`` (all mobile particles, the default) or ``'N_ads'``
-            (adsorbed ones only; needs a run with ``adsorbed_cutoff``).
+            ``'N'`` (all mobile particles, the default), ``'N_ads'``
+            (adsorbed ones only; needs a run with ``adsorbed_cutoff``) or
+            ``'N_<species>'``.
 
         Returns
         -------
         numpy.ndarray
             Integer array of shape (len(T_grid), len(mu_grid)).
         """
-        T_mesh, mu_mesh = np.meshgrid(T_grid, mu_grid, indexing="ij")
+        T_mesh, mu_mesh = self._Tmu_mesh(T_grid, mu_grid)
         return self._most_probable_N_at(T_mesh, mu_mesh, observable)
+
+    def most_probable_composition(self, T_grid: np.ndarray, mu_grid: np.ndarray) -> np.ndarray:
+        """
+        The most stable phase, labelled by its composition (N_1, ..., N_S).
+
+        `most_probable_N` for several exchanged species: the argmax of the
+        reweighted joint P(N_1, ..., N_S), e.g. telling an O-rich from a
+        Cl-rich phase of the same total coverage.
+
+        Parameters
+        ----------
+        T_grid : numpy.ndarray
+            Temperatures, length n_T.
+        mu_grid : numpy.ndarray
+            Path of mu vectors, shape (n_mu, n_species) (length n_mu for
+            one species).
+
+        Returns
+        -------
+        numpy.ndarray
+            Integer array of shape (n_T, n_mu, n_species).
+        """
+        T_mesh, mu_mesh = self._Tmu_mesh(T_grid, mu_grid)
+        comps, label = np.unique(np.rint(self.Ns_all).astype(int), axis=0, return_inverse=True)
+        one_hot = np.zeros((label.size, comps.shape[0]))
+        one_hot[np.arange(label.size), label.ravel()] = 1.0
+        return comps[np.argmax(self._reweight(T_mesh, mu_mesh, one_hot), axis=-1)]
 
     def most_probable_N_Tp(self, T_grid: np.ndarray, p_grid: np.ndarray,
                            observable: str = "N") -> np.ndarray:
@@ -640,8 +816,16 @@ class MBARSurfaceAnalysis:
         -------
         tuple of numpy.ndarray
             ``(N_values, E_min)``: the distinct N in the samples and the
-            lowest potential energy sampled with that N.
+            lowest potential energy sampled with that N. With several
+            species, `N_values` holds the distinct compositions, shape
+            (n_compositions, n_species).
         """
+        if self.n_species > 1:
+            comps, label = np.unique(np.rint(self.Ns_all).astype(int), axis=0,
+                                     return_inverse=True)
+            E = np.full(comps.shape[0], np.inf)
+            np.minimum.at(E, label.ravel(), self.U_all)
+            return comps, E
         N_int = np.rint(self.N_all).astype(int)
         Ns = np.unique(N_int)
         return Ns, np.array([self.U_all[N_int == n].min() for n in Ns])
@@ -659,15 +843,20 @@ class MBARSurfaceAnalysis:
         Parameters
         ----------
         mu_values : sequence of float
-            Chemical potentials.
+            Chemical potentials (mu vectors, shape (n, n_species), with
+            several species).
 
         Returns
         -------
         numpy.ndarray
-            Integer array of the stable N, one per mu.
+            Integer array of the stable N, one per mu (with several
+            species, the stable composition, shape (n, n_species)).
         """
         Ns, E = self.lowest_energy_per_N()
         mu = np.asarray(mu_values, dtype=float)
+        if self.n_species > 1:
+            mu = mu.reshape(-1, self.n_species)
+            return Ns[np.argmin(E[None, :] - mu @ Ns.T, axis=1)]
         return Ns[np.argmin(E[None, :] - mu[:, None] * Ns[None, :], axis=1)]
 
     def lowest_energy_N_Tp(self, T_grid: np.ndarray, p_grid: np.ndarray) -> np.ndarray:
@@ -682,12 +871,13 @@ class MBARSurfaceAnalysis:
         Returns
         -------
         numpy.ndarray
-            Integer array of shape (len(T_grid), len(p_grid)).
+            Integer array of shape (len(T_grid), len(p_grid)) (plus a
+            trailing species axis with several species).
         """
         return np.array([self.lowest_energy_N([self.mu_from_p(T, p) for p in p_grid])
                          for T in T_grid])
 
-    def pN(self, T: float, mu: float, n_bins: Optional[int] = None
+    def pN(self, T: float, mu, n_bins: Optional[int] = None, observable: str = "N"
            ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute the reweighted probability mass function of N at (T, mu).
@@ -700,11 +890,15 @@ class MBARSurfaceAnalysis:
         ----------
         T : float
             Temperature to reweight to.
-        mu : float
-            Chemical potential to reweight to.
+        mu : float or array_like
+            Chemical potential to reweight to (one per species with
+            several).
         n_bins : int, optional
             Number of histogram bins. Default is None, which uses one bin
             per integer N from 0 to the observed maximum.
+        observable : str, optional
+            Count to histogram: ``'N'`` (default), ``'N_ads'`` or
+            ``'N_<species>'`` (see `phase_diagram`).
 
         Returns
         -------
@@ -712,12 +906,13 @@ class MBARSurfaceAnalysis:
             ``(centers, probs)``: the bin centers (in N) and the
             reweighted probability mass in each bin.
         """
-        n_max = int(self.N_all.max())
+        N = self._observable(observable)
+        n_max = int(N.max())
         edges = (np.arange(-0.5, n_max + 1.5, 1.0) if n_bins is None
                  else np.linspace(-0.5, n_max + 0.5, n_bins + 1))
         centers = 0.5 * (edges[:-1] + edges[1:])
         w = np.exp(self._log_weights(T, mu))
-        probs, _ = np.histogram(self.N_all, bins=edges, weights=w)
+        probs, _ = np.histogram(N, bins=edges, weights=w)
         return centers, probs
 
     def pN_p(self, T: float, p: float, n_bins: Optional[int] = None
@@ -780,7 +975,13 @@ class MBARSurfaceAnalysis:
         RuntimeError
             If a bimodal P(N) crossing can't be bracketed within
             `mu_bracket`.
+        ValueError
+            With several exchanged species (no single mu to bisect; scan
+            `pN` along a mu path instead).
         """
+        if self.n_species > 1:
+            raise ValueError("locate_coexistence_mu bisects one mu; with several species, "
+                             "scan pN(T, mu_vector) along a path instead")
         lo_mu, hi_mu = mu_bracket
 
         def imbalance(mu: float) -> Optional[float]:

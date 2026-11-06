@@ -57,6 +57,7 @@ from .analysis import MBARSurfaceAnalysis
 from .plotting import plot_phase_diagram
 from .units import (
     PRESSURE_UNITS,
+    SpeciesLambdaCubed,
     ThermalWavelengthCubed,
     default_mass_amu,
     eV_to_kelvin,
@@ -97,6 +98,7 @@ __all__ = [
     "ThermoState", "Replica", "ReplicaExchangeGCMC", "SWAP_TYPES",
     # units and pressure conventions
     "kelvin_to_eV", "eV_to_kelvin", "pascal_per", "PRESSURE_UNITS", "ThermalWavelengthCubed",
+    "SpeciesLambdaCubed",
     "thermal_wavelength_angstrom", "thermal_wavelength_cubed_angstrom3", "default_mass_amu",
     "p0_reduced_units", "p0_ideal_gas_wavelength",
     "mu_from_pressure", "pressure_from_mu", "mu_grid_from_pressures", "invert_mu_of_Tp",

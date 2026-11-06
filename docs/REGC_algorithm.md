@@ -444,7 +444,91 @@ It reports how these diagrams relate to the paper's results:
 
 ---
 
-## 7. Summary of changes relative to [ZSG]
+## 8. Several exchanged species (an extension beyond [ZSG])
+
+Two gas reservoirs act at once in many surface problems (O$_2$ + a Cl promoter on Ag, O$_2$ + CO on
+Pd). `ParticleSystem(exchange_species=['O', 'Cl'])` exchanges $S$ species $s = 1,\dots,S$, each
+with its own $\mu_s$ and $\Lambda_s(T)$. The target ensemble (1) becomes
+
+$$
+\mathcal N(\beta,\boldsymbol\mu,\mathbf R) \propto
+\prod_{s}\frac{V^{N_s}}{N_s!\,\Lambda_s^{3N_s}(T)}\;
+e^{-\beta\left[E(\mathbf R) - \sum_s \mu_s N_s\right]},
+\qquad (16)
+$$
+
+with $N_s$ the number of mobile particles of species $s$ (`ParticleSystem.species_counts`).
+Particles of different species are distinguishable; particles of the same species are not.
+
+**GC moves** (`Replica._move_insert_species`, `_move_delete_species`). Draw $s$ uniformly. An
+insertion places one $s$ particle uniformly in $V_\text{ex}$; a deletion removes one of the
+$N_{\text{ex},s}$ particles of species $s$ inside $V_\text{ex}$. The acceptance rules are
+(4)–(5) with $\mu\to\mu_s$, $\Lambda\to\Lambda_s$, $N_\text{ex}\to N_{\text{ex},s}$:
+
+$$
+P_\text{acc}(N_s\to N_s+1) = \min\!\left[1,\;
+\frac{V_\text{ex}}{\Lambda_s^3(T)\,(N_{\text{ex},s}+1)}\;
+e^{\beta\left[\mu_s - (E_{N+1}-E_N)\right]}\right].
+\qquad (17)
+$$
+
+The $1/S$ species-choice probability is the same in both directions and cancels. Counting
+$N_\text{ex}$ over all species instead of species $s$ is a classic error that biases the
+composition; `tests/test_multispecies.py` catches it.
+
+**Replica exchange.** Inserting (16) into (7) gives (8) summed over species:
+
+$$
+P_\text{acc}^\text{swap} = \min\!\left[1,\;
+\exp\!\Big\{(\beta_a-\beta_b)(E_a-E_b)
+- \sum_s(\beta_a\mu_{a,s}-\beta_b\mu_{b,s})(N_{a,s}-N_{b,s})
++ \sum_s (N_{a,s}-N_{b,s})\ln\frac{\Lambda_s^3(T_a)}{\Lambda_s^3(T_b)}\Big\}\right].
+\qquad (18)
+$$
+
+**The ladder stays 2D.** Each grid point carries a vector $\boldsymbol\mu = (\mu_1,\dots,\mu_S)$,
+so `mus` has shape $(n_\mu, S)$ or $(n_T, n_\mu, S)$. The second ladder axis is therefore a path
+in $\boldsymbol\mu$ space. A natural choice is a gas feed of fixed composition at increasing
+total pressure: $\boldsymbol\mu(T,p) = (\mu_{\text{O}}(T, x_\text{O}p), \mu_\text{Cl}(T, x_\text{Cl}p))$.
+All four swap patterns of §3.2 and the $\rho(u)$ convergence check work unchanged with (18) and (19).
+
+**MBAR.** The reduced potential (9) becomes
+
+$$
+u(\mathbf R; \boldsymbol\mu, \beta) = \beta E(\mathbf R)
+- \sum_s \left[\beta\mu_s - \ln\Lambda_s^3(T)\right] N_s(\mathbf R),
+\qquad (19)
+$$
+
+built from the per-species counts the engine records as `samples[key]['N_s']`.
+`MBARSurfaceAnalysis` reweights to any $(T,\boldsymbol\mu)$, including points *off* the
+simulated path, as far as the sampled $(N_1,\dots,N_S)$ distributions overlap there. Several
+quantities take a $\mu$ vector or a path of $\mu$ vectors:
+* `mean_N_species`;
+* `phase_diagram(..., observable='N_Cl')`;
+* `most_probable_composition`, the argmax of the joint $P(N_1,\dots,N_S)$;
+* `lowest_energy_N`, the aiAT construction over compositions;
+* `pN(..., observable=...)`.
+
+For $(T,p)$ output, pass `mu_of_Tp(T, p)` returning the vector (e.g. the fixed-feed path).
+`locate_coexistence_mu` bisects a scalar $\mu$ and is disabled for $S>1$; scan `pN` along the
+path instead.
+
+**Exact checks** (`tests/test_multispecies.py`):
+* Ideal gas, per species: $\langle N_s\rangle = V e^{\beta\mu_s}/\Lambda_s^3$ at every grid
+  point, with a steeply $T$-dependent $\Lambda_\text{Cl}$ so that dropping the $\Lambda$ term of
+  (18) shows up as a ~50% error. Also checked after MBAR reweighting to an unsampled
+  $(T,\boldsymbol\mu)$.
+* Two labels on *one* interacting particle type (`LJCalculator` ignores species). The grand
+  partition function only depends on $z_1 + z_2$ with $z_s = e^{\beta\mu_s}/\Lambda_s^3$, so
+  $\langle N\rangle$ and $\langle E\rangle$ must equal those of a single species with
+  $\mu = kT\ln(z_1+z_2)$. In addition, each particle carries label $s$ with probability
+  $z_s/(z_1+z_2)$.
+* With one species, every code path is the original one, bit for bit.
+
+---
+
+## 9. Summary of changes relative to [ZSG]
 
 | # | Item | Status |
 |---|---|---|
@@ -458,3 +542,4 @@ It reports how these diagrams relate to the paper's results:
 | 7 | Convergence by unchanged $\rho(U)$ | **Implemented:** Eq. (15) |
 | — | Mixed sweep scheme `run` | Kept as an alternative (§4.2) |
 | 8 | Reservoir $\mu_\text{H}$ missing the calculator's isolated-atom energy | **Fixed:** Eq. (14), `e_atom_eV` in `reservoir.py` and the runner |
+| 9 | Several gas reservoirs at once (e.g. O + Cl) | **Implemented:** Eqs. (16)–(19), §8 |

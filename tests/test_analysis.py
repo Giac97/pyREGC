@@ -118,11 +118,11 @@ def test_most_probable_N_Tp_routes_through_mu_from_p(tiny_sim):
     assert np.array_equal(analysis.most_probable_N_Tp(np.array([T]), ps), expected)
 
 
-def test_lbfgs_warm_start_matches_pymbar_solution(tiny_sim):
+def test_newton_warm_start_matches_pymbar_solution(tiny_sim):
     from pymbar import MBAR
 
-    from gcmc_re.analysis import _mbar_free_energies_lbfgs
+    from gcmc_re.analysis import _mbar_free_energies_newton
 
     analysis = MBARSurfaceAnalysis(tiny_sim)
     reference = MBAR(analysis.u_kn, analysis.Nk).f_k
-    assert np.allclose(_mbar_free_energies_lbfgs(analysis.u_kn, analysis.Nk), reference, atol=1e-6)
+    assert np.allclose(_mbar_free_energies_newton(analysis.u_kn, analysis.Nk), reference, atol=1e-6)
