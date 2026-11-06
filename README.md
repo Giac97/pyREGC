@@ -81,7 +81,8 @@ gcmc_re/
 ├── trajectory.py      extended-XYZ trajectory snapshots
 └── runner.py          config-file-driven pipeline (structure file -> phase diagram)
 
-docs/         REGC_algorithm.md/.pdf: the algorithm with every acceptance rule
+docs/         MANUAL.md: user manual (library and YAML runner); API_REFERENCE.md: every public name
+              REGC_algorithm.md/.pdf: the algorithm with every acceptance rule
 examples/     runnable scripts, cheapest first (+ examples/data/ for shipped structure files)
 hpc/          Slurm setup for production runs
 tests/        pytest checks, incl. NumPy-docstring validation of the package
