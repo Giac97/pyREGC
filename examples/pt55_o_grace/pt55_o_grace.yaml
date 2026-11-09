@@ -1,0 +1,107 @@
+# O on an icosahedral Pt55 nanoparticle from O2 gas, with a GRACE foundation
+# model running in LAMMPS (pair_style grace/runtime). Start it with ./run.sh in
+# this folder (see its header); the regc-run commands it wraps are
+#
+#   regc-run pt55_o_grace.yaml --check            # setup, the model's O2, the mu ladder
+#   regc-run pt55_o_grace.yaml                    # run + analysis
+#   regc-run pt55_o_grace.yaml --resume --time-limit 85000   # batch jobs: exit 75 = resubmit
+#   regc-run pt55_o_grace.yaml --analyze-only     # re-analyse the saved samples
+#
+# Needs the grace-runtime LAMMPS build (bash hpc/build_lammps.sh) and a GRACE
+# model as model.npz in this folder (run.sh links one; see the Pd(111) example,
+# examples/pd111_o_grace/, for the same setup on a surface).
+#
+# The cluster:
+# - Geometry. A Mackay icosahedron of 55 Pt atoms: 13 core atoms, 42 on the
+#   surface (12 vertices, 30 edges), radius ~5.5 A. It sits at the centre of a
+#   cubic box with no periodicity and hard walls 6 A beyond its outermost atom.
+#   The central atom is frozen, which pins the particle at the centre of the
+#   insertion shell; the other 54 atoms relax through LAMMPS MD.
+# - Insertion shell. O is inserted between 2 A inside and 3 A outside the
+#   cluster radius (the vertex atoms). That covers the hollow and bridge sites
+#   on the facets, which lie inside the vertex radius, and subsurface sites
+#   between the surface and core shells. Deletions pick O in the same shell, so
+#   the ensemble stays exact.
+# - Coverage. The phase diagram plots adsorbed O (within 2.6 A of a Pt atom)
+#   per surface Pt atom.
+#
+# Physics (see examples/pd111_o_grace/pd111_o_grace.yaml for more):
+# - d0: self references mu_O to the model's own O2 molecule, so the model's
+#   poor isolated-atom energy cancels. --check prints the model's D0;
+#   experiment gives 5.12 eV.
+# - An icosahedron may not stay one. At high O coverage Pt55 can reconstruct
+#   or oxidise, and MD lets the 54 mobile atoms rearrange. Look at the saved
+#   structures before reading coverages as "O on an icosahedron".
+# - Cost: 55 Pt + O atoms, 48 replicas, GRACE-2L. Use a cluster node (hpc/).
+
+structure:
+  cluster:                      # an ase.cluster function and its keywords
+    shape: Icosahedron
+    symbol: Pt
+    noshells: 3                 # 1, 13, 55, 147 atoms for noshells 1-4
+    a: auto                     # fcc lattice constant fitted to the model
+  frozen: center                # center (default), core, none, or a number of central atoms
+  headroom_angstrom: 6.0        # box walls this far beyond the outermost atom
+
+gas:
+  species: O
+  mass_amu: 15.999
+  insertion_shell_around_cluster: [-2.0, 3.0]   # A from the cluster radius
+
+calculator:
+  type: LAMMPS
+  lammps_name: grace            # liblammps_grace.so: the grace-runtime build
+  pair_style: grace/runtime     # GRACE-1L/2L/3L models in kokkos.npz format
+  pair_coeff: "* * model.npz Pt O"
+  species: [Pt, O]              # LAMMPS atom-type order, as in pair_coeff
+  min_distance: 1.0             # A hard core: no insertions closer than this (O-O in O2: 1.21 A)
+
+reservoir:
+  type: diatomic                # O2 gas exchanging O atoms
+  d0: self                      # the model's own O2; or D0_eV: 5.116
+  bond_length_angstrom: 1.2075  # O2 spectroscopic constants
+  vibrational_wavenumber_cm: 1580.2
+  symmetry_number: 2
+
+replica_exchange:
+  temperatures_K: [300, 381.7, 485.6, 617.8, 786.0, 1000]   # geometric ladder
+  pressures: [1.0e-12, 1.0e-10, 1.0e-8, 1.0e-6, 1.0e-4, 1.0e-2, 1.0, 1.0e+2]
+  pressure_unit: bar            # O2 partial pressure
+  scheme: regc
+  n_steps: 20000                # may stop earlier on rho(u) convergence
+  x0: 0.9                       # probability of a GC step (else a replica swap)
+  diffusion: md                 # Bussi NVT MD, native in LAMMPS, walls on all six faces
+  diffusion_steps: 40
+  md: {timestep_fs: 1.0, thermostat: bussi, taut_fs: 50.0}
+  hmc: {leapfrog_steps: 10, timestep_fs: 1.0}     # used with diffusion: hmc
+  record_every: 10
+  convergence_every: 2000
+  convergence_tol: 0.05
+  adsorbed_cutoff: 2.6          # record N_ads: O within 2.6 A of a Pt atom (Pt-O ~ 2.0 A)
+  max_disp: 0.3
+  seed: 0
+  n_workers: auto               # all cores; run.sh's WORKERS=n overrides
+
+checkpoint:
+  chunk: 1000
+
+trajectory:
+  save: true                    # extended XYZ per replica: check the cluster's shape
+  directory: trajectories
+  every: 1000
+
+phase_diagram:
+  T_min_K: 300
+  T_max_K: 1000
+  n_T: 120
+  p_min: 1.0e-14
+  p_max: 1.0e+2
+  n_p: 150
+  pressure_unit: bar
+  observable: N_ads
+  coverage_per: surface_atom    # O per surface Pt (42); or atom (all 55 Pt), none
+  most_probable: true
+  discard: 0.2
+
+output:
+  directory: output_pt55_o_grace

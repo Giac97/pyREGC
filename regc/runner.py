@@ -5,12 +5,18 @@ surface phase diagram, all from one YAML or JSON file.
 ``regc-run config.yaml`` (or `run_from_config` on a dict) does what
 ``examples/13_fe_h_eam_surface.py`` does in Python:
 
-1. **structure** -- read any ASE-readable slab (``structure.file``) or build
-   one with an ``ase.build`` surface function (``structure.build``, lattice
-   constant optionally fitted to the potential, ``a: auto``); lay it out
-   with `slab_geometry_from_atoms` (bottom ``n_frozen_layers`` rigid, the
-   rest displaceable, ``headroom_angstrom`` of space above). Orthogonal and
-   oblique (e.g. hexagonal fcc(111)) cells both work.
+1. **structure** -- a slab or a cluster. A slab is read from any
+   ASE-readable file (``structure.file``) or built with an ``ase.build``
+   surface function (``structure.build``, lattice constant optionally
+   fitted to the potential, ``a: auto``), and laid out with
+   `slab_geometry_from_atoms` (bottom ``n_frozen_layers`` rigid, the rest
+   displaceable, ``headroom_angstrom`` of space above); orthogonal and
+   oblique (e.g. hexagonal fcc(111)) cells both work. A cluster is built
+   with an ``ase.cluster`` function (``structure.cluster``, e.g.
+   ``Icosahedron``) or read from a file with ``geometry: cluster``, and laid
+   out with `cluster_geometry_from_atoms`: centred in a non-periodic cubic
+   box, ``frozen`` atoms rigid (default: the central one), insertions in
+   the box or a shell (``gas.insertion_shell_around_cluster``).
 2. **calculator** -- ``EMT``, ``LJ``, ``PairLJ``, ``LAMMPS`` (any pair style:
    an EAM file, GRACE, ACE, ...; native MD; ``lammps_name`` picks the LAMMPS
    library, e.g. ``grace`` for liblammps_grace.so) or ``ASE`` (any ASE calculator
@@ -27,7 +33,8 @@ surface phase diagram, all from one YAML or JSON file.
    (``checkpoint.pkl``/``samples.npz``), resumable (``--resume``) and
    stopping cleanly before ``--time-limit`` (exit code 75, `EXIT_RESUBMIT`).
 6. **phase_diagram** -- MBAR-reweighted coverage (of ``N``, ``N_ads`` or one
-   species ``N_<sp>``) on a (T, p) mesh, per area or per surface atom, and
+   species ``N_<sp>``) on a (T, p) mesh, per area, per surface atom or per
+   slab/cluster atom, and
    optionally the most probable N; re-runnable on saved samples with
    ``--analyze-only``.
 
@@ -71,8 +78,10 @@ import numpy as np
 FS_PER_INTERNAL_TIME = 10.1805
 
 _SECTIONS = {
-    "structure": {"file", "build", "n_frozen_layers", "headroom_angstrom", "layer_tol"},
-    "gas": {"species", "mass_amu", "insertion_z_range_above_surface", "composition"},
+    "structure": {"file", "build", "cluster", "geometry", "n_frozen_layers", "headroom_angstrom",
+                  "layer_tol", "frozen", "full_coordination"},
+    "gas": {"species", "mass_amu", "insertion_z_range_above_surface",
+            "insertion_shell_around_cluster", "composition"},
     "reservoir": {"type", "d0", "D0_eV", "e_atom_eV", "bond_length_angstrom",
                   "vibrational_wavenumber_cm", "symmetry_number", "mass_molecule_amu", "mass_amu"},
     "trajectory": {"save", "directory", "every"},
@@ -336,10 +345,55 @@ def validate_config(config: Dict[str, Any]) -> None:
                          "potentials) or 'pressures' (gas-pressure ladder via the reservoir)")
     if "checkpoint" in config and scheme != "regc":
         raise ValueError("the checkpoint section needs replica_exchange.scheme: regc")
-    if "build" in config["structure"] and "file" in config["structure"]:
-        raise ValueError("structure needs one of 'file' or 'build', not both")
-    if "build" not in config["structure"] and "file" not in config["structure"]:
-        raise ValueError("structure needs 'file' (an ASE-readable slab) or 'build'")
+    struct = config["structure"]
+    sources = [k for k in ("file", "build", "cluster") if k in struct]
+    if len(sources) != 1:
+        raise ValueError("structure needs exactly one of 'file' (an ASE-readable slab or "
+                         "cluster), 'build' (an ase.build surface) or 'cluster' (an ase.cluster "
+                         f"particle); got {sources or 'none'}")
+    kind = _geometry_kind(struct)
+    if kind == "cluster" and "build" in struct:
+        raise ValueError("structure.build makes a slab; use structure.cluster for a cluster")
+    wrong = ({"n_frozen_layers", "layer_tol"} if kind == "cluster"
+             else {"frozen", "full_coordination"}) & set(struct)
+    wrong_gas = {"insertion_z_range_above_surface" if kind == "cluster"
+                 else "insertion_shell_around_cluster"} & set(config["gas"])
+    if wrong or wrong_gas:
+        keys = sorted(wrong) + [f"gas.{k}" for k in sorted(wrong_gas)]
+        raise ValueError(f"{', '.join(keys)} not used with a {kind} (structure.geometry)")
+    if (kind == "cluster" and "phase_diagram" in config
+            and config["phase_diagram"].get("coverage_per") == "area"):
+        raise ValueError("phase_diagram.coverage_per: area needs a slab; for a cluster use "
+                         "surface_atom, atom or none")
+
+
+def _geometry_kind(struct_cfg: Dict[str, Any]) -> str:
+    """
+    Whether the ``structure`` section describes a slab or a cluster.
+
+    Parameters
+    ----------
+    struct_cfg : dict
+        The ``structure`` section.
+
+    Returns
+    -------
+    str
+        ``'cluster'`` with a ``cluster`` block or ``geometry: cluster``,
+        else ``'slab'``.
+
+    Raises
+    ------
+    ValueError
+        If ``geometry`` is neither slab nor cluster, or contradicts a
+        ``cluster`` block.
+    """
+    kind = str(struct_cfg.get("geometry", "cluster" if "cluster" in struct_cfg else "slab")).lower()
+    if kind not in ("slab", "cluster"):
+        raise ValueError(f"structure.geometry must be slab or cluster, got {kind!r}")
+    if kind == "slab" and "cluster" in struct_cfg:
+        raise ValueError("structure.cluster builds a cluster: drop geometry: slab")
+    return kind
 
 
 # =============================================================================
@@ -497,15 +551,17 @@ class _CalculatorSpec:
         factory = self._ase_factory()
         return factory() if factory is not None else None
 
-    def make(self, cell: np.ndarray):
+    def make(self, cell: np.ndarray, pbc: Tuple[bool, bool, bool] = (True, True, False)):
         """
         A fresh simulation `Calculator` (each system needs its own).
 
         Parameters
         ----------
         cell : numpy.ndarray
-            3x3 cell matrix (rows a1, a2, a3) for ASE-backed calculators;
-            periodic in x and y, open in z.
+            3x3 cell matrix (rows a1, a2, a3) for ASE-backed calculators.
+        pbc : tuple of bool, optional
+            Their periodicity. Default ``(True, True, False)``: a slab
+            (a cluster has none).
 
         Returns
         -------
@@ -538,7 +594,7 @@ class _CalculatorSpec:
         cell = np.asarray(cell, dtype=float)
         if np.allclose(cell - np.diag(np.diag(cell)), 0.0):
             cell = np.diag(cell)
-        return ASECalculatorAdapter(self._ase_factory(), cell=cell, pbc=(True, True, False))
+        return ASECalculatorAdapter(self._ase_factory(), cell=cell, pbc=tuple(pbc))
 
     def isolated_atom_energy(self, species: str) -> float:
         """
@@ -567,7 +623,7 @@ class _CalculatorSpec:
 def _build_structure(struct_cfg: Dict[str, Any], calc_spec_of: Callable[[List[str]], _CalculatorSpec]
                      ) -> Tuple[Any, _CalculatorSpec, Optional[float]]:
     """
-    Read or build the slab, and the calculator spec that goes with it.
+    Read or build the slab or cluster, and the calculator spec that goes with it.
 
     Parameters
     ----------
@@ -585,15 +641,17 @@ def _build_structure(struct_cfg: Dict[str, Any], calc_spec_of: Callable[[List[st
     Raises
     ------
     ValueError
-        If ``build`` lacks ``surface``/``symbol``, ``a: auto`` is asked for
-        a non-cubic crystal or a potential with no ASE counterpart, or
-        ``ase.build`` has no such surface function.
+        If ``build``/``cluster`` lacks its shape or ``symbol``, ``a: auto``
+        is asked for a non-cubic crystal or a potential with no ASE
+        counterpart, or ``ase.build``/``ase.cluster`` has no such function.
     """
     if "file" in struct_cfg:
         from ase.io import read as ase_read
         atoms = ase_read(struct_cfg["file"])
         slab_species = list(dict.fromkeys(atoms.get_chemical_symbols()))
         return atoms, calc_spec_of(slab_species), None
+    if "cluster" in struct_cfg:
+        return _build_cluster(dict(struct_cfg["cluster"]), calc_spec_of)
 
     import ase.build
     build = dict(struct_cfg["build"])
@@ -605,25 +663,108 @@ def _build_structure(struct_cfg: Dict[str, Any], calc_spec_of: Callable[[List[st
     if builder is None:
         raise ValueError(f"ase.build has no surface function {surface!r}")
     calc_spec = calc_spec_of([symbol])
-    a = build.pop("a", None)
-    a_range = build.pop("a_range", None)
-    if a == "auto":
-        from .structures import cubic_lattice_constant
-        crystal = surface[:3]
-        if crystal not in ("fcc", "bcc"):
-            raise ValueError(f"structure.build.a: auto needs an fcc/bcc surface, got {surface!r}")
-        ase_calc = calc_spec.ase_calculator()
-        if ase_calc is None:
-            raise ValueError("structure.build.a: auto needs a calculator with an ASE "
-                             "counterpart (EMT, LAMMPS, ASE); give 'a' explicitly")
-        a_range = tuple(_floats(a_range, "structure.build.a_range")) if a_range else (2.3, 5.5)
-        a = cubic_lattice_constant(ase_calc, symbol, crystal, a_range=a_range, n_coarse=97)
-    elif a is not None:
-        a = _as_float(a, "structure.build.a")
+    a = _lattice_constant(build.pop("a", None), build.pop("a_range", None), surface[:3], symbol,
+                          calc_spec, "structure.build")
     if "size" in build:
         build["size"] = tuple(int(n) for n in build["size"])
     atoms = builder(symbol, a=a, **build) if a is not None else builder(symbol, **build)
     return atoms, calc_spec, a
+
+
+#: Lattice of each ase.cluster function, for ``a: auto``.
+_CLUSTER_CRYSTAL = {"Icosahedron": "fcc", "Octahedron": "fcc", "Decahedron": "fcc",
+                    "FaceCenteredCubic": "fcc", "BodyCenteredCubic": "bcc"}
+
+
+def _build_cluster(cl: Dict[str, Any], calc_spec_of: Callable[[List[str]], _CalculatorSpec]
+                   ) -> Tuple[Any, _CalculatorSpec, Optional[float]]:
+    """
+    Build a cluster with an ``ase.cluster`` function.
+
+    Parameters
+    ----------
+    cl : dict
+        The ``structure.cluster`` block: ``shape`` (the function, e.g.
+        ``Icosahedron``), ``symbol``, ``a`` (``auto``, a number, or absent
+        for ASE's default), ``a_range``, and the function's own keywords
+        (``noshells``, ``length``, ``cutoff``, ``p``, ``q``, ``r``, ...).
+    calc_spec_of : callable
+        ``calc_spec_of(cluster_species) -> _CalculatorSpec``.
+
+    Returns
+    -------
+    tuple
+        ``(atoms, calc_spec, lattice_constant)``.
+
+    Raises
+    ------
+    ValueError
+        If ``shape``/``symbol`` is missing or ``ase.cluster`` has no such
+        function, or ``a: auto`` cannot be fitted.
+    """
+    import ase.cluster
+    for key in ("shape", "symbol"):
+        if key not in cl:
+            raise ValueError(f"structure.cluster needs {key!r} (e.g. shape: Icosahedron, "
+                             "symbol: Pt, noshells: 3)")
+    shape, symbol = str(cl.pop("shape")), str(cl.pop("symbol"))
+    builder = getattr(ase.cluster, shape, None)
+    if builder is None or not callable(builder):
+        raise ValueError(f"ase.cluster has no function {shape!r} (e.g. Icosahedron, Octahedron, "
+                         "Decahedron)")
+    calc_spec = calc_spec_of([symbol])
+    a = _lattice_constant(cl.pop("a", None), cl.pop("a_range", None),
+                          _CLUSTER_CRYSTAL.get(shape, shape), symbol, calc_spec,
+                          "structure.cluster")
+    atoms = builder(symbol, latticeconstant=a, **cl) if a is not None else builder(symbol, **cl)
+    return atoms, calc_spec, a
+
+
+def _lattice_constant(a: Any, a_range: Any, crystal: str, symbol: str,
+                      calc_spec: _CalculatorSpec, where: str) -> Optional[float]:
+    """
+    The lattice constant of a ``build``/``cluster`` block.
+
+    Parameters
+    ----------
+    a : 'auto', number or None
+        The block's ``a``.
+    a_range : sequence of float or None
+        Scan range for ``a: auto``. Default: 0.8-1.2 times the experimental
+        lattice constant (`cubic_lattice_constant`).
+    crystal : str
+        ``'fcc'`` or ``'bcc'`` (anything else refuses ``auto``).
+    symbol : str
+        The element.
+    calc_spec : _CalculatorSpec
+        The potential.
+    where : str
+        Config path, for messages.
+
+    Returns
+    -------
+    float or None
+        The lattice constant (A), or None to use ASE's default.
+
+    Raises
+    ------
+    ValueError
+        If ``auto`` is asked for another crystal or a potential with no
+        ASE counterpart.
+    """
+    if a is None:
+        return None
+    if a != "auto":
+        return _as_float(a, f"{where}.a")
+    from .structures import cubic_lattice_constant
+    if crystal not in ("fcc", "bcc"):
+        raise ValueError(f"{where}.a: auto needs an fcc or bcc lattice, got {crystal!r}")
+    ase_calc = calc_spec.ase_calculator()
+    if ase_calc is None:
+        raise ValueError(f"{where}.a: auto needs a calculator with an ASE counterpart "
+                         "(EMT, LAMMPS, ASE); give 'a' explicitly")
+    a_range = tuple(_floats(a_range, f"{where}.a_range")) if a_range else None  # +-20% of expt.
+    return cubic_lattice_constant(ase_calc, symbol, crystal, a_range=a_range, n_coarse=97)
 
 
 # =============================================================================
@@ -944,11 +1085,12 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
     Returns
     -------
     dict
-        ``geometry`` (`SlabGeometry`), ``lattice_constant`` (A, or None),
+        ``geometry`` (`SlabGeometry` or `ClusterGeometry`), ``lattice_constant`` (A, or None),
         ``calc_spec``, ``species``, ``masses``, ``feed`` (`GasFeed`, or None
         when the run needs no reservoir), ``temperatures_K``, ``mu_grid``,
         ``pressures``/``pressure_unit`` (None for an explicit mu ladder),
-        ``lambda_cubed_of_T``, ``insertion_z_range``, ``system_factory``
+        ``lambda_cubed_of_T``, ``insertion_z_range`` (slab) or
+        ``insertion_shell`` (cluster), ``system_factory``
         and ``metadata`` (JSON-able; what a resumed run must agree with,
         and what `analyze_from_config` reads).
 
@@ -958,7 +1100,7 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
         On an invalid config (see `validate_config`) or an insertion
         z-range outside the box.
     """
-    from .structures import slab_geometry_from_atoms
+    from .structures import cluster_geometry_from_atoms, slab_geometry_from_atoms
     from .units import ThermalWavelengthCubed
 
     validate_config(config)
@@ -975,17 +1117,33 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
 
     # ---- structure -----------------------------------------------------------
     struct_cfg = config["structure"]
+    kind = _geometry_kind(struct_cfg)
     atoms, calc_spec, a = _build_structure(struct_cfg, calc_spec_of)
-    nfl = struct_cfg.get("n_frozen_layers")
-    geometry = slab_geometry_from_atoms(
-        atoms, n_frozen_layers=None if nfl is None else int(nfl),
-        headroom=_as_float(struct_cfg.get("headroom_angstrom", 5.0), "structure.headroom_angstrom"),
-        layer_tol=_as_float(struct_cfg.get("layer_tol", 1e-3), "structure.layer_tol"))
-    cell = np.zeros((3, 3))
-    cell[:2, :2], cell[2, 2] = geometry.cell_xy, geometry.Lz
+    insertion_z_range = insertion_shell = None
+    if kind == "cluster":
+        frozen = struct_cfg.get("frozen", "center")
+        geometry = cluster_geometry_from_atoms(
+            atoms, headroom=_as_float(struct_cfg.get("headroom_angstrom", 6.0),
+                                      "structure.headroom_angstrom"),
+            frozen=frozen if isinstance(frozen, str) else int(frozen),
+            full_coordination=int(struct_cfg.get("full_coordination", 12)))
+        cell, pbc = np.diag([geometry.box] * 3), (False, False, False)
+        shell = gas_cfg.get("insertion_shell_around_cluster")
+        if shell is not None:
+            insertion_shell = geometry.shell(*_floats(shell, "gas.insertion_shell_around_cluster"))
+        region = {"insertion_shell": insertion_shell}
+    else:
+        nfl = struct_cfg.get("n_frozen_layers")
+        geometry = slab_geometry_from_atoms(
+            atoms, n_frozen_layers=None if nfl is None else int(nfl),
+            headroom=_as_float(struct_cfg.get("headroom_angstrom", 5.0),
+                               "structure.headroom_angstrom"),
+            layer_tol=_as_float(struct_cfg.get("layer_tol", 1e-3), "structure.layer_tol"))
+        cell, pbc = np.zeros((3, 3)), (True, True, False)
+        cell[:2, :2], cell[2, 2] = geometry.cell_xy, geometry.Lz
+        region = {"insertion_z_range": None}
 
     zr = gas_cfg.get("insertion_z_range_above_surface")
-    insertion_z_range = None
     if zr is not None:
         lo, hi = _floats(zr, "gas.insertion_z_range_above_surface")
         insertion_z_range = (geometry.top_z + lo, geometry.top_z + hi)
@@ -997,6 +1155,7 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
                 f"[{-geometry.top_z:.3f}, {geometry.Lz - geometry.top_z:.3f}] or raise "
                 f"structure.headroom_angstrom")
         insertion_z_range = (insertion_z_range[0], min(insertion_z_range[1], geometry.Lz))
+        region = {"insertion_z_range": insertion_z_range}
 
     if calc_spec.type == "LJ" and (len(geometry.frozen_positions) or len(geometry.substrate_positions)):
         print("WARNING: calculator.type is 'LJ' (the native LJCalculator), which only evaluates "
@@ -1041,8 +1200,8 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
     exchange = species[0] if len(species) == 1 else list(species)
 
     def system_factory(rng):
-        return geometry.make_system(calc_spec.make(cell), exchange, mass_of_species=masses,
-                                    insertion_z_range=insertion_z_range)
+        return geometry.make_system(calc_spec.make(cell, pbc), exchange, mass_of_species=masses,
+                                    **region)
 
     scheme = _scheme(re_cfg)
     sampling = {"scheme": scheme, "record_every": re_cfg.get("record_every"),
@@ -1058,16 +1217,21 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
         "reservoirs": ({s: _reservoir_to_dict(r) for s, r in zip(species, feed.reservoirs)}
                        if feed else None),
         "structure": struct_cfg, "calculator": calc_cfg, "lattice_constant_angstrom": a,
-        "n_surface": geometry.n_surface, "area_angstrom2": geometry.area,
-        "insertion_z_range": insertion_z_range, "sampling": sampling,
+        "geometry": kind, "n_surface": geometry.n_surface, "area_angstrom2": geometry.area,
+        "n_atoms": len(geometry.frozen_positions) + len(geometry.substrate_positions),
+        "insertion_z_range": insertion_z_range, "insertion_shell": insertion_shell,
+        "sampling": sampling,
     }
 
     if verbose:
         if a is not None:
             print(f"lattice constant from the potential: {a:.4f} A")
-        print(f"slab: {geometry.summary()}")
+        print(f"{kind}: {geometry.summary()}")
         if insertion_z_range is not None:
             print(f"insertions in z in ({insertion_z_range[0]:.2f}, {insertion_z_range[1]:.2f}] A")
+        if insertion_shell is not None:
+            print(f"insertions in the shell {insertion_shell[0]:.2f} <= r < "
+                  f"{insertion_shell[1]:.2f} A around the cluster centre")
         if feed is not None:
             for s, r in zip(species, feed.reservoirs):
                 d0 = ""
@@ -1083,7 +1247,8 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
             "species": species, "masses": masses, "feed": feed,
             "temperatures_K": temperatures_K, "mu_grid": mu_grid, "pressures": pressures,
             "pressure_unit": pressure_unit, "lambda_cubed_of_T": lambda_cubed_of_T,
-            "insertion_z_range": insertion_z_range, "system_factory": system_factory,
+            "insertion_z_range": insertion_z_range, "insertion_shell": insertion_shell,
+            "system_factory": system_factory,
             "metadata": metadata}
 
 
@@ -1292,7 +1457,7 @@ def run_from_config(config: Dict[str, Any], verbose: bool = True, resume: bool =
 # Analysis
 # =============================================================================
 _COVERAGE_LABEL = {"area": "particles / A$^2$", "surface_atom": "particles per surface atom",
-                   "none": "particles per cell"}
+                   "atom": "particles per slab/cluster atom", "none": "particles per cell"}
 
 
 def _phase_diagram_grid(pd_cfg: Dict[str, Any], ladder_unit: Optional[str]
@@ -1317,7 +1482,7 @@ def _phase_diagram_grid(pd_cfg: Dict[str, Any], ladder_unit: Optional[str]
     ------
     ValueError
         If a bound is missing or not a number, the unit is unknown, or
-        ``coverage_per`` is not one of area, surface_atom, none.
+        ``coverage_per`` is not one of area, surface_atom, atom, none.
     """
     from .units import PRESSURE_UNITS
     legacy_atm = "p_min_atm" in pd_cfg or "p_max_atm" in pd_cfg
@@ -1338,7 +1503,7 @@ def _phase_diagram_grid(pd_cfg: Dict[str, Any], ladder_unit: Optional[str]
                            _as_float(pd_cfg["T_max_K"], "phase_diagram.T_max_K"),
                            int(pd_cfg.get("n_T", 15)))
     if pd_cfg.get("coverage_per", "area") not in _COVERAGE_LABEL:
-        raise ValueError(f"phase_diagram.coverage_per must be area, surface_atom or none, "
+        raise ValueError(f"phase_diagram.coverage_per must be area, surface_atom, atom or none, "
                          f"got {pd_cfg['coverage_per']!r}")
     return T_grid_K, np.geomspace(bounds[0], bounds[1], int(pd_cfg.get("n_p", 40))), unit
 
@@ -1404,8 +1569,14 @@ def analyze_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[st
 
     T_grid_K, p_grid, unit = _phase_diagram_grid(pd_cfg, meta.get("pressure_unit"))
     observable = str(pd_cfg.get("observable", "N"))
-    per = str(pd_cfg.get("coverage_per", "area"))
-    norm = {"area": meta["area_angstrom2"], "surface_atom": meta["n_surface"], "none": 1.0}[per]
+    per = str(pd_cfg.get("coverage_per",
+                         "surface_atom" if meta.get("geometry") == "cluster" else "area"))
+    norm = {"area": meta.get("area_angstrom2"), "surface_atom": meta.get("n_surface"),
+            "atom": meta.get("n_atoms"), "none": 1.0}[per]
+    if norm is None:
+        raise ValueError(f"coverage_per: {per} is not available for this run "
+                         + ("(a cluster has no area; use surface_atom, atom or none)"
+                            if per == "area" else "(run_metadata.json predates it; rerun setup)"))
 
     samples = load_samples(samples_path, discard=_as_float(pd_cfg.get("discard", 0.0),
                                                            "phase_diagram.discard"))

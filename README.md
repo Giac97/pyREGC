@@ -5,7 +5,8 @@ of replicas over (temperature, chemical potential), a pluggable energy
 backend (fast pairwise Lennard-Jones, or *any* ASE-compatible potential --
 EAM, MACE, NequIP, Allegro, ...), optional process-pool parallelism across
 replicas, and MBAR-based reweighting into smooth coverage(T, mu)/(T, p)
-surface phase diagrams.
+phase diagrams of surfaces (periodic slabs) and nanoparticles (clusters in
+a non-periodic box).
 
 The package was formerly called `gcmc_re`. `import gcmc_re` and the
 `gcmc-re-run` command still work as deprecated aliases of `regc` and
@@ -71,8 +72,8 @@ regc/
 ├── calculators.py     Calculator, LJCalculator, PairLJCalculator, ASECalculatorAdapter
 ├── lammps_backend.py  LammpsCalculator (any LAMMPS pair style, native MD),
 │                      eam_pair_commands, lammps_ase_calculator
-├── systems.py         ParticleSystem (mobile/substrate/frozen), BulkSystem, SlabSystem
-│                      (historical aliases: LJSystem, SlabLJSystem)
+├── systems.py         ParticleSystem (mobile/substrate/frozen), BulkSystem, SlabSystem,
+│                      ClusterSystem (historical aliases: LJSystem, SlabLJSystem)
 ├── state.py           ThermoState
 ├── replica.py         Replica (one grid point: GCMC moves, MC/HMC/MD diffusion)
 ├── engine.py          ReplicaExchangeGCMC (grid, swaps incl. diagonals, run/run_regc,
@@ -588,7 +589,9 @@ Two annotated configs cover every key:
 `examples/fe100_h_eam_example.yaml` (Fe(100) + H with the Wen EAM through
 LAMMPS, checkpointed: the setup of example 13). `examples/pd111_o_grace/`
 (config + `run.sh`) does Pd(111) + O from O₂ with a GRACE model through
-LAMMPS `grace/runtime`.
+LAMMPS `grace/runtime`, and `examples/pt55_o_grace/` the same for O on an
+icosahedral Pt55 cluster (`structure.cluster`, an insertion shell around the
+particle; see MANUAL.md §2.6).
 
 | Section | What it sets |
 |---|---|
@@ -643,6 +646,12 @@ with Python's `float()`, so this corrects itself, but writing the sign
 - **New geometry**: subclass `ParticleSystem` and implement `_min_image`,
   `volume`, `random_insertion_position`, `apply_move`, `apply_insert`
   (`external_energy` and the frozen-substrate machinery are optional).
+- **Nanoparticles**: `cluster_geometry_from_atoms(ase.cluster.Icosahedron(...))`
+  centres the particle in a non-periodic box (hard walls on all six faces,
+  central atom frozen, surface atoms counted by coordination), and
+  `geometry.make_system(calc, "O", insertion_shell=geometry.shell(-2, 3))`
+  builds the `ClusterSystem`. Molecular gases (CO) are not supported yet:
+  see `TASKS.md`.
 - **Real substrate + adsorbate** (e.g. Fe + H): give `SlabSystem`
   `frozen_positions`/`frozen_species` for the rigid substrate, set
   `wall_epsilon=0`, and use `ASECalculatorAdapter(EAM(...))` or an MLIP as

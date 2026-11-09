@@ -8,8 +8,8 @@ Everything below is importable as `from regc import <name>`, except the runner f
 
 - [Calculators (`regc.calculators`)](#calculators-regccalculators): `Calculator`, `LJCalculator`, `PairLJCalculator`, `ASECalculatorAdapter`
 - [LAMMPS backend (`regc.lammps_backend`)](#lammps-backend-regclammps_backend): `LammpsCalculator`, `eam_pair_commands`, `lammps_ase_calculator`, `open_lammps`
-- [Systems (`regc.systems`)](#systems-regcsystems): `ParticleSystem`, `BulkSystem`, `SlabSystem`, `LJSystem`, `SlabLJSystem`
-- [Structures and slab geometry (`regc.structures`)](#structures-and-slab-geometry-regcstructures): `cubic_lattice_constant`, `slab_geometry_from_atoms`, `SlabGeometry`, `insertion_energy_scan`
+- [Systems (`regc.systems`)](#systems-regcsystems): `ParticleSystem`, `BulkSystem`, `SlabSystem`, `ClusterSystem`, `LJSystem`, `SlabLJSystem`
+- [Structures and slab geometry (`regc.structures`)](#structures-and-slab-geometry-regcstructures): `cubic_lattice_constant`, `slab_geometry_from_atoms`, `SlabGeometry`, `insertion_energy_scan`, `cluster_geometry_from_atoms`, `ClusterGeometry`, `coordination_numbers`, `reference_lattice_constant`
 - [Thermodynamic state (`regc.state`)](#thermodynamic-state-regcstate): `ThermoState`
 - [Replicas (`regc.replica`)](#replicas-regcreplica): `Replica`
 - [The replica-exchange engine (`regc.engine`)](#the-replica-exchange-engine-regcengine): `ReplicaExchangeGCMC`, `SWAP_TYPES`
@@ -384,7 +384,7 @@ Energies, forces and native MD from LAMMPS, for any pair style.
 - `species` (*sequence of str*): Species in LAMMPS atom-type order (type 1 = species[0], ...); must match the element order in `pair_commands`.
 - `masses` (*dict, optional*): Mass (amu) per species; defaults to ASE's tables.
 - `min_distance` (*float, optional*): Hard core: the energy is +inf if any mobile atom is closer than this to any other atom (an exact modification of the potential). Guards GCMC insertions against unphysical, off-training-set configurations of machine-learned potentials. Choose it below any physically reachable separation. Default None (off).
-- `z_padding` (*float, optional*): Extra space (A) below the lowest and above the highest atom/wall in the non-periodic z direction of the LAMMPS box. Default 5.0.
+- `z_padding` (*float, optional*): Extra space (A) beyond the outermost atoms/walls along every non-periodic direction of the LAMMPS box (z for a slab, all three for a cluster). Default 5.0.
 - `lammps_name` (*str, optional*): Which LAMMPS shared library to load: `"grace"` loads `liblammps_grace.so`, `""` the default `liblammps.so`. Default None: the environment variable `REGC_LAMMPS_NAME` of the process that evaluates (worker processes inherit it), else the default library. See `open_lammps`.
 
 **Constructor**
@@ -443,8 +443,9 @@ One NVT MD segment inside LAMMPS.
 Fresh Maxwell-Boltzmann velocities at T for the moving atoms
 (exact: momenta and positions are independent in the canonical
 ensemble), `fix nve` + `fix temp/csvr` (Bussi; or `langevin`),
-`fix wall/reflect` at the system's hard z-walls, frozen atoms
-excluded from integration.
+`fix wall/reflect` at the system's hard walls (`md_wall_bounds`:
+the z-walls of a slab, the six faces of a cluster box), frozen
+atoms excluded from integration.
 
 **Parameters**
 
@@ -457,7 +458,7 @@ excluded from integration.
 
 **Returns**
 
-- *numpy.ndarray*: New positions of the substrate + mobile atoms, shape (n_substrate + n_mobile, 3), unwrapped in x, y.
+- *numpy.ndarray*: New positions of the substrate + mobile atoms, shape (n_substrate + n_mobile, 3), unwrapped along periodic axes.
 
 **Raises**
 
@@ -857,6 +858,23 @@ class has none (fully periodic).
 **Returns**
 
 - *tuple of float or None*: `(z_min, z_max)`, or None.
+
+#### `ParticleSystem.md_wall_bounds`
+
+```python
+ParticleSystem.md_wall_bounds() -> list
+```
+
+Hard walls along each axis that MD must enforce by reflection.
+
+The general form of `md_z_bounds`: MD (ASE or LAMMPS) reflects
+positions and velocities at these planes. The base class turns
+`md_z_bounds` into it, so geometries with z-walls only need not
+override this.
+
+**Returns**
+
+- *list*: Three entries (x, y, z), each `(lo, hi)` or None (no wall).
 
 #### `ParticleSystem.full_configuration`
 
@@ -1309,6 +1327,188 @@ Compute the mobile-particle areal coverage.
 
 ---
 
+### `ClusterSystem`
+
+```python
+ClusterSystem(box: Union[float, Sequence[float]], calculator: Calculator, exchange_species: Union[str, Sequence[str]] = 'X', frozen_positions: Optional[np.ndarray] = None, frozen_species: Optional[np.ndarray] = None, substrate_positions: Optional[np.ndarray] = None, substrate_species: Optional[np.ndarray] = None, positions: Optional[np.ndarray] = None, species: Optional[np.ndarray] = None, insertion_shell: Optional[Tuple[float, float]] = None, center: Optional[Sequence[float]] = None, mass_of_species: Optional[dict] = None)
+```
+
+A cluster (nanoparticle) in a box with no periodicity: hard walls on all faces.
+
+Particles live in `(0, Lx] x (0, Ly] x (0, Lz]`; `external_energy` is
+infinite outside, and MD reflects at the six faces (`md_wall_bounds`).
+The cluster's own atoms are the frozen and displaceable substrate
+atoms, as for a slab; freeze at least the central atom, so the
+particle cannot drift away from the insertion shell.
+
+Insertions are drawn uniformly over the whole box, or, with
+`insertion_shell=(r_in, r_out)`, over the spherical shell
+`r_in <= |r - center| < r_out`. That shell is where adsorption
+happens; the rest of the box (vacuum, the cluster's interior) would
+waste almost every insertion attempt. As for `SlabSystem`'s
+`insertion_z_range`, the acceptance rules use the shell's volume and
+deletions pick only particles inside it (`exchange_zone_indices`), so
+the ensemble stays exact; particles that wander outside the shell stay
+in the system and can be deleted once they are back.
+
+**Constructor**
+
+Construct a cluster system.
+
+**Parameters**
+
+- `box` (*float or sequence of 3 floats*): Box edge lengths (Lx, Ly, Lz), or one length for a cube. Not periodic in any direction.
+- `calculator` (*Calculator*): The energy-evaluation backend.
+- `exchange_species` (*str or sequence of str, optional*): The exchanged species (see `ParticleSystem`). Default `'X'`.
+- `frozen_positions, frozen_species` (*numpy.ndarray, optional*): Rigid cluster atoms (e.g. the central atom), shape (M, 3) and (M,). Default None (none).
+- `substrate_positions, substrate_species` (*numpy.ndarray, optional*): Displaceable cluster atoms, shape (K, 3) and (K,). Default None.
+- `positions, species` (*numpy.ndarray, optional*): Initial mobile particles, shape (N, 3) and (N,). Default None.
+- `insertion_shell` (*tuple of float, optional*): `(r_in, r_out)`: insert in this spherical shell around `center` (0 <= r_in < r_out; the shell must fit in the box). Default None: the whole box.
+- `center` (*sequence of 3 floats, optional*): Centre of the insertion shell. Default: the box centre.
+- `mass_of_species` (*dict, optional*): Masses (amu) by species, for MD/HMC. Default None (ASE tables).
+
+**Raises**
+
+- *ValueError*: If a box length is not positive, or the shell is empty or does not fit in the box.
+
+#### `ClusterSystem.volume` (property)
+
+float: The insertion volume: the shell's `4/3 pi (r_out^3 -
+r_in^3)`, or the box volume without a shell.
+
+#### `ClusterSystem.cell` (property)
+
+tuple of float: The box, (Lx, Ly, Lz).
+
+#### `ClusterSystem.pbc` (property)
+
+tuple of bool: `(False, False, False)`: no periodicity.
+
+#### `ClusterSystem.external_energy`
+
+```python
+ClusterSystem.external_energy(pos: np.ndarray) -> float
+```
+
+The hard walls of the box.
+
+**Parameters**
+
+- `pos` (*numpy.ndarray*): A (3,) Cartesian position.
+
+**Returns**
+
+- *float*: `numpy.inf` outside `(0, L]` along any axis, else 0.0.
+
+#### `ClusterSystem.random_insertion_position`
+
+```python
+ClusterSystem.random_insertion_position(rng: np.random.Generator) -> np.ndarray
+```
+
+Draw a position uniformly over the insertion shell (or the box).
+
+**Parameters**
+
+- `rng` (*numpy.random.Generator*): The random number generator to draw from.
+
+**Returns**
+
+- *numpy.ndarray*: A (3,) Cartesian position.
+
+#### `ClusterSystem.exchange_zone_indices`
+
+```python
+ClusterSystem.exchange_zone_indices(species: Optional[str] = None) -> np.ndarray
+```
+
+Indices of the mobile particles inside the insertion shell.
+
+**Parameters**
+
+- `species` (*str, optional*): Only particles of this species. Default None (all species).
+
+**Returns**
+
+- *numpy.ndarray*: Integer indices into `self.positions` (every particle when there is no shell).
+
+#### `ClusterSystem.md_z_bounds`
+
+```python
+ClusterSystem.md_z_bounds() -> Optional[Tuple[float, float]]
+```
+
+The z-walls (see `md_wall_bounds` for all three axes).
+
+**Returns**
+
+- *tuple of float*: `(0, Lz)`.
+
+#### `ClusterSystem.md_wall_bounds`
+
+```python
+ClusterSystem.md_wall_bounds() -> list
+```
+
+The six box faces, for MD reflection.
+
+**Returns**
+
+- *list*: `[(0, Lx), (0, Ly), (0, Lz)]`.
+
+#### `ClusterSystem.apply_move`
+
+```python
+ClusterSystem.apply_move(i: int, new_pos: np.ndarray) -> None
+```
+
+Commit a displacement of the i-th mobile particle (no wrapping).
+
+**Parameters**
+
+- `i` (*int*): Index of the mobile particle.
+- `new_pos` (*numpy.ndarray*): Its new (3,) position.
+
+**Returns**
+
+- *None*
+
+#### `ClusterSystem.apply_move_substrate`
+
+```python
+ClusterSystem.apply_move_substrate(i: int, new_pos: np.ndarray) -> None
+```
+
+Commit a displacement of the i-th substrate atom (no wrapping).
+
+**Parameters**
+
+- `i` (*int*): Index of the substrate atom.
+- `new_pos` (*numpy.ndarray*): Its new (3,) position.
+
+**Returns**
+
+- *None*
+
+#### `ClusterSystem.apply_insert`
+
+```python
+ClusterSystem.apply_insert(pos: np.ndarray, species: Optional[str] = None) -> None
+```
+
+Commit the insertion of a new mobile particle.
+
+**Parameters**
+
+- `pos` (*numpy.ndarray*): The (3,) position of the new particle.
+- `species` (*str, optional*): Its species. Default None: `self.exchange_species` (required when several species are exchanged).
+
+**Returns**
+
+- *None*
+
+---
+
 ### `LJSystem`
 
 Alias of [`BulkSystem`](#bulksystem), kept for older scripts.
@@ -1324,7 +1524,7 @@ Alias of [`SlabSystem`](#slabsystem), kept for older scripts.
 ### `cubic_lattice_constant`
 
 ```python
-cubic_lattice_constant(ase_calculator, symbol: str, crystal: str = 'bcc', a_range: Tuple[float, float] = (2.3, 3.5), n_coarse: int = 61, n_fine: int = 21) -> float
+cubic_lattice_constant(ase_calculator, symbol: str, crystal: str = 'bcc', a_range: Optional[Tuple[float, float]] = None, n_coarse: int = 61, n_fine: int = 21) -> float
 ```
 
 Equilibrium lattice constant of a cubic crystal for a given potential.
@@ -1337,7 +1537,7 @@ a finer scan around it is fitted with a parabola.
 - `ase_calculator` (*ase.calculators.calculator.Calculator*): The potential (e.g. ASE's EAM, or `regc.lammps_backend.lammps_ase_calculator`).
 - `symbol` (*str*): Element symbol.
 - `crystal` (*{'bcc', 'fcc', 'sc'}, optional*): Crystal structure. Default `'bcc'`.
-- `a_range` (*tuple of float, optional*): Range (A) of the coarse scan. Default (2.3, 3.5).
+- `a_range` (*tuple of float, optional*): Range (A) of the coarse scan. Default: 0.8 to 1.2 times the element's experimental lattice constant (`reference_lattice_constant`), or (2.3, 5.5) if ASE has none for this crystal. Keep the range near the real value for machine-learned potentials: far below it they can have unphysical energy holes, which a wide scan finds.
 - `n_coarse, n_fine` (*int, optional*): Points of the coarse and fine scans. Defaults 61 and 21.
 
 **Returns**
@@ -1463,6 +1663,153 @@ energies).
 **Returns**
 
 - *numpy.ndarray*: Shape (len(xy_points), len(z_values)): insertion energies in eV. Points where the calculator returns NaN (e.g. exactly on top of an atom, r = 0) are reported as +inf, so `argmin` finds real minima.
+
+---
+
+### `cluster_geometry_from_atoms`
+
+```python
+cluster_geometry_from_atoms(atoms, headroom: float = 6.0, frozen: Union[str, int] = 'center', full_coordination: int = 12, cn_cutoff: Optional[float] = None) -> ClusterGeometry
+```
+
+Lay out a cluster for `ClusterSystem`.
+
+The cluster is translated so its centroid is at the centre of a cubic
+box of edge `2 (radius + headroom)`: a spherical insertion shell up
+to `headroom` beyond the outermost atom then fits inside the box.
+
+**Parameters**
+
+- `atoms` (*ase.Atoms*): The cluster (its cell and periodicity are ignored).
+- `headroom` (*float, optional*): Space (A) between the outermost atom and the box walls along the axes. Default 6.0.
+- `frozen` (*{'center', 'core', 'none'} or int, optional*): Which atoms are rigid: the one nearest the centroid (default; pins the particle in place while it relaxes), every fully coordinated atom (`coordination >= full_coordination`), none, or the given number of atoms nearest the centroid.
+- `full_coordination` (*int, optional*): Coordination of an interior atom: 12 for fcc, hcp and icosahedral particles, 14 for bcc with the default cutoff. Atoms below it are surface atoms. Default 12.
+- `cn_cutoff` (*float, optional*): Neighbour cutoff for the coordination numbers (see `coordination_numbers`). Default None (automatic).
+
+**Returns**
+
+- *ClusterGeometry*: The geometry.
+
+**Raises**
+
+- *ValueError*: If `frozen` is not understood, or the cluster has no atoms.
+
+---
+
+### `ClusterGeometry`
+
+```python
+ClusterGeometry(box: float, center: np.ndarray, radius: float, frozen_positions: np.ndarray, frozen_species: np.ndarray, substrate_positions: np.ndarray, substrate_species: np.ndarray, coordination: np.ndarray, n_surface: int = 0) -> None
+```
+
+A cluster laid out for `ClusterSystem`: centred in a cubic, non-periodic box.
+
+**Attributes**
+
+- `box` (*float*): Edge of the cubic box, in A.
+- `center` (*numpy.ndarray*): The box centre (3,), where the cluster's centroid sits.
+- `radius` (*float*): Largest distance of a cluster atom from `center`, in A.
+- `frozen_positions, substrate_positions` (*numpy.ndarray*): Positions of the rigid and the displaceable cluster atoms, (M, 3).
+- `frozen_species, substrate_species` (*numpy.ndarray*): Their species labels.
+- `coordination` (*numpy.ndarray*): Coordination number of every cluster atom (frozen first, then substrate, as in `full_configuration`).
+- `n_surface` (*int*): Number of surface atoms (coordination below full), for coverages per surface atom.
+
+#### `ClusterGeometry.n_atoms` (property)
+
+int: Number of cluster atoms (frozen + displaceable).
+
+#### `ClusterGeometry.area` (property)
+
+None: a cluster has no surface-cell area (coverages per atom instead).
+
+#### `ClusterGeometry.shell`
+
+```python
+ClusterGeometry.shell(d_in: float, d_out: float) -> Tuple[float, float]
+```
+
+Insertion-shell radii from distances relative to the cluster's surface.
+
+**Parameters**
+
+- `d_in, d_out` (*float*): Inner and outer distance from `radius` (A); negative values reach into the cluster.
+
+**Returns**
+
+- *tuple of float*: `(max(0, radius + d_in), radius + d_out)`, for `ClusterSystem(insertion_shell=...)`.
+
+**Raises**
+
+- *ValueError*: If the shell is empty or does not fit in the box.
+
+#### `ClusterGeometry.make_system`
+
+```python
+ClusterGeometry.make_system(calculator: Calculator, exchange_species: Union[str, Sequence[str]], mass_of_species: Optional[dict] = None, insertion_shell: Optional[Tuple[float, float]] = None) -> ClusterSystem
+```
+
+Build the `ClusterSystem` for this geometry.
+
+**Parameters**
+
+- `calculator` (*Calculator*): The energy backend (each system needs its own instance).
+- `exchange_species` (*str or sequence of str*): Species GCMC inserts and deletes.
+- `mass_of_species` (*dict, optional*): Masses (amu) by species, for MD/HMC. Default None (ASE tables).
+- `insertion_shell` (*tuple of float, optional*): `(r_in, r_out)` around the centre (see `shell`). Default None: the whole box.
+
+**Returns**
+
+- *ClusterSystem*: An empty (no mobile particles) system.
+
+#### `ClusterGeometry.summary`
+
+```python
+ClusterGeometry.summary() -> str
+```
+
+One-line description.
+
+**Returns**
+
+- *str*: Atom counts, radius and box.
+
+---
+
+### `coordination_numbers`
+
+```python
+coordination_numbers(positions: np.ndarray, cutoff: Optional[float] = None) -> np.ndarray
+```
+
+Coordination number of every atom of a finite (non-periodic) structure.
+
+**Parameters**
+
+- `positions` (*numpy.ndarray*): Atom positions, (N, 3).
+- `cutoff` (*float, optional*): Neighbour cutoff, in A. Default: halfway between the fcc first and second neighbour shells, `(1 + sqrt 2)/2` times the median nearest-neighbour distance (12 neighbours inside an fcc or icosahedral particle; 14 inside a bcc one).
+
+**Returns**
+
+- *numpy.ndarray*: Integer coordination numbers, (N,).
+
+---
+
+### `reference_lattice_constant`
+
+```python
+reference_lattice_constant(symbol: str, crystal: str) -> Optional[float]
+```
+
+The experimental cubic lattice constant of an element, from ASE's tables.
+
+**Parameters**
+
+- `symbol` (*str*): Element symbol.
+- `crystal` (*{'bcc', 'fcc', 'sc'}*): Crystal structure.
+
+**Returns**
+
+- *float or None*: `ase.data.reference_states` lattice constant (A) when the element's reference structure is `crystal`, else None.
 
 ## Thermodynamic state (`regc.state`)
 
@@ -3586,7 +3933,7 @@ Everything a run needs, built from a config but nothing sampled yet.
 
 **Returns**
 
-- *dict*: `geometry` (`SlabGeometry`), `lattice_constant` (A, or None), `calc_spec`, `species`, `masses`, `feed` (`GasFeed`, or None when the run needs no reservoir), `temperatures_K`, `mu_grid`, `pressures`/`pressure_unit` (None for an explicit mu ladder), `lambda_cubed_of_T`, `insertion_z_range`, `system_factory` and `metadata` (JSON-able; what a resumed run must agree with, and what `analyze_from_config` reads).
+- *dict*: `geometry` (`SlabGeometry` or `ClusterGeometry`), `lattice_constant` (A, or None), `calc_spec`, `species`, `masses`, `feed` (`GasFeed`, or None when the run needs no reservoir), `temperatures_K`, `mu_grid`, `pressures`/`pressure_unit` (None for an explicit mu ladder), `lambda_cubed_of_T`, `insertion_z_range` (slab) or `insertion_shell` (cluster), `system_factory` and `metadata` (JSON-able; what a resumed run must agree with, and what `analyze_from_config` reads).
 
 **Raises**
 

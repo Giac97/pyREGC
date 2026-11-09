@@ -584,7 +584,8 @@ class Replica:
         in the canonical ensemble, so this is exact, and it handles freshly
         inserted particles and configurations just swapped in from another
         T). Frozen atoms are held by `FixAtoms`; displaceable substrate and
-        mobile atoms move. Hard z-walls (`system.md_z_bounds()`) are
+        mobile atoms move. Hard walls (`system.md_wall_bounds()`: the z-walls
+        of a slab, all six faces of a cluster box) are
         enforced by specular reflection after every step, like the
         reflecting boundaries [ZSG] apply via PLUMED.
 
@@ -663,18 +664,20 @@ class Replica:
         else:
             raise ValueError(f"thermostat must be 'bussi' or 'langevin', got {thermostat!r}")
 
-        bounds = sysm.md_z_bounds()
-        if bounds is not None:
-            z_min, z_max = bounds
-
+        walls = [(k, b) for k, b in enumerate(sysm.md_wall_bounds()) if b is not None]
+        if walls:
             def reflect() -> None:
                 pos, vel = atoms.get_positions(), atoms.get_velocities()
-                z, vz = pos[n_fr:, 2], vel[n_fr:, 2]
-                low, high = z <= z_min, z > z_max
-                if low.any() or high.any():
-                    z[low] = 2.0 * z_min - z[low]
-                    z[high] = 2.0 * z_max - z[high]
-                    vz[low | high] *= -1.0
+                hit = False
+                for k, (lo, hi) in walls:
+                    x, v = pos[n_fr:, k], vel[n_fr:, k]
+                    low, high = x <= lo, x > hi
+                    if low.any() or high.any():
+                        x[low] = 2.0 * lo - x[low]
+                        x[high] = 2.0 * hi - x[high]
+                        v[low | high] *= -1.0
+                        hit = True
+                if hit:
                     atoms.set_positions(pos, apply_constraint=False)
                     atoms.set_velocities(vel)
 
@@ -694,7 +697,7 @@ class Replica:
         MD segment run by the calculator itself (`calculator.run_md`).
 
         Same physics as the ASE path of `_diffuse_md` (fresh Maxwell-
-        Boltzmann velocities, thermostat, reflecting z-walls, frozen atoms
+        Boltzmann velocities, thermostat, reflecting walls, frozen atoms
         fixed), but the whole segment runs inside the engine (LAMMPS). If
         the end point has infinite energy (e.g. a hard core of the
         calculator), the segment is discarded and counted in

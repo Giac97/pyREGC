@@ -18,11 +18,14 @@ particle categories, delegating all physics to a pluggable `Calculator`
     this for whatever part of a substrate you don't need to let relax
     (e.g. deep, bulk-truncated layers far from the surface).
 
-Two concrete geometries (both work with any `Calculator`):
+Three concrete geometries (all work with any `Calculator`):
   * `BulkSystem` -- bulk, fully-periodic cube.
   * `SlabSystem` -- periodic in x, y only (rectangular or general, e.g.
     hexagonal, surface cell); hard walls at z = 0 and z = Lz; a continuum
     9-3 wall OR an explicit substrate (rigid, displaceable, or both).
+  * `ClusterSystem` -- a nanoparticle in a box with no periodicity and hard
+    walls on all six faces; insertions in the whole box or in a spherical
+    shell around the particle.
 
 `LJSystem` and `SlabLJSystem` are the historical names of these two
 classes and remain available as aliases.
@@ -527,6 +530,22 @@ class ParticleSystem:
             ``(z_min, z_max)``, or None.
         """
         return None
+
+    def md_wall_bounds(self) -> list:
+        """
+        Hard walls along each axis that MD must enforce by reflection.
+
+        The general form of `md_z_bounds`: MD (ASE or LAMMPS) reflects
+        positions and velocities at these planes. The base class turns
+        `md_z_bounds` into it, so geometries with z-walls only need not
+        override this.
+
+        Returns
+        -------
+        list
+            Three entries (x, y, z), each ``(lo, hi)`` or None (no wall).
+        """
+        return [None, None, self.md_z_bounds()]
 
     def full_configuration(self) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -1320,6 +1339,284 @@ class SlabSystem(ParticleSystem):
             Ly)``.
         """
         return self.n / self.area
+
+
+# =============================================================================
+# ClusterSystem: a nanoparticle in a non-periodic box
+# =============================================================================
+class ClusterSystem(ParticleSystem):
+    """A cluster (nanoparticle) in a box with no periodicity: hard walls on all faces.
+
+    Particles live in ``(0, Lx] x (0, Ly] x (0, Lz]``; `external_energy` is
+    infinite outside, and MD reflects at the six faces (`md_wall_bounds`).
+    The cluster's own atoms are the frozen and displaceable substrate
+    atoms, as for a slab; freeze at least the central atom, so the
+    particle cannot drift away from the insertion shell.
+
+    Insertions are drawn uniformly over the whole box, or, with
+    ``insertion_shell=(r_in, r_out)``, over the spherical shell
+    ``r_in <= |r - center| < r_out``. That shell is where adsorption
+    happens; the rest of the box (vacuum, the cluster's interior) would
+    waste almost every insertion attempt. As for `SlabSystem`'s
+    `insertion_z_range`, the acceptance rules use the shell's volume and
+    deletions pick only particles inside it (`exchange_zone_indices`), so
+    the ensemble stays exact; particles that wander outside the shell stay
+    in the system and can be deleted once they are back.
+    """
+
+    def __init__(self, box: Union[float, Sequence[float]], calculator: Calculator,
+                 exchange_species: Union[str, Sequence[str]] = 'X',
+                 frozen_positions: Optional[np.ndarray] = None,
+                 frozen_species: Optional[np.ndarray] = None,
+                 substrate_positions: Optional[np.ndarray] = None,
+                 substrate_species: Optional[np.ndarray] = None,
+                 positions: Optional[np.ndarray] = None,
+                 species: Optional[np.ndarray] = None,
+                 insertion_shell: Optional[Tuple[float, float]] = None,
+                 center: Optional[Sequence[float]] = None,
+                 mass_of_species: Optional[dict] = None):
+        """
+        Construct a cluster system.
+
+        Parameters
+        ----------
+        box : float or sequence of 3 floats
+            Box edge lengths (Lx, Ly, Lz), or one length for a cube. Not
+            periodic in any direction.
+        calculator : Calculator
+            The energy-evaluation backend.
+        exchange_species : str or sequence of str, optional
+            The exchanged species (see `ParticleSystem`). Default ``'X'``.
+        frozen_positions, frozen_species : numpy.ndarray, optional
+            Rigid cluster atoms (e.g. the central atom), shape (M, 3) and
+            (M,). Default None (none).
+        substrate_positions, substrate_species : numpy.ndarray, optional
+            Displaceable cluster atoms, shape (K, 3) and (K,). Default None.
+        positions, species : numpy.ndarray, optional
+            Initial mobile particles, shape (N, 3) and (N,). Default None.
+        insertion_shell : tuple of float, optional
+            ``(r_in, r_out)``: insert in this spherical shell around
+            `center` (0 <= r_in < r_out; the shell must fit in the box).
+            Default None: the whole box.
+        center : sequence of 3 floats, optional
+            Centre of the insertion shell. Default: the box centre.
+        mass_of_species : dict, optional
+            Masses (amu) by species, for MD/HMC. Default None (ASE tables).
+
+        Raises
+        ------
+        ValueError
+            If a box length is not positive, or the shell is empty or does
+            not fit in the box.
+        """
+        super().__init__(calculator, exchange_species, positions, species,
+                         frozen_positions, frozen_species,
+                         substrate_positions, substrate_species, mass_of_species)
+        L = np.broadcast_to(np.asarray(box, dtype=float), (3,)).copy()
+        if np.any(L <= 0):
+            raise ValueError(f"box lengths must be positive, got {L.tolist()}")
+        self.box = L
+        self.center = 0.5 * L if center is None else np.asarray(center, dtype=float).reshape(3)
+        if insertion_shell is not None:
+            r_in, r_out = (float(x) for x in insertion_shell)
+            if not 0.0 <= r_in < r_out:
+                raise ValueError(f"insertion_shell={insertion_shell} must satisfy 0 <= r_in < r_out")
+            room = float(np.min(np.minimum(self.center, L - self.center)))
+            if r_out > room + 1e-9:
+                raise ValueError(f"insertion_shell r_out = {r_out:.3f} A does not fit in the box: "
+                                 f"the nearest wall is {room:.3f} A from the centre")
+            insertion_shell = (r_in, r_out)
+        self.insertion_shell = insertion_shell
+
+    def _min_image(self, dr: np.ndarray) -> np.ndarray:
+        """
+        No periodicity: displacements are returned unchanged.
+
+        Parameters
+        ----------
+        dr : numpy.ndarray
+            One or more displacement vectors, shape (..., 3).
+
+        Returns
+        -------
+        numpy.ndarray
+            A copy of `dr`.
+        """
+        return np.array(dr, dtype=float, copy=True)
+
+    @property
+    def volume(self) -> float:
+        """
+        float: The insertion volume: the shell's ``4/3 pi (r_out^3 -
+        r_in^3)``, or the box volume without a shell.
+        """
+        if self.insertion_shell is None:
+            return float(np.prod(self.box))
+        r_in, r_out = self.insertion_shell
+        return 4.0 / 3.0 * np.pi * (r_out ** 3 - r_in ** 3)
+
+    @property
+    def cell(self) -> Tuple[float, float, float]:
+        """tuple of float: The box, (Lx, Ly, Lz)."""
+        return tuple(float(x) for x in self.box)
+
+    @property
+    def pbc(self) -> Tuple[bool, bool, bool]:
+        """tuple of bool: ``(False, False, False)``: no periodicity."""
+        return (False, False, False)
+
+    def external_energy(self, pos: np.ndarray) -> float:
+        """
+        The hard walls of the box.
+
+        Parameters
+        ----------
+        pos : numpy.ndarray
+            A (3,) Cartesian position.
+
+        Returns
+        -------
+        float
+            ``numpy.inf`` outside ``(0, L]`` along any axis, else 0.0.
+        """
+        if np.any(pos <= 0.0) or np.any(pos > self.box):
+            return np.inf
+        return 0.0
+
+    def _radius(self, pos: np.ndarray) -> np.ndarray:
+        """
+        Distance of positions from `center`.
+
+        Parameters
+        ----------
+        pos : numpy.ndarray
+            Positions, shape (..., 3).
+
+        Returns
+        -------
+        numpy.ndarray
+            Distances, shape (...).
+        """
+        return np.linalg.norm(np.asarray(pos) - self.center, axis=-1)
+
+    def random_insertion_position(self, rng: np.random.Generator) -> np.ndarray:
+        """
+        Draw a position uniformly over the insertion shell (or the box).
+
+        Parameters
+        ----------
+        rng : numpy.random.Generator
+            The random number generator to draw from.
+
+        Returns
+        -------
+        numpy.ndarray
+            A (3,) Cartesian position.
+        """
+        if self.insertion_shell is None:
+            return rng.random(3) * self.box
+        r_in, r_out = self.insertion_shell
+        r = (r_in ** 3 + rng.random() * (r_out ** 3 - r_in ** 3)) ** (1.0 / 3.0)
+        u = rng.normal(size=3)
+        return self.center + r * u / np.linalg.norm(u)
+
+    def exchange_zone_indices(self, species: Optional[str] = None) -> np.ndarray:
+        """
+        Indices of the mobile particles inside the insertion shell.
+
+        Parameters
+        ----------
+        species : str, optional
+            Only particles of this species. Default None (all species).
+
+        Returns
+        -------
+        numpy.ndarray
+            Integer indices into `self.positions` (every particle when
+            there is no shell).
+        """
+        inside = np.ones(self.n, dtype=bool)
+        if self.insertion_shell is not None and self.n:
+            r = self._radius(self.positions)
+            inside = (r >= self.insertion_shell[0]) & (r < self.insertion_shell[1])
+        if species is not None:
+            inside &= self.species == species
+        return np.flatnonzero(inside)
+
+    def md_z_bounds(self) -> Optional[Tuple[float, float]]:
+        """
+        The z-walls (see `md_wall_bounds` for all three axes).
+
+        Returns
+        -------
+        tuple of float
+            ``(0, Lz)``.
+        """
+        return (0.0, float(self.box[2]))
+
+    def md_wall_bounds(self) -> list:
+        """
+        The six box faces, for MD reflection.
+
+        Returns
+        -------
+        list
+            ``[(0, Lx), (0, Ly), (0, Lz)]``.
+        """
+        return [(0.0, float(L)) for L in self.box]
+
+    def apply_move(self, i: int, new_pos: np.ndarray) -> None:
+        """
+        Commit a displacement of the i-th mobile particle (no wrapping).
+
+        Parameters
+        ----------
+        i : int
+            Index of the mobile particle.
+        new_pos : numpy.ndarray
+            Its new (3,) position.
+
+        Returns
+        -------
+        None
+        """
+        self.positions[i] = np.asarray(new_pos, dtype=float)
+
+    def apply_move_substrate(self, i: int, new_pos: np.ndarray) -> None:
+        """
+        Commit a displacement of the i-th substrate atom (no wrapping).
+
+        Parameters
+        ----------
+        i : int
+            Index of the substrate atom.
+        new_pos : numpy.ndarray
+            Its new (3,) position.
+
+        Returns
+        -------
+        None
+        """
+        self.substrate_positions[i] = np.asarray(new_pos, dtype=float)
+
+    def apply_insert(self, pos: np.ndarray, species: Optional[str] = None) -> None:
+        """
+        Commit the insertion of a new mobile particle.
+
+        Parameters
+        ----------
+        pos : numpy.ndarray
+            The (3,) position of the new particle.
+        species : str, optional
+            Its species. Default None: `self.exchange_species` (required
+            when several species are exchanged).
+
+        Returns
+        -------
+        None
+        """
+        self.positions = np.vstack([self.positions, np.asarray(pos, dtype=float)])
+        self.species = np.append(self.species, self._insert_species(species))
 
 
 #: Historical name of `BulkSystem` (kept for backward compatibility).

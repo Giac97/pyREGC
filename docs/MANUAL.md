@@ -140,6 +140,10 @@ above it, periodic in x and y. The slab has two kinds of atoms:
 The gas atoms are the *mobile* or *exchanged* particles. Hard walls
 keep them between z = 0 (the top frozen layer) and z = Lz.
 
+A nanoparticle works the same way (§2.6). The cluster's atoms are the
+frozen and substrate atoms, the box has no periodicity, and hard walls
+close all six faces.
+
 ### The grand-canonical ensemble
 
 At fixed temperature T and chemical potential μ, the box exchanges
@@ -227,8 +231,8 @@ and 0.030 eV per decade.
   phase above the surface.
 - **N_ads** counts only atoms within `adsorbed_cutoff` of a slab atom.
   Use it when the headroom is large, or at high pressure.
-- **Normalisation:** per surface atom (monolayers, ML), per Å², or as
-  an absolute count.
+- **Normalisation:** per surface atom (monolayers, ML), per Å², per
+  slab or cluster atom, or as an absolute count. A cluster has no area.
 
 ---
 
@@ -387,11 +391,16 @@ slab carries strain:
 
 ```python
 from regc import cubic_lattice_constant
-a = cubic_lattice_constant(ase_calc, "Fe", crystal="bcc", a_range=(2.3, 3.5))
+a = cubic_lattice_constant(ase_calc, "Fe", crystal="bcc")
 ```
 
-The function scans `a_range` and refines the minimum. Widen `a_range`
-for fcc metals with large lattice constants, for example `(2.3, 5.5)`.
+The function scans `a_range` and refines the minimum. The default range
+is 0.8–1.2 times the experimental lattice constant from ASE's tables,
+or 2.3–5.5 Å for elements without one. Keep the range close for
+machine-learned potentials. Well below the real lattice constant they
+can have unphysical energy holes, and a wide scan finds those instead of
+the minimum: GRACE-2L-OMAT puts fcc Pt's lowest energy at a = 2.3 Å in
+a 2.3–5.5 Å scan.
 
 ### 2.4 Checking a site before a run
 
@@ -412,6 +421,60 @@ sensible height, before spending CPU time.
 
 `LJSystem` and `SlabLJSystem` are older aliases of `BulkSystem` and
 `SlabSystem`.
+
+### 2.6 Clusters (nanoparticles)
+
+`cluster_geometry_from_atoms` lays out a nanoparticle the way
+`slab_geometry_from_atoms` lays out a slab. Build the particle with
+`ase.cluster` (or read it from a file):
+
+```python
+from ase.cluster import Icosahedron
+from regc import cluster_geometry_from_atoms
+
+atoms = Icosahedron("Pt", noshells=3, latticeconstant=a)   # Pt55
+geometry = cluster_geometry_from_atoms(atoms, headroom=6.0, frozen="center")
+print(geometry.summary())
+# 55 atoms (55 Pt): 1 frozen + 54 displaceable, 42 on the surface, radius 5.61 A,
+# in a 23.23 A cubic box (no periodicity)
+
+system = geometry.make_system(calc, "O", mass_of_species={"Pt": 195.08, "O": 15.999},
+                              insertion_shell=geometry.shell(-2.0, 3.0))
+```
+
+- **The box.** The cluster's centroid sits at the centre of a cube of
+  edge 2 (radius + `headroom`). There is no periodicity. `external_energy`
+  is infinite outside the box, and MD reflects at all six faces, in ASE
+  and in LAMMPS (`fix wall/reflect`). LAMMPS runs with `boundary f f f`
+  and a box padded by `z_padding` on every side.
+- **`frozen`.**
+  - `"center"` (default) freezes the atom nearest the centroid. That pins
+    the particle at the centre of the insertion shell while all the
+    other atoms relax.
+  - `"core"` freezes every fully coordinated atom.
+  - `"none"` freezes nothing.
+  - A number freezes that many central atoms.
+- **Surface atoms.** These are atoms with fewer than `full_coordination`
+  neighbours: 12 for fcc and icosahedral particles, 14 for bcc. The
+  neighbour cutoff lies halfway between the first and second shells.
+  `geometry.n_surface` is the normalisation for coverage per surface
+  atom: 42 for Pt55 (12 vertices and 30 edges), 32 for the Pt38
+  truncated octahedron. `coordination_numbers(positions)` gives the
+  per-atom numbers.
+- **The insertion shell.** `geometry.shell(d_in, d_out)` gives radii
+  relative to the cluster radius, the distance of the outermost atom
+  (a vertex for an icosahedron). Facet hollow sites lie *inside* that
+  radius, so start the shell below it: `(-2.0, 3.0)` covers facet,
+  edge and vertex sites, plus subsurface sites. The acceptance rules use
+  the shell's volume, and deletions pick only atoms inside it, so the
+  ensemble stays exact, as with a slab's `insertion_z_range`. Without a
+  shell, insertions are drawn over the whole box. That is correct too,
+  but most attempts land in vacuum.
+- **`ClusterSystem(box, calculator, ...)`** builds the system by hand:
+  `box` (one length or three), `frozen_positions`/`substrate_positions`,
+  `insertion_shell=(r_in, r_out)` and `center`.
+- **Coverage.** A cluster has no area: normalise per surface atom
+  (`n_surface`), per cluster atom (`n_atoms`), or not at all.
 
 ## 3. Calculators (potentials)
 
@@ -1368,6 +1431,10 @@ Two annotated example configs cover every key:
   LAMMPS, with displaceable layers, MD diffusion and checkpoints. The
   production setup of example 13.
 
+`examples/pt55_o_grace/` (config + `run.sh`) runs the same kind of
+setup on a nanoparticle: O on an icosahedral Pt55 cluster from O₂, with a
+GRACE model, an insertion shell and per-surface-atom coverage (§2.6).
+
 There is also `examples/pd111_o_grace/`, which holds `pd111_o_grace.yaml`
 and `run.sh`. It models Pd(111) + O from O₂ with a GRACE model through
 `pair_style grace/runtime` (`lammps_name: grace`, §3.2.1), with a non-H
@@ -1588,15 +1655,20 @@ General rules:
 
 ### 14.1 `structure`
 
-Give exactly one of `file` or `build`.
+Give exactly one of `file`, `build` (a slab) or `cluster` (a
+nanoparticle).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `file` | – | Any ASE-readable slab file. a1 along x, a2 in the xy plane. |
+| `file` | – | Any ASE-readable slab file (a1 along x, a2 in the xy plane), or a cluster with `geometry: cluster`. |
 | `build` | – | A mapping for an `ase.build` surface function (below). |
-| `n_frozen_layers` | all layers | Bottom layers kept rigid; the rest are displaceable. |
-| `headroom_angstrom` | 5.0 | Space above the topmost atom. |
-| `layer_tol` | 0.001 | z tolerance (Å) for grouping atoms into layers. |
+| `cluster` | – | A mapping for an `ase.cluster` function (below). |
+| `geometry` | `cluster` with a `cluster` block, else `slab` | `slab` or `cluster`. Needed only to read a cluster from `file`. |
+| `n_frozen_layers` | all layers | Slab only: bottom layers kept rigid; the rest are displaceable. |
+| `layer_tol` | 0.001 | Slab only: z tolerance (Å) for grouping atoms into layers. |
+| `frozen` | `center` | Cluster only: `center` (the central atom), `core` (fully coordinated atoms), `none`, or a number of central atoms (§2.6). |
+| `full_coordination` | 12 | Cluster only: coordination of an interior atom; fewer neighbours means a surface atom. Use 14 for bcc. |
+| `headroom_angstrom` | 5.0 (slab), 6.0 (cluster) | Slab: space above the topmost atom. Cluster: space between the outermost atom and the box walls. |
 
 `build` keys:
 
@@ -1606,8 +1678,28 @@ Give exactly one of `file` or `build`.
 | `symbol` | Element. |
 | `size` | `[nx, ny, nlayers]` |
 | `a` | Lattice constant in Å, or `auto` to fit it to the potential (fcc and bcc only; needs a calculator with an ASE counterpart: EMT, LAMMPS or ASE). |
-| `a_range` | Search range for `a: auto`; default `[2.3, 5.5]`. |
+| `a_range` | Search range for `a: auto`. Default: 0.8–1.2 times the experimental lattice constant (§2.3). |
 | *anything else* | Passed to the `ase.build` function, e.g. `orthogonal: true`, `vacuum: null`, `c`. |
+
+`cluster` keys:
+
+| Key | Meaning |
+|---|---|
+| `shape` | The `ase.cluster` function: `Icosahedron`, `Octahedron`, `Decahedron`, `FaceCenteredCubic`, `BodyCenteredCubic`, ... |
+| `symbol` | Element. |
+| `a` | Lattice constant (passed as `latticeconstant`), `auto` (fcc shapes and `BodyCenteredCubic`), or absent for ASE's default. |
+| `a_range` | As for `build`. |
+| *anything else* | Passed to the function, e.g. `noshells: 3` (Icosahedron: Pt55), `length` and `cutoff` (Octahedron), `p`, `q`, `r` (Decahedron). |
+
+```yaml
+structure:
+  cluster: {shape: Icosahedron, symbol: Pt, noshells: 3, a: auto}
+  frozen: center
+  headroom_angstrom: 6.0
+gas:
+  species: O
+  insertion_shell_around_cluster: [-2.0, 3.0]
+```
 
 ### 14.2 `gas`
 
@@ -1615,7 +1707,8 @@ Give exactly one of `file` or `build`.
 |---|---|---|
 | `species` | – | The exchanged element, or a list such as `[O, Cl]`. |
 | `mass_amu` | ASE tables | Atomic mass: a number, or a mapping per species. |
-| `insertion_z_range_above_surface` | whole box | `[lo, hi]` in Å above the topmost slab atom. Insertions and deletions happen only there. It must lie inside the box; raise `headroom_angstrom` if not. |
+| `insertion_z_range_above_surface` | whole box | Slab only: `[lo, hi]` in Å above the topmost slab atom. Insertions and deletions happen only there. It must lie inside the box; raise `headroom_angstrom` if not. |
+| `insertion_shell_around_cluster` | whole box | Cluster only: `[d_in, d_out]` in Å from the cluster radius (its outermost atom); negative values reach inside. Insertions and deletions happen only in that spherical shell. It must fit in the box; raise `headroom_angstrom` if not. |
 | `composition` | – | Feed mole fractions per species, e.g. `{O: 0.999, Cl: 0.001}`. Required with several species when pressures are used. |
 
 ### 14.3 `calculator`
@@ -1743,7 +1836,7 @@ With this section the run goes through `run_with_checkpoints`
 | `p_min`, `p_max`, `n_p` | –, –, 40 | Pressure mesh (geometric). |
 | `pressure_unit` | the ladder's unit, else `bar` | Unit of `p_min` / `p_max`. |
 | `observable` | `N` | `N`, `N_ads` (needs `adsorbed_cutoff`) or `N_<species>`. |
-| `coverage_per` | `area` | `area` (per Å²), `surface_atom` (per top-layer atom) or `none` (absolute count). |
+| `coverage_per` | `area` (slab), `surface_atom` (cluster) | `area` (per Å², slab only), `surface_atom` (per top-layer or cluster-surface atom), `atom` (per slab or cluster atom) or `none` (absolute count). |
 | `most_probable` | false | Also compute and plot the most probable N (`<plot>_most_probable.png`). |
 | `discard` | 0.0 | Fraction of each replica's samples dropped as equilibration. |
 

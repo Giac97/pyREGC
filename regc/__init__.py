@@ -11,7 +11,8 @@ algorithm, with every acceptance rule, is documented in
 Core (numpy only)
 -----------------
 calculators  Calculator, LJCalculator, PairLJCalculator, ASECalculatorAdapter
-systems      ParticleSystem, BulkSystem, SlabSystem (aliases LJSystem, SlabLJSystem)
+systems      ParticleSystem, BulkSystem, SlabSystem, ClusterSystem
+             (aliases LJSystem, SlabLJSystem)
 state        ThermoState
 replica      Replica -- one grid point: GCMC moves and diffusion
 engine       ReplicaExchangeGCMC -- the grid, swaps, `run` and `run_regc`
@@ -23,6 +24,7 @@ Real units, potentials and gas reservoirs
 reservoir       MonatomicIdealGasReservoir, DiatomicReservoir (e.g. H2), and the
                 low-level diatomic functions
 structures      cubic_lattice_constant, slab_geometry_from_atoms, SlabGeometry,
+                cluster_geometry_from_atoms, ClusterGeometry, coordination_numbers,
                 insertion_energy_scan  (needs ase)
 lammps_backend  LammpsCalculator (any LAMMPS pair style; native MD),
                 eam_pair_commands, lammps_ase_calculator, open_lammps
@@ -43,7 +45,8 @@ them, so ``import regc`` succeeds with numpy alone.
 from .calculators import ASECalculatorAdapter, Calculator, LJCalculator, PairLJCalculator
 from .lammps_backend import (LammpsCalculator, eam_pair_commands, lammps_ase_calculator,
                              open_lammps)
-from .systems import BulkSystem, LJSystem, ParticleSystem, SlabLJSystem, SlabSystem
+from .systems import (BulkSystem, ClusterSystem, LJSystem, ParticleSystem, SlabLJSystem,
+                      SlabSystem)
 from .state import ThermoState
 from .replica import Replica
 from .engine import SWAP_TYPES, ReplicaExchangeGCMC
@@ -83,9 +86,13 @@ from .reservoir import (
     pressure_from_atomic_mu_reservoir_pascal,
 )
 from .structures import (
+    ClusterGeometry,
     SlabGeometry,
+    cluster_geometry_from_atoms,
+    coordination_numbers,
     cubic_lattice_constant,
     insertion_energy_scan,
+    reference_lattice_constant,
     slab_geometry_from_atoms,
 )
 from .io import SampleSet, load_samples, save_samples
@@ -95,7 +102,7 @@ __all__ = [
     # calculators and systems
     "Calculator", "LJCalculator", "PairLJCalculator", "ASECalculatorAdapter", "LammpsCalculator",
     "eam_pair_commands", "lammps_ase_calculator", "open_lammps",
-    "ParticleSystem", "BulkSystem", "SlabSystem", "LJSystem", "SlabLJSystem",
+    "ParticleSystem", "BulkSystem", "SlabSystem", "ClusterSystem", "LJSystem", "SlabLJSystem",
     # engine
     "ThermoState", "Replica", "ReplicaExchangeGCMC", "SWAP_TYPES",
     # units and pressure conventions
@@ -112,6 +119,8 @@ __all__ = [
     "H2_D0_EXPERIMENTAL_EV",
     # structures
     "cubic_lattice_constant", "slab_geometry_from_atoms", "SlabGeometry", "insertion_energy_scan",
+    "cluster_geometry_from_atoms", "ClusterGeometry", "coordination_numbers",
+    "reference_lattice_constant",
     # running and analysis
     "run_with_checkpoints", "RunStatus", "EXIT_RESUBMIT",
     "save_samples", "load_samples", "SampleSet",

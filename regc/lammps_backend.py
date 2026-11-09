@@ -287,8 +287,9 @@ class LammpsCalculator(Calculator):
         configurations of machine-learned potentials. Choose it below any
         physically reachable separation. Default None (off).
     z_padding : float, optional
-        Extra space (A) below the lowest and above the highest atom/wall
-        in the non-periodic z direction of the LAMMPS box. Default 5.0.
+        Extra space (A) beyond the outermost atoms/walls along every
+        non-periodic direction of the LAMMPS box (z for a slab, all three
+        for a cluster). Default 5.0.
     lammps_name : str, optional
         Which LAMMPS shared library to load: ``"grace"`` loads
         ``liblammps_grace.so``, ``""`` the default ``liblammps.so``.
@@ -387,45 +388,94 @@ class LammpsCalculator(Calculator):
             return np.diag(np.asarray(cell, dtype=float))
         return np.asarray(cell, dtype=float)
 
-    def _setup(self, system, z_lo: float, z_hi: float) -> None:
+    @staticmethod
+    def _pbc(system) -> tuple:
+        """
+        A system's periodicity.
+
+        Parameters
+        ----------
+        system : ParticleSystem
+            The system.
+
+        Returns
+        -------
+        tuple of bool
+            ``system.pbc``; ``(True, True, False)`` (a slab) if it has none.
+        """
+        return tuple(bool(p) for p in getattr(system, 'pbc', (True, True, False)))
+
+    @staticmethod
+    def _walls(system) -> list:
+        """
+        A system's hard walls, per axis.
+
+        Parameters
+        ----------
+        system : ParticleSystem
+            The system.
+
+        Returns
+        -------
+        list
+            Three entries, ``(lo, hi)`` or None (`ParticleSystem.md_wall_bounds`).
+        """
+        if hasattr(system, 'md_wall_bounds'):
+            return list(system.md_wall_bounds())
+        z = system.md_z_bounds() if hasattr(system, 'md_z_bounds') else None
+        return [None, None, z]
+
+    def _setup(self, system, lo: np.ndarray, hi: np.ndarray) -> None:
         """
         Attach a LAMMPS instance with the right box (cached per process).
+
+        Periodic axes span the cell (``0`` to the cell's length); the
+        non-periodic ones span ``lo`` to ``hi`` (atoms and walls plus
+        `z_padding`).
 
         Parameters
         ----------
         system : ParticleSystem
             Supplies the cell and periodicity.
-        z_lo, z_hi : float
-            Box extent along z.
+        lo, hi : numpy.ndarray
+            Box extent (3,) along the non-periodic axes; entries of
+            periodic axes are ignored.
 
         Raises
         ------
         ValueError
-            If the cell is not in LAMMPS's restricted-triclinic form.
+            If the cell is not in LAMMPS's restricted-triclinic form, or is
+            tilted along a non-periodic axis.
         """
         H = self._cell_matrix(system)
         if abs(H[0, 1]) > 1e-12 or abs(H[0, 2]) > 1e-12 or abs(H[1, 2]) > 1e-12:
             raise ValueError("LammpsCalculator needs a1 along x and a2 in the xy plane "
                              "(LAMMPS's restricted-triclinic convention)")
-        Lx, xy, Ly = H[0, 0], H[1, 0], H[1, 1]
+        pbc = self._pbc(system)
+        xy, xz, yz = H[1, 0], H[2, 0], H[2, 1]
+        for tilt, axes, label in ((xy, (0, 1), "xy"), (xz, (0, 2), "xz"), (yz, (1, 2), "yz")):
+            if abs(tilt) > 1e-12 and not all(pbc[k] for k in axes):
+                raise ValueError(f"LammpsCalculator: the cell is tilted in {label}, along a "
+                                 "non-periodic axis")
+        box_lo = np.array([0.0 if pbc[k] else float(lo[k]) for k in range(3)])
+        box_hi = np.array([H[k, k] if pbc[k] else float(hi[k]) for k in range(3)])
         name = resolve_lammps_name(getattr(self, 'lammps_name', None))  # absent in old pickles
         key = (name, tuple(self.pair_commands), tuple(self.species),
                tuple(sorted((s, self._mass(s)) for s in self.species)),
-               tuple(np.round(H.ravel(), 10)), round(z_lo, 10), round(z_hi, 10),
-               tuple(getattr(system, 'pbc', (True, True, False))))
+               tuple(np.round(H.ravel(), 10)), tuple(np.round(box_lo, 10)),
+               tuple(np.round(box_hi, 10)), pbc)
         if key in _INSTANCES:
-            self._lmp, self._H, self._Hinv, self._z_range = _INSTANCES[key]
+            self._lmp, self._H, self._Hinv, self._lo, self._hi = _INSTANCES[key]
             return
         lmp = open_lammps(name)
-        pbc = tuple(getattr(system, 'pbc', (True, True, False)))
         bnd = " ".join("p" if p else "f" for p in pbc)
-        tilt = abs(xy) > 1e-12
+        bounds = " ".join(f"{_f(a)} {_f(b)}" for a, b in zip(box_lo, box_hi))
         cmds = ["units metal", "atom_style atomic", "atom_modify map array sort 0 0.0",
                 f"boundary {bnd}"]
-        if tilt:
-            cmds.append(f"region box prism 0 {_f(Lx)} 0 {_f(Ly)} {_f(z_lo)} {_f(z_hi)} {_f(xy)} 0 0 units box")
+        if max(abs(xy), abs(xz), abs(yz)) > 1e-12:
+            cmds.append(f"region box prism {bounds} {_f(xy)} {_f(xz)} {_f(yz)} units box")
         else:
-            cmds.append(f"region box block 0 {_f(Lx)} 0 {_f(Ly)} {_f(z_lo)} {_f(z_hi)} units box")
+            cmds.append(f"region box block {bounds} units box")
         cmds.append(f"create_box {len(self.species)} box")
         cmds += [f"mass {i + 1} {_f(self._mass(s))}" for i, s in enumerate(self.species)]
         cmds += self.pair_commands
@@ -434,17 +484,18 @@ class LammpsCalculator(Calculator):
         lmp.commands_list(cmds)
         self._lmp = lmp
         self._H = H
-        self._Hinv = np.linalg.inv(H[:2, :2])
-        self._z_range = (z_lo, z_hi)
-        _INSTANCES[key] = (lmp, H, self._Hinv, self._z_range)
+        self._Hinv = np.linalg.inv(H)
+        self._lo, self._hi = box_lo, box_hi
+        _INSTANCES[key] = (lmp, H, self._Hinv, self._lo, self._hi)
 
     def _load(self, system) -> int:
         """
         Replace LAMMPS's atoms by `system`'s full configuration.
 
-        Positions are wrapped into the periodic cell; atom ids follow
-        `full_configuration`'s order (frozen 1..n_frozen, then substrate,
-        then mobile).
+        Positions are wrapped into the cell along periodic axes; along the
+        others the box grows (a new instance) if an atom or wall lies
+        outside it. Atom ids follow `full_configuration`'s order (frozen
+        1..n_frozen, then substrate, then mobile).
 
         Parameters
         ----------
@@ -462,25 +513,31 @@ class LammpsCalculator(Calculator):
             If LAMMPS dropped atoms (one outside the box).
         """
         pos, sp = system.full_configuration()
-        walls = system.md_z_bounds() if hasattr(system, 'md_z_bounds') else None
-        z_min = min(pos[:, 2].min() if len(pos) else 0.0, walls[0] if walls else 0.0)
-        z_max = max(pos[:, 2].max() if len(pos) else 0.0, walls[1] if walls else 0.0)
-        key = (tuple(np.round(self._cell_matrix(system).ravel(), 10)),)
+        pbc = self._pbc(system)
+        walls = self._walls(system)
+        lo, hi = np.zeros(3), np.zeros(3)
+        for k in range(3):
+            if pbc[k]:
+                continue
+            vals = [0.0] if not len(pos) else [pos[:, k].min(), pos[:, k].max()]
+            if walls[k] is not None:
+                vals += list(walls[k])
+            lo[k], hi[k] = min(vals), max(vals)
+        key = (tuple(np.round(self._cell_matrix(system).ravel(), 10)), pbc)
         if (self._lmp is None or self._box_key != key
-                or z_min < self._z_range[0] or z_max > self._z_range[1]):
-            self._setup(system, z_min - self.z_padding, z_max + self.z_padding)
+                or any(not pbc[k] and (lo[k] < self._lo[k] or hi[k] > self._hi[k])
+                       for k in range(3))):
+            self._setup(system, lo - self.z_padding, hi + self.z_padding)
             self._box_key = key
         lmp = self._lmp
         lmp.command("delete_atoms group all compress yes")
         n = len(pos)
         if n:
-            x = pos.copy()
-            frac = x[:, :2] @ self._Hinv
-            pbc = getattr(system, 'pbc', (True, True, False))
-            for k in (0, 1):
+            frac = pos @ self._Hinv
+            for k in range(3):
                 if pbc[k]:
                     frac[:, k] %= 1.0
-            x[:, :2] = frac @ self._H[:2, :2]
+            x = frac @ self._H
             types = [self.type_of[str(s)] for s in sp]
             lmp.create_atoms(n, list(range(1, n + 1)), types, x.ravel().tolist())
             if lmp.get_natoms() != n:
@@ -588,8 +645,9 @@ class LammpsCalculator(Calculator):
         Fresh Maxwell-Boltzmann velocities at T for the moving atoms
         (exact: momenta and positions are independent in the canonical
         ensemble), ``fix nve`` + ``fix temp/csvr`` (Bussi; or ``langevin``),
-        ``fix wall/reflect`` at the system's hard z-walls, frozen atoms
-        excluded from integration.
+        ``fix wall/reflect`` at the system's hard walls (`md_wall_bounds`:
+        the z-walls of a slab, the six faces of a cluster box), frozen
+        atoms excluded from integration.
 
         Parameters
         ----------
@@ -610,7 +668,7 @@ class LammpsCalculator(Calculator):
         -------
         numpy.ndarray
             New positions of the substrate + mobile atoms, shape
-            (n_substrate + n_mobile, 3), unwrapped in x, y.
+            (n_substrate + n_mobile, 3), unwrapped along periodic axes.
 
         Raises
         ------
@@ -637,13 +695,15 @@ class LammpsCalculator(Calculator):
                         f"{_f(taut_fs / 1000.0)} {seed + 1}")
         else:
             raise ValueError(f"thermostat must be 'bussi' or 'langevin', got {thermostat!r}")
-        walls = system.md_z_bounds() if hasattr(system, 'md_z_bounds') else None
-        if walls is not None:
-            cmds.append(f"fix gcmc_walls mobile wall/reflect zlo {_f(walls[0])} zhi {_f(walls[1])}")
+        pbc = self._pbc(system)
+        faces = [f"{ax}lo {_f(b[0])} {ax}hi {_f(b[1])}"
+                 for ax, b, p in zip("xyz", self._walls(system), pbc) if b is not None and not p]
+        if faces:
+            cmds.append("fix gcmc_walls mobile wall/reflect " + " ".join(faces))
         lmp.commands_list(cmds)
         lmp.command(f"run {int(n_steps)} post no")
         x = self._gather("x", n_tot)
         lmp.commands_list(["unfix gcmc_nve", "unfix gcmc_thermo"]
-                          + (["unfix gcmc_walls"] if walls is not None else [])
+                          + (["unfix gcmc_walls"] if faces else [])
                           + ["group mobile delete"] + (["group frozen delete"] if n_fr else []))
         return x[n_fr:]

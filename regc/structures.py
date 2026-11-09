@@ -10,6 +10,11 @@ Building simulation cells from a potential and an ASE structure.
   z = 0, the box's hard wall), displaceable substrate layers above it, and a
   headroom for the exchanged species; `SlabGeometry.make_system` then builds
   the `SlabSystem` for any calculator.
+* `cluster_geometry_from_atoms` / `ClusterGeometry` -- the same for a
+  nanoparticle (``ase.cluster.Icosahedron``, ``Octahedron``, ... or a file):
+  centred in a cubic box with no periodicity, its central atom (or core)
+  frozen, surface atoms counted by coordination; `ClusterGeometry.make_system`
+  builds the `ClusterSystem`.
 * `insertion_energy_scan` -- the energy of inserting one particle along
   vertical lines above chosen lateral points (adsorption-site scans).
 
@@ -24,11 +29,35 @@ from typing import Optional, Sequence, Tuple, Union
 import numpy as np
 
 from .calculators import Calculator
-from .systems import SlabSystem
+from .systems import ClusterSystem, SlabSystem
+
+
+def reference_lattice_constant(symbol: str, crystal: str) -> Optional[float]:
+    """
+    The experimental cubic lattice constant of an element, from ASE's tables.
+
+    Parameters
+    ----------
+    symbol : str
+        Element symbol.
+    crystal : {'bcc', 'fcc', 'sc'}
+        Crystal structure.
+
+    Returns
+    -------
+    float or None
+        ``ase.data.reference_states`` lattice constant (A) when the
+        element's reference structure is `crystal`, else None.
+    """
+    from ase.data import atomic_numbers, reference_states
+    ref = reference_states[atomic_numbers[symbol]] if symbol in atomic_numbers else None
+    if ref and ref.get("symmetry") == crystal and "a" in ref:
+        return float(ref["a"])
+    return None
 
 
 def cubic_lattice_constant(ase_calculator, symbol: str, crystal: str = "bcc",
-                           a_range: Tuple[float, float] = (2.3, 3.5), n_coarse: int = 61,
+                           a_range: Optional[Tuple[float, float]] = None, n_coarse: int = 61,
                            n_fine: int = 21) -> float:
     """
     Equilibrium lattice constant of a cubic crystal for a given potential.
@@ -46,7 +75,11 @@ def cubic_lattice_constant(ase_calculator, symbol: str, crystal: str = "bcc",
     crystal : {'bcc', 'fcc', 'sc'}, optional
         Crystal structure. Default ``'bcc'``.
     a_range : tuple of float, optional
-        Range (A) of the coarse scan. Default (2.3, 3.5).
+        Range (A) of the coarse scan. Default: 0.8 to 1.2 times the
+        element's experimental lattice constant (`reference_lattice_constant`),
+        or (2.3, 5.5) if ASE has none for this crystal. Keep the range near
+        the real value for machine-learned potentials: far below it they
+        can have unphysical energy holes, which a wide scan finds.
     n_coarse, n_fine : int, optional
         Points of the coarse and fine scans. Defaults 61 and 21.
 
@@ -68,6 +101,9 @@ def cubic_lattice_constant(ase_calculator, symbol: str, crystal: str = "bcc",
         atoms.calc = ase_calculator
         return float(atoms.get_potential_energy())
 
+    if a_range is None:
+        a_ref = reference_lattice_constant(symbol, crystal)
+        a_range = (0.8 * a_ref, 1.2 * a_ref) if a_ref else (2.3, 5.5)
     coarse = np.linspace(a_range[0], a_range[1], n_coarse)
     e_coarse = np.array([energy(a) for a in coarse])
     i = int(np.argmin(e_coarse))
@@ -231,6 +267,234 @@ def slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headr
                         frozen_positions=pos[frozen], frozen_species=species[frozen],
                         substrate_positions=pos[~frozen], substrate_species=species[~frozen],
                         layer_z=layers - shift, n_surface=int(np.sum(layer_of == n_layers - 1)))
+
+
+@dataclass
+class ClusterGeometry:
+    """
+    A cluster laid out for `ClusterSystem`: centred in a cubic, non-periodic box.
+
+    Attributes
+    ----------
+    box : float
+        Edge of the cubic box, in A.
+    center : numpy.ndarray
+        The box centre (3,), where the cluster's centroid sits.
+    radius : float
+        Largest distance of a cluster atom from `center`, in A.
+    frozen_positions, substrate_positions : numpy.ndarray
+        Positions of the rigid and the displaceable cluster atoms, (M, 3).
+    frozen_species, substrate_species : numpy.ndarray
+        Their species labels.
+    coordination : numpy.ndarray
+        Coordination number of every cluster atom (frozen first, then
+        substrate, as in `full_configuration`).
+    n_surface : int
+        Number of surface atoms (coordination below full), for coverages
+        per surface atom.
+    """
+
+    box: float
+    center: np.ndarray
+    radius: float
+    frozen_positions: np.ndarray
+    frozen_species: np.ndarray
+    substrate_positions: np.ndarray
+    substrate_species: np.ndarray
+    coordination: np.ndarray = field(repr=False)
+    n_surface: int = 0
+
+    @property
+    def n_atoms(self) -> int:
+        """int: Number of cluster atoms (frozen + displaceable)."""
+        return len(self.frozen_positions) + len(self.substrate_positions)
+
+    @property
+    def area(self) -> None:
+        """None: a cluster has no surface-cell area (coverages per atom instead)."""
+        return None
+
+    def shell(self, d_in: float, d_out: float) -> Tuple[float, float]:
+        """
+        Insertion-shell radii from distances relative to the cluster's surface.
+
+        Parameters
+        ----------
+        d_in, d_out : float
+            Inner and outer distance from `radius` (A); negative values
+            reach into the cluster.
+
+        Returns
+        -------
+        tuple of float
+            ``(max(0, radius + d_in), radius + d_out)``, for
+            ``ClusterSystem(insertion_shell=...)``.
+
+        Raises
+        ------
+        ValueError
+            If the shell is empty or does not fit in the box.
+        """
+        r_in, r_out = max(0.0, self.radius + d_in), self.radius + d_out
+        if not r_in < r_out:
+            raise ValueError(f"empty insertion shell: r_in = {r_in:.3f}, r_out = {r_out:.3f} A")
+        if r_out > 0.5 * self.box + 1e-9:
+            raise ValueError(f"insertion shell r_out = {r_out:.3f} A exceeds half the box "
+                             f"({0.5 * self.box:.3f} A): raise the headroom")
+        return (r_in, r_out)
+
+    def make_system(self, calculator: Calculator, exchange_species: Union[str, Sequence[str]],
+                    mass_of_species: Optional[dict] = None,
+                    insertion_shell: Optional[Tuple[float, float]] = None) -> ClusterSystem:
+        """
+        Build the `ClusterSystem` for this geometry.
+
+        Parameters
+        ----------
+        calculator : Calculator
+            The energy backend (each system needs its own instance).
+        exchange_species : str or sequence of str
+            Species GCMC inserts and deletes.
+        mass_of_species : dict, optional
+            Masses (amu) by species, for MD/HMC. Default None (ASE tables).
+        insertion_shell : tuple of float, optional
+            ``(r_in, r_out)`` around the centre (see `shell`). Default None:
+            the whole box.
+
+        Returns
+        -------
+        ClusterSystem
+            An empty (no mobile particles) system.
+        """
+        return ClusterSystem(self.box, calculator, exchange_species=exchange_species,
+                             frozen_positions=self.frozen_positions,
+                             frozen_species=self.frozen_species,
+                             substrate_positions=self.substrate_positions,
+                             substrate_species=self.substrate_species,
+                             insertion_shell=insertion_shell, center=self.center,
+                             mass_of_species=mass_of_species)
+
+    def summary(self) -> str:
+        """
+        One-line description.
+
+        Returns
+        -------
+        str
+            Atom counts, radius and box.
+        """
+        species = ", ".join(f"{n} {s}" for s, n in zip(*np.unique(
+            np.concatenate([self.frozen_species, self.substrate_species]), return_counts=True)))
+        return (f"{self.n_atoms} atoms ({species}): {len(self.frozen_positions)} frozen + "
+                f"{len(self.substrate_positions)} displaceable, {self.n_surface} on the surface, "
+                f"radius {self.radius:.2f} A, in a {self.box:.2f} A cubic box (no periodicity)")
+
+
+def coordination_numbers(positions: np.ndarray, cutoff: Optional[float] = None) -> np.ndarray:
+    """
+    Coordination number of every atom of a finite (non-periodic) structure.
+
+    Parameters
+    ----------
+    positions : numpy.ndarray
+        Atom positions, (N, 3).
+    cutoff : float, optional
+        Neighbour cutoff, in A. Default: halfway between the fcc first and
+        second neighbour shells, ``(1 + sqrt 2)/2`` times the median
+        nearest-neighbour distance (12 neighbours inside an fcc or
+        icosahedral particle; 14 inside a bcc one).
+
+    Returns
+    -------
+    numpy.ndarray
+        Integer coordination numbers, (N,).
+    """
+    pos = np.asarray(positions, dtype=float)
+    if len(pos) < 2:
+        return np.zeros(len(pos), dtype=int)
+    d = np.linalg.norm(pos[:, None, :] - pos[None, :, :], axis=-1)
+    np.fill_diagonal(d, np.inf)
+    if cutoff is None:
+        cutoff = 0.5 * (1.0 + np.sqrt(2.0)) * float(np.median(d.min(axis=1)))
+    return np.count_nonzero(d < cutoff, axis=1)
+
+
+def cluster_geometry_from_atoms(atoms, headroom: float = 6.0,
+                                frozen: Union[str, int] = "center",
+                                full_coordination: int = 12,
+                                cn_cutoff: Optional[float] = None) -> ClusterGeometry:
+    """
+    Lay out a cluster for `ClusterSystem`.
+
+    The cluster is translated so its centroid is at the centre of a cubic
+    box of edge ``2 (radius + headroom)``: a spherical insertion shell up
+    to ``headroom`` beyond the outermost atom then fits inside the box.
+
+    Parameters
+    ----------
+    atoms : ase.Atoms
+        The cluster (its cell and periodicity are ignored).
+    headroom : float, optional
+        Space (A) between the outermost atom and the box walls along the
+        axes. Default 6.0.
+    frozen : {'center', 'core', 'none'} or int, optional
+        Which atoms are rigid: the one nearest the centroid (default; pins
+        the particle in place while it relaxes), every fully coordinated
+        atom (``coordination >= full_coordination``), none, or the given
+        number of atoms nearest the centroid.
+    full_coordination : int, optional
+        Coordination of an interior atom: 12 for fcc, hcp and icosahedral
+        particles, 14 for bcc with the default cutoff. Atoms below it are
+        surface atoms. Default 12.
+    cn_cutoff : float, optional
+        Neighbour cutoff for the coordination numbers (see
+        `coordination_numbers`). Default None (automatic).
+
+    Returns
+    -------
+    ClusterGeometry
+        The geometry.
+
+    Raises
+    ------
+    ValueError
+        If `frozen` is not understood, or the cluster has no atoms.
+    """
+    pos = np.array(atoms.positions, dtype=float)
+    species = np.array(atoms.get_chemical_symbols())
+    if len(pos) == 0:
+        raise ValueError("the cluster has no atoms")
+    centroid = pos.mean(axis=0)
+    dist = np.linalg.norm(pos - centroid, axis=1)
+    radius = float(dist.max())
+    box = 2.0 * (radius + float(headroom))
+    center = np.full(3, 0.5 * box)
+    pos = pos - centroid + center
+    cn = coordination_numbers(pos, cn_cutoff)
+    if isinstance(frozen, str):
+        key = frozen.lower()
+        if key == "center":
+            is_frozen = np.zeros(len(pos), dtype=bool)
+            is_frozen[int(np.argmin(dist))] = True
+        elif key == "core":
+            is_frozen = cn >= full_coordination
+        elif key == "none":
+            is_frozen = np.zeros(len(pos), dtype=bool)
+        else:
+            raise ValueError(f"frozen must be 'center', 'core', 'none' or a number, got {frozen!r}")
+    else:
+        n_fr = int(frozen)
+        if not 0 <= n_fr <= len(pos):
+            raise ValueError(f"frozen must be in 0..{len(pos)}, got {n_fr}")
+        is_frozen = np.zeros(len(pos), dtype=bool)
+        is_frozen[np.argsort(dist, kind="stable")[:n_fr]] = True
+    order = np.concatenate([np.flatnonzero(is_frozen), np.flatnonzero(~is_frozen)])
+    return ClusterGeometry(box=box, center=center, radius=radius,
+                           frozen_positions=pos[is_frozen], frozen_species=species[is_frozen],
+                           substrate_positions=pos[~is_frozen],
+                           substrate_species=species[~is_frozen],
+                           coordination=cn[order],
+                           n_surface=int(np.count_nonzero(cn < full_coordination)))
 
 
 def insertion_energy_scan(system, xy_points: Sequence[Sequence[float]],
