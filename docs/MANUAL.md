@@ -87,9 +87,11 @@ pip install -e ".[dev]"       # editable install + pytest
 | `plot` | matplotlib | `plot_phase_diagram` |
 | `yaml` | PyYAML | `.yaml`/`.yml` configs (JSON needs nothing) |
 
-LAMMPS is not a pip extra. Install it from conda-forge, or build it
-yourself (`hpc/build_lammps.sh`) for pair styles that conda-forge lacks,
-such as `grace/fs`.
+LAMMPS is not a pip extra. Install it from conda-forge (EAM, ACE/`pace`,
+`grace/fs`). For GRACE-1L/2L/3L models (`pair_style grace/runtime`), build
+the grace-runtime fork of LAMMPS with `hpc/build_lammps.sh`. It installs
+next to conda-forge's build as `liblammps_grace.so`, and you select it with
+`lammps_name="grace"` (§3.2.1).
 
 The core needs only numpy. Every optional dependency is imported inside
 the function that needs it, so `import regc` always works.
@@ -437,7 +439,8 @@ from regc import LammpsCalculator, eam_pair_commands, lammps_ase_calculator
 pair = eam_pair_commands("FeH_Wen.eam.fs", ["Fe", "H"])    # style from the file name
 pair = ["pair_style pace", "pair_coeff * * FeH.yace Fe H"]   # ...or any pair style
 calc = LammpsCalculator(pair, ["Fe", "H"], masses={"H": 1.008},
-                        min_distance=None, z_padding=5.0)
+                        min_distance=None, z_padding=5.0,
+                        lammps_name=None)                   # which LAMMPS build, §3.2.1
 ase_calc = lammps_ase_calculator(pair, ["Fe", "H"])         # same potential, ASE interface
 ```
 
@@ -451,7 +454,57 @@ ase_calc = lammps_ase_calculator(pair, ["Fe", "H"])         # same potential, AS
   run.
 - **`ase_calc`:** an ordinary ASE calculator running the same potential.
   Use it for setup work: `cubic_lattice_constant`,
-  `DiatomicReservoir.from_calculator` and site scans.
+  `DiatomicReservoir.from_calculator` and site scans. It takes the same
+  `lammps_name` argument.
+
+#### 3.2.1 Choosing a LAMMPS build: `lammps_name`
+
+One environment can hold several LAMMPS shared libraries:
+`liblammps.so` (the default, e.g. conda-forge's) and named builds
+`liblammps_<name>.so`. `lammps_name` picks one:
+
+| `lammps_name` | Loads |
+|---|---|
+| `None` (default) | the build named by the environment variable `REGC_LAMMPS_NAME`; if it is unset, `liblammps.so` |
+| `""` | `liblammps.so` |
+| `"grace"` | `liblammps_grace.so` (built by `hpc/build_lammps.sh`) |
+
+The LAMMPS Python module looks for the library next to itself, then on
+the loader path (the environment's `lib/`, `LD_LIBRARY_PATH`).
+`REGC_LAMMPS_NAME` is useful for scripts with no option for it, such as
+example 13 and the Slurm jobs: `export REGC_LAMMPS_NAME=grace`. Worker
+processes inherit it. `python hpc/check_env.py --lammps-name grace
+--grace-runtime` shows what a build provides.
+
+- **One build per process.** The LAMMPS Python module loads libraries
+  with `RTLD_GLOBAL`, so two builds in one process would share symbols
+  and corrupt each other's memory. regc refuses to load a second,
+  different library and raises a `RuntimeError`. To compare builds, run
+  each in its own process.
+- **Version mismatch.** The Python module refuses a library from another
+  LAMMPS version (conda-forge's module is 22 Jul 2025, the grace-runtime
+  fork is 30 Sep 2026). The calls regc makes are the same in both
+  versions, so regc warns once and turns that check off. The test suite
+  checks that both builds give the same EAM energies and forces.
+
+**GRACE-1L/2L/3L models** run through `pair_style grace/runtime`, which
+reads a `kokkos.npz` file:
+
+```python
+pair = ["pair_style grace/runtime",
+        "pair_coeff * * /home/me/.cache/grace/GRACE-2L-OMAT-medium-ft-E/kokkos.npz Fe H"]
+calc = LammpsCalculator(pair, ["Fe", "H"], min_distance=0.6, lammps_name="grace")
+```
+
+- **Getting a model:** pretrained models come from `grace-runtime models
+  download <name>` (pip package `grace-runtime`). Your own fits come from
+  `grace_utils -p model.yaml -c CHECKPOINT export_kokkos -o model.npz`.
+- **H₂ reference:** OMAT-trained models describe isolated atoms poorly.
+  GRACE-2L-OMAT-medium-ft-E gives D0(H₂) = 7.5 eV, against 4.48 eV in
+  experiment, so use `d0="experimental"` (YAML `d0: experimental`) with
+  them.
+- **`pace/runtime`:** reads pacemaker ACE `.yaml` files on the same
+  runtime.
 
 ### 3.3 ASE calculators and parallel runs
 
@@ -1564,7 +1617,7 @@ Give exactly one of `file` or `build`.
 | `EMT` | – | ASE's EMT. Fine for testing; its H description is not physical. |
 | `LJ` | `lj_sigma` (1.0), `lj_epsilon` (0.1), `lj_r_cut` (3.0) | Ignores the slab entirely; pipeline tests only. A warning is printed. |
 | `PairLJ` | `pair_params`: list of `[a, b, epsilon_eV, sigma_A]`; `r_cut_factor` (2.5) | Pairwise LJ that sees the slab. |
-| `LAMMPS` | `potential` (an `*.eam.fs` / `*.eam.alloy` file), **or** `pair_style` + `pair_coeff`, **or** `pair_commands` (list of lines); `species` (atom-type order; default slab element(s) then gas); `min_distance` (Å hard core); `z_padding` (5.0) | Needs the LAMMPS Python module. Native MD for `diffusion: md`. |
+| `LAMMPS` | `potential` (an `*.eam.fs` / `*.eam.alloy` file), **or** `pair_style` + `pair_coeff`, **or** `pair_commands` (list of lines); `species` (atom-type order; default slab element(s) then gas); `min_distance` (Å hard core); `z_padding` (5.0); `lammps_name` (LAMMPS build, §3.2.1; default `REGC_LAMMPS_NAME`, else `liblammps.so`) | Needs the LAMMPS Python module. Native MD for `diffusion: md`. |
 | `ASE` | `class`: dotted import path, e.g. `ase.calculators.eam.EAM`; `kwargs`: mapping passed to it | Any ASE calculator. Built in each worker, so `n_workers > 1` works. |
 
 ```yaml
@@ -1574,6 +1627,14 @@ calculator:
   type: LAMMPS
   pair_style: pace
   pair_coeff: "* * FeH.yace Fe H"
+  species: [Fe, H]
+  min_distance: 0.6
+
+calculator:                     # GRACE-2L through the grace-runtime build
+  type: LAMMPS
+  lammps_name: grace            # liblammps_grace.so
+  pair_style: grace/runtime
+  pair_coeff: "* * models/GRACE-2L-OMAT-medium-ft-E/kokkos.npz Fe H"
   species: [Fe, H]
   min_distance: 0.6
 

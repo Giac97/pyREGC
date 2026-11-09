@@ -238,3 +238,80 @@ def test_lammps_instances_shared_within_a_process(eam_file):
     # interleaved evaluations stay correct (every call reloads its own atoms)
     assert a.total_energy() == pytest.approx(ea) and b.total_energy() == pytest.approx(eb)
     assert ea != pytest.approx(eb)
+
+
+# -- choosing the LAMMPS library (lammps_name / REGC_LAMMPS_NAME) -------------------------
+
+def test_resolve_lammps_name(monkeypatch):
+    from regc.lammps_backend import resolve_lammps_name
+    monkeypatch.delenv("REGC_LAMMPS_NAME", raising=False)
+    assert resolve_lammps_name() == ""
+    assert resolve_lammps_name("grace") == "grace"
+    monkeypatch.setenv("REGC_LAMMPS_NAME", "grace")
+    assert resolve_lammps_name() == "grace"
+    assert resolve_lammps_name("") == ""          # an explicit name beats the variable
+
+
+def test_default_library_by_name(eam_file, monkeypatch):
+    """lammps_name="" and the variable set to "" both give the default library."""
+    monkeypatch.setenv("REGC_LAMMPS_NAME", "")
+    e_env = _bcc110_slab(_lmp_calc(eam_file)).total_energy()
+    e_explicit = _bcc110_slab(_lmp_calc(eam_file, lammps_name="")).total_energy()
+    assert e_env == pytest.approx(e_explicit)
+
+
+def _in_fresh_process(code, env_name):
+    """Run `code` in a new interpreter with REGC_LAMMPS_NAME=env_name (a process can
+    hold only one LAMMPS library); returns the completed process."""
+    import os
+    import subprocess
+    import sys
+    env = dict(os.environ, REGC_LAMMPS_NAME=env_name)
+    return subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True,
+                          timeout=300)
+
+
+def test_missing_library_is_reported():
+    res = _in_fresh_process("from regc import open_lammps; open_lammps()", "no_such_build")
+    assert res.returncode != 0 and "liblammps_no_such_build" in res.stderr
+
+
+def test_second_library_in_one_process_is_refused(eam_file):
+    _bcc110_slab(_lmp_calc(eam_file, lammps_name="")).total_energy()   # default loaded
+    with pytest.raises(RuntimeError, match="one lammps_name per process"):
+        _bcc110_slab(_lmp_calc(eam_file, lammps_name="other_build")).total_energy()
+
+
+def test_old_pickles_without_lammps_name_load(eam_file):
+    calc = _lmp_calc(eam_file)
+    del calc.__dict__["lammps_name"]                 # as pickled before the option existed
+    calc = pickle.loads(pickle.dumps(calc))
+    assert np.isfinite(_bcc110_slab(calc).total_energy())
+
+
+_EAM_ENERGY_FORCES = """
+import sys, warnings
+import numpy as np
+sys.path.insert(0, {testdir!r})
+warnings.simplefilter("ignore")
+from test_lammps_backend import _bcc110_slab, _lmp_calc
+slab = _bcc110_slab(_lmp_calc({eam!r}))
+np.save({out!r}, np.concatenate([[slab.total_energy()], slab.calculator.forces(slab).ravel()]))
+"""
+
+
+def test_named_build_matches_default_for_eam(eam_file, tmp_path):
+    """A second LAMMPS build (hpc/build_lammps.sh: liblammps_grace.so), if installed,
+    gives the same EAM energies and forces as the default one (each in its own process)."""
+    import os
+    results = {}
+    for name in ("", "grace"):
+        out = str(tmp_path / f"ef_{name or 'default'}.npy")
+        res = _in_fresh_process(_EAM_ENERGY_FORCES.format(
+            testdir=os.path.dirname(__file__), eam=eam_file, out=out), name)
+        if res.returncode != 0:
+            if name and "liblammps_grace" in res.stderr:
+                pytest.skip("no liblammps_grace.so (hpc/build_lammps.sh)")
+            raise AssertionError(res.stderr[-2000:])
+        results[name] = np.load(out)
+    np.testing.assert_allclose(results["grace"], results[""], atol=1e-8)

@@ -341,3 +341,15 @@ def test_load_config_resolves_potential_paths(tmp_path):
     calc = load_config(str(tmp_path / "cfg.json"))["calculator"]
     assert calc["potential"] == str(tmp_path / "pot" / "Fe-H.eam.fs")
     assert calc["pair_coeff"] == f"* * {tmp_path / 'pot' / 'Fe-H.eam.fs'} Fe H"
+
+
+def test_lammps_name_reaches_the_calculator(tmp_path):
+    pytest.importorskip("lammps")
+    from regc.runner import _CalculatorSpec
+    pot = tmp_path / "x.eam.fs"
+    pot.write_text("")
+    spec = _CalculatorSpec({"type": "LAMMPS", "potential": str(pot), "lammps_name": "grace"},
+                           ["Fe", "H"], {"H": 1.008})
+    assert spec.make(np.eye(3)).lammps_name == "grace"
+    default = _CalculatorSpec({"type": "LAMMPS", "potential": str(pot)}, ["Fe", "H"], {})
+    assert default.make(np.eye(3)).lammps_name is None   # REGC_LAMMPS_NAME, else liblammps.so

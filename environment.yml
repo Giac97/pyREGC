@@ -9,9 +9,10 @@
 # file with:  mamba env update -f environment.yml --prune
 #
 # LAMMPS comes from conda-forge (serial CPU build with the Python module and the
-# MANYBODY / ML-PACE / EXTRA-FIX packages regc uses). It does NOT provide
-# pair_style grace/fs: for GRACE-FS models in LAMMPS, build LAMMPS yourself
-# (hpc/build_lammps.sh) and drop the `lammps` line below.
+# MANYBODY / ML-PACE / EXTRA-FIX packages regc uses: eam/fs, pace, grace/fs).
+# For GRACE-1L/2L/3L models (pair_style grace/runtime), additionally run
+# `bash hpc/build_lammps.sh`: it adds liblammps_grace.so to this env, selected
+# with lammps_name: grace / REGC_LAMMPS_NAME=grace. Keep the `lammps` line below.
 name: gcmc_re
 channels:
   - conda-forge

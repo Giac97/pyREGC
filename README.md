@@ -29,8 +29,13 @@ editable mode (`pip install -e .`), so edits to `regc/` take effect
 immediately. After changing `environment.yml`, run
 `mamba env update -f environment.yml --prune`.
 
-conda-forge's LAMMPS has no `pair_style grace/fs`. For GRACE-FS models in
-LAMMPS, build LAMMPS yourself (`hpc/build_lammps.sh`, see `hpc/README.md`).
+conda-forge's LAMMPS covers EAM, ACE (`pace`) and GRACE-FS (`grace/fs`).
+For GRACE-1L/2L/3L models (`pair_style grace/runtime`, from
+[grace-runtime](https://grace-runtime.readthedocs.io/)), `bash
+hpc/build_lammps.sh` builds the grace-runtime LAMMPS fork into the env as
+`liblammps_grace.so`, next to the default build. Select it with
+`LammpsCalculator(..., lammps_name="grace")`, the config key
+`calculator.lammps_name: grace`, or `export REGC_LAMMPS_NAME=grace`.
 GRACE's own ASE calculator (`tensorpotential`, with TensorFlow) is an
 optional extra, commented out in `environment.yml`.
 
@@ -468,9 +473,12 @@ hours.
 ## LAMMPS backend (`regc.LammpsCalculator`)
 
 `LammpsCalculator(pair_commands, species)` runs any LAMMPS pair style:
-EAM (`eam/fs`, `eam/alloy`), GRACE-FS (`grace/fs`), ACE (`pace`), and so
-on. You give it the `pair_style`/`pair_coeff` lines and the species order
-they use.
+EAM (`eam/fs`, `eam/alloy`), GRACE-FS (`grace/fs`), GRACE-1L/2L/3L
+(`grace/runtime`), ACE (`pace`), and so on. You give it the
+`pair_style`/`pair_coeff` lines and the species order they use.
+`lammps_name` chooses the LAMMPS build (`"grace"` loads `liblammps_grace.so`;
+the default is `$REGC_LAMMPS_NAME`, else `liblammps.so`). A process uses one
+build only.
 
 - **Energies and forces:** all atoms are loaded into a persistent LAMMPS
   instance and evaluated with `run 0`, so GCMC and MC/HMC moves work
@@ -501,7 +509,9 @@ A prepared production setup for a real metal-hydrogen system.
   via `--potential`, or any LAMMPS pair style via `--pair-style` /
   `--pair-coeff`, e.g. a GRACE-FS model:
   `--pair-style grace/fs --pair-coeff "* * model.yaml Fe H" --min-distance 0.6`.
-  GRACE-FS needs a LAMMPS built with GRACE support.
+  GRACE-FS needs a LAMMPS built with GRACE support. For a GRACE-1L/2L/3L
+  model, run with `REGC_LAMMPS_NAME=grace` and
+  `--pair-style grace/runtime --pair-coeff "* * kokkos.npz Fe H"`.
 - **Backend:** LAMMPS by default when its Python module is installed;
   `--backend ase` uses ASE's EAM instead.
 - **Slab:** Fe(110), 3x4 cell, 6 layers. The bottom 3 are frozen; the top 3

@@ -8,6 +8,7 @@ setup_environment() {
     # module load compiler/gnu mpi/openmpi          # whatever your LAMMPS was built with
     # source "$HOME/miniforge3/etc/profile.d/conda.sh"
     conda activate gcmc_re
+    # export REGC_LAMMPS_NAME=grace                 # (c) below: liblammps_grace.so
 }
 
 # ---- paths -----------------------------------------------------------------------------
@@ -16,11 +17,16 @@ setup_environment() {
 PROJECT_DIR="$HOME/gcmc_re"
 OUT="$PROJECT_DIR/runs/fe110_h"
 
-# ---- potential (EDIT: one of the two) -----------------------------------------------
+# ---- potential (EDIT: one of these) ------------------------------------------------
 # (a) an Fe-H EAM file (.eam.fs / .eam.alloy), e.g. the Wen (2021) EAM shipped in examples/:
 POTENTIAL_ARGS=(--potential "$PROJECT_DIR/examples/FeH_Wen.eam.fs")
 # (b) a GRACE-FS model through LAMMPS's grace/fs (needs a GRACE-enabled LAMMPS):
 # POTENTIAL_ARGS=(--pair-style grace/fs --pair-coeff "* * $PROJECT_DIR/potentials/model.yaml Fe H"
+#                 --min-distance 0.6)
+# (c) a GRACE-1L/2L/3L model (kokkos.npz) through pair_style grace/runtime: needs the
+#     grace-runtime build (bash hpc/build_lammps.sh) and REGC_LAMMPS_NAME=grace above:
+# POTENTIAL_ARGS=(--pair-style grace/runtime
+#                 --pair-coeff "* * $PROJECT_DIR/potentials/GRACE-2L-OMAT-medium-ft-E/kokkos.npz Fe H"
 #                 --min-distance 0.6)
 
 # ---- run -------------------------------------------------------------------------------

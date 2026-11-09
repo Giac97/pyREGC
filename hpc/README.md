@@ -10,7 +10,7 @@ LAMMPS doing energies, forces and MD). Everything cluster-specific is in
 |---|---|
 | `config.sh` | **edit this**: environment activation, potential, output directory, run length |
 | `environment.yml` | conda/mamba environment (Python side; LAMMPS is built separately) |
-| `build_lammps.sh` | builds LAMMPS as a shared library + Python module into the env |
+| `build_lammps.sh` | builds the grace-runtime LAMMPS into the env as `liblammps_grace.so` |
 | `check_env.py` | verifies Python packages and every LAMMPS style the run needs |
 | `check.sbatch` | 30-min pre-flight: `check_env.py` + the example's `--check` (sanity checks, timing) |
 | `run.sbatch` | the production run: resumes automatically, stops before the wall time, resubmits itself |
@@ -23,8 +23,8 @@ git clone <your repository> ~/gcmc_re && cd ~/gcmc_re      # or copy the directo
 mamba env create -f hpc/environment.yml
 conda activate gcmc_re
 pip install -e .
-LAMMPS_SRC=~/src/lammps bash hpc/build_lammps.sh              # see "LAMMPS" below
-python hpc/check_env.py            # add --grace for a GRACE-FS model
+bash hpc/build_lammps.sh           # only for GRACE-1L/2L/3L; see "LAMMPS" below
+python hpc/check_env.py            # --grace: GRACE-FS; --lammps-name grace --grace-runtime
 ```
 
 Then edit `hpc/config.sh` (`setup_environment`, `PROJECT_DIR`, `OUT`,
@@ -33,18 +33,37 @@ Then edit `hpc/config.sh` (`setup_environment`, `PROJECT_DIR`, `OUT`,
 
 ### LAMMPS
 
-`regc.LammpsCalculator` uses the LAMMPS **Python module**, so LAMMPS must be
-built as a shared library (`build_lammps.sh` does it with CMake and installs the
-module into the active environment). Required styles:
+`regc.LammpsCalculator` uses the LAMMPS **Python module** and a LAMMPS shared
+library. The conda-forge `lammps` package from `environment.yml` is the default
+(`liblammps.so`), with EAM, ACE (`pace`) and GRACE-FS (`grace/fs`).
+
+For GRACE-1L/2L/3L models, `build_lammps.sh` builds the grace-runtime fork of
+LAMMPS (https://github.com/yury-lysogorskiy/lammps, branch `grace-runtime`; see
+https://grace-runtime.readthedocs.io/). It uses the env's compilers and
+installs `liblammps_grace.so` and `lmp_grace` into the env, without touching
+the default build:
+
+```bash
+bash hpc/build_lammps.sh                     # ~10 min; needs network at configure time
+python hpc/check_env.py --lammps-name grace --grace-runtime
+export REGC_LAMMPS_NAME=grace                # in setup_environment(), for the jobs
+```
+
+Settings: `LAMMPS_SRC` (default `~/src/lammps-grace`), `MACHINE` (default
+`grace`), `ARCH_FLAGS` (default `-march=native`: build on the CPU type you
+run on, e.g. a compute node), `NPROC`. A cluster without conda-forge's LAMMPS
+can use `MACHINE= INSTALL_PYTHON=1` to make this build the env's only one.
+
+Required styles:
 
 - `pair_style eam/fs` / `eam/alloy` (package MANYBODY) for EAM potentials;
-- `pair_style grace/fs` for GRACE-FS models: needs a LAMMPS source/version with
-  GRACE support in ML-PACE. Follow the GRACE / tensorpotential documentation for
-  where to get it and any extra build options, and export your model in the
-  format `grace/fs` reads;
+- `pair_style grace/fs` for GRACE-FS models (ML-PACE; both builds have it);
+- `pair_style grace/runtime` for GRACE-1L/2L/3L models exported as
+  `kokkos.npz` (grace-runtime build only); `pace/runtime` for pacemaker ACE;
 - `fix nve`, `fix temp/csvr` (Bussi thermostat), `fix wall/reflect`, `compute temp`.
 
-`check_env.py` lists what is present. The engine runs serially per replica
+`check_env.py` lists what is present (`--lammps-name NAME` for a named build).
+One process can load only one LAMMPS build. The engine runs serially per replica
 (no MPI inside LAMMPS): parallelism is one process per replica.
 
 ## Workflow

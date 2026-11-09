@@ -25,7 +25,8 @@ reservoir       MonatomicIdealGasReservoir, DiatomicReservoir (e.g. H2), and the
 structures      cubic_lattice_constant, slab_geometry_from_atoms, SlabGeometry,
                 insertion_energy_scan  (needs ase)
 lammps_backend  LammpsCalculator (any LAMMPS pair style; native MD),
-                eam_pair_commands, lammps_ase_calculator  (needs the lammps module)
+                eam_pair_commands, lammps_ase_calculator, open_lammps
+                (needs the lammps module; lammps_name / REGC_LAMMPS_NAME pick the library)
 
 Running and analysing
 ---------------------
@@ -40,7 +41,8 @@ them, so ``import regc`` succeeds with numpy alone.
 """
 
 from .calculators import ASECalculatorAdapter, Calculator, LJCalculator, PairLJCalculator
-from .lammps_backend import LammpsCalculator, eam_pair_commands, lammps_ase_calculator
+from .lammps_backend import (LammpsCalculator, eam_pair_commands, lammps_ase_calculator,
+                             open_lammps)
 from .systems import BulkSystem, LJSystem, ParticleSystem, SlabLJSystem, SlabSystem
 from .state import ThermoState
 from .replica import Replica
@@ -92,7 +94,7 @@ from .driver import EXIT_RESUBMIT, RunStatus, run_with_checkpoints
 __all__ = [
     # calculators and systems
     "Calculator", "LJCalculator", "PairLJCalculator", "ASECalculatorAdapter", "LammpsCalculator",
-    "eam_pair_commands", "lammps_ase_calculator",
+    "eam_pair_commands", "lammps_ase_calculator", "open_lammps",
     "ParticleSystem", "BulkSystem", "SlabSystem", "LJSystem", "SlabLJSystem",
     # engine
     "ThermoState", "Replica", "ReplicaExchangeGCMC", "SWAP_TYPES",

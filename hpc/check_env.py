@@ -1,8 +1,10 @@
 """
 Check that this environment can run regc's Fe-H example on the cluster.
 
-    python hpc/check_env.py            # EAM styles
-    python hpc/check_env.py --grace    # also require pair_style grace/fs
+    python hpc/check_env.py                                  # EAM styles, default LAMMPS
+    python hpc/check_env.py --grace                          # also require pair_style grace/fs
+    python hpc/check_env.py --lammps-name grace --grace-runtime
+        # liblammps_grace.so (hpc/build_lammps.sh), also require grace/runtime + pace/runtime
 
 Exit code 0 if everything needed is present, 1 otherwise.
 """
@@ -14,6 +16,11 @@ import sys
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--grace", action="store_true", help="also require pair_style grace/fs")
+ap.add_argument("--grace-runtime", action="store_true",
+                help="also require pair_style grace/runtime and pace/runtime (grace-runtime build)")
+ap.add_argument("--lammps-name", default=None,
+                help="LAMMPS library to check: NAME -> liblammps_NAME.so (default: "
+                     "$REGC_LAMMPS_NAME, else liblammps.so)")
 args = ap.parse_args()
 
 ok = True
@@ -35,13 +42,25 @@ for mod in ("numpy", "scipy", "ase", "pymbar", "matplotlib", "regc"):
 
 print("LAMMPS Python module and styles:")
 try:
-    from lammps import lammps
-    lmp = lammps(cmdargs=["-log", "none", "-screen", "none", "-nocite"])
-    report("lammps", True, f"version {lmp.version()}")
+    import warnings
+
+    import lammps as lammps_module
+    from regc.lammps_backend import open_lammps, resolve_lammps_name
+    name = resolve_lammps_name(args.lammps_name)
+    module_version = lammps_module.__version__
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        lmp = open_lammps(name)
+    report("lammps", True, f"library {lmp.lib._name}, version {lmp.version()} "
+                           f"(Python module {module_version})")
+    for w in caught:
+        print(f"  [note] {w.message}")
     needed = [("pair", "eam/fs"), ("pair", "eam/alloy"), ("fix", "nve"), ("fix", "temp/csvr"),
               ("fix", "wall/reflect"), ("compute", "temp")]
     if args.grace:
         needed.append(("pair", "grace/fs"))
+    if args.grace_runtime:
+        needed += [("pair", "grace/runtime"), ("pair", "pace/runtime")]
     for cat, name in needed:
         report(f"{cat} {name}", lmp.has_style(cat, name))
     lmp.close()

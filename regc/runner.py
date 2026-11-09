@@ -12,7 +12,8 @@ surface phase diagram, all from one YAML or JSON file.
    rest displaceable, ``headroom_angstrom`` of space above). Orthogonal and
    oblique (e.g. hexagonal fcc(111)) cells both work.
 2. **calculator** -- ``EMT``, ``LJ``, ``PairLJ``, ``LAMMPS`` (any pair style:
-   an EAM file, GRACE, ACE, ...; native MD) or ``ASE`` (any ASE calculator
+   an EAM file, GRACE, ACE, ...; native MD; ``lammps_name`` picks the LAMMPS
+   library, e.g. ``grace`` for liblammps_grace.so) or ``ASE`` (any ASE calculator
    class by import path, e.g. ``ase.calculators.eam.EAM``).
 3. **reservoir** -- a `DiatomicReservoir` (H2, O2, ...; D0 and the
    isolated-atom energy from the potential itself, from experiment, or
@@ -87,7 +88,7 @@ _CALCULATOR_KEYS = {
     "LJ": {"lj_sigma", "lj_epsilon", "lj_r_cut"},
     "PAIRLJ": {"pair_params", "r_cut_factor"},
     "LAMMPS": {"species", "potential", "pair_style", "pair_coeff", "pair_commands",
-               "min_distance", "z_padding"},
+               "min_distance", "z_padding", "lammps_name"},
     "ASE": {"class", "kwargs"},
 }
 _RE_COMMON = {"temperatures_K", "mu_eV", "pressures", "pressure_unit", "scheme", "seed",
@@ -432,6 +433,8 @@ class _CalculatorSpec:
                 raise ValueError("calculator.species (LAMMPS atom-type order, matching "
                                  "pair_coeff) is required with pair_style/pair_commands")
             self.lammps_species = [str(s) for s in cfg.get("species", species)]
+            name = cfg.get("lammps_name")   # None: REGC_LAMMPS_NAME, else the default library
+            self.lammps_name = None if name is None else str(name)
             if cfg.get("pair_commands"):
                 self.pair_commands = [str(c) for c in cfg["pair_commands"]]
             elif cfg.get("pair_style"):
@@ -489,7 +492,8 @@ class _CalculatorSpec:
         """
         if self.type == "LAMMPS":
             from .lammps_backend import lammps_ase_calculator
-            return lammps_ase_calculator(self.pair_commands, self.lammps_species)
+            return lammps_ase_calculator(self.pair_commands, self.lammps_species,
+                                         lammps_name=self.lammps_name)
         factory = self._ase_factory()
         return factory() if factory is not None else None
 
@@ -528,7 +532,8 @@ class _CalculatorSpec:
                                     min_distance=None if md is None else _as_float(
                                         md, "calculator.min_distance"),
                                     z_padding=_as_float(self.cfg.get("z_padding", 5.0),
-                                                        "calculator.z_padding"))
+                                                        "calculator.z_padding"),
+                                    lammps_name=self.lammps_name)
         from .calculators import ASECalculatorAdapter
         cell = np.asarray(cell, dtype=float)
         if np.allclose(cell - np.diag(np.diag(cell)), 0.0):

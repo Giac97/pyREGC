@@ -16,9 +16,11 @@ It plugs into `ParticleSystem` like every other `Calculator`:
   which `Replica.diffuse('md')` uses automatically instead of ASE's MD.
 
 Units are LAMMPS ``metal`` (eV, Angstrom, ps, amu): the same as this
-package's real-units convention. Requires the LAMMPS Python module built
-with the pair style you use (e.g. ML-PACE with GRACE support for
-``grace/fs``).
+package's real-units convention. Requires the LAMMPS Python module and a
+LAMMPS shared library built with the pair style you use (e.g. ML-PACE for
+``grace/fs``, a grace-runtime build for ``grace/runtime``). Which library is
+loaded is chosen with ``lammps_name`` (``"grace"`` -> ``liblammps_grace.so``)
+or the environment variable ``REGC_LAMMPS_NAME``; see `open_lammps`.
 
 Pickling (process-pool workers) drops the LAMMPS handle; it is rebuilt
 lazily in the receiving process.
@@ -26,6 +28,8 @@ lazily in the receiving process.
 
 from __future__ import annotations
 
+import os
+import warnings
 from typing import Optional, Sequence
 
 import numpy as np
@@ -40,6 +44,142 @@ KB_EV_PER_K = 8.617333262e-5
 # shipped to it. Sharing is safe: every evaluation reloads all atoms, and a
 # process evaluates one configuration at a time.
 _INSTANCES: dict = {}
+
+# Environment variable naming the LAMMPS shared library to load when a calculator
+# does not name one itself: REGC_LAMMPS_NAME=grace loads liblammps_grace.so.
+LAMMPS_NAME_ENV = "REGC_LAMMPS_NAME"
+
+# The LAMMPS library this process has loaded (None: none yet). The LAMMPS Python
+# module loads libraries with RTLD_GLOBAL, so a second, different build loaded into
+# the same process binds part of its calls to the first one's symbols: the two
+# must never be mixed in one process.
+_LOADED_LIBRARY: Optional[str] = None
+
+
+def resolve_lammps_name(lammps_name: Optional[str] = None) -> str:
+    """
+    The LAMMPS library ("machine") name to load.
+
+    Parameters
+    ----------
+    lammps_name : str, optional
+        An explicit name: ``"grace"`` loads ``liblammps_grace.so``, ``""``
+        the default ``liblammps.so``. Default None: the value of the
+        environment variable ``REGC_LAMMPS_NAME``, else ``""``.
+
+    Returns
+    -------
+    str
+        The name, as LAMMPS's ``lammps(name=...)`` takes it.
+    """
+    if lammps_name is None:
+        lammps_name = os.environ.get(LAMMPS_NAME_ENV, "")
+    return str(lammps_name).strip()
+
+
+def open_lammps(lammps_name: Optional[str] = None,
+                cmdargs: Sequence[str] = ("-log", "none", "-screen", "none", "-nocite")):
+    """
+    Start a LAMMPS instance from a chosen shared library.
+
+    The LAMMPS Python module loads ``liblammps_<name>.so`` (``liblammps.so``
+    for an empty name) from its own directory or, failing that, from the
+    dynamic loader's search path (the environment's ``lib/``,
+    ``LD_LIBRARY_PATH``). Several LAMMPS builds can so live in one
+    environment, e.g. conda-forge's as the default and a grace-runtime build
+    as ``liblammps_grace.so`` (``hpc/build_lammps.sh``).
+
+    A process can use only one LAMMPS library: asking for a second, different
+    one raises instead of loading it (two builds in one process share
+    symbols and corrupt each other's memory). Compare builds in separate
+    processes.
+
+    The module refuses a library of another LAMMPS version than its own.
+    The C library interface regc uses (commands, atom creation and
+    gathering, thermo output) is stable across versions, so when a named
+    library has a different version this function warns and turns the
+    module's version check off for the rest of the process.
+
+    Parameters
+    ----------
+    lammps_name : str, optional
+        Library name (see `resolve_lammps_name`). Default None
+        (``REGC_LAMMPS_NAME``, else the default library).
+    cmdargs : sequence of str, optional
+        LAMMPS command-line arguments. Default: no log file, no screen
+        output, no citation reminder.
+
+    Returns
+    -------
+    lammps.lammps
+        The instance.
+
+    Raises
+    ------
+    OSError
+        If the library cannot be found or loaded.
+    RuntimeError
+        If this process already uses another LAMMPS library.
+    """
+    global _LOADED_LIBRARY
+    import lammps as lammps_module
+    name = resolve_lammps_name(lammps_name)
+    if _LOADED_LIBRARY is not None and name != _LOADED_LIBRARY:
+        raise RuntimeError(
+            f"this process already uses {_library_file(_LOADED_LIBRARY)}; loading "
+            f"{_library_file(name)} as well would mix two LAMMPS builds in one process, which "
+            "corrupts memory. Use one lammps_name per process (worker processes inherit "
+            "REGC_LAMMPS_NAME); compare builds in separate processes.")
+    lmp = _start_lammps(lammps_module, name, list(cmdargs))
+    _LOADED_LIBRARY = name
+    return lmp
+
+
+def _start_lammps(lammps_module, name: str, cmdargs: list):
+    """
+    `lammps.lammps(name, cmdargs)`, tolerating a library/module version mismatch.
+
+    Parameters
+    ----------
+    lammps_module : module
+        The imported ``lammps`` package.
+    name : str
+        Library name.
+    cmdargs : list of str
+        Command-line arguments.
+
+    Returns
+    -------
+    lammps.lammps
+        The instance.
+    """
+    try:
+        return lammps_module.lammps(name=name, cmdargs=cmdargs)
+    except AttributeError as err:
+        if "shared library is version" not in str(err):
+            raise
+        warnings.warn(f"{err} (library {_library_file(name)}); regc runs it anyway and skips "
+                      "the LAMMPS Python module's version check from now on",
+                      RuntimeWarning, stacklevel=3)
+        lammps_module.__version__ = 0   # the module's own 'in-place build' value: no check
+        return lammps_module.lammps(name=name, cmdargs=cmdargs)
+
+
+def _library_file(name: str) -> str:
+    """
+    File name of a LAMMPS shared library.
+
+    Parameters
+    ----------
+    name : str
+        Library name, possibly empty.
+
+    Returns
+    -------
+    str
+        ``liblammps_<name>.so`` or ``liblammps.so``.
+    """
+    return f"liblammps_{name}.so" if name else "liblammps.so"
 
 
 def _f(x) -> str:
@@ -91,7 +231,8 @@ def eam_pair_commands(potential_file: str, species: Sequence[str]) -> list:
             f"pair_coeff * * {os.path.abspath(potential_file)} {' '.join(species)}"]
 
 
-def lammps_ase_calculator(pair_commands: Sequence[str], species: Sequence[str]):
+def lammps_ase_calculator(pair_commands: Sequence[str], species: Sequence[str],
+                          lammps_name: Optional[str] = None):
     """
     An ASE calculator running the same LAMMPS potential.
 
@@ -105,6 +246,9 @@ def lammps_ase_calculator(pair_commands: Sequence[str], species: Sequence[str]):
         LAMMPS ``pair_style``/``pair_coeff`` lines.
     species : sequence of str
         Species in LAMMPS type order.
+    lammps_name : str, optional
+        LAMMPS library to load (``"grace"`` -> ``liblammps_grace.so``).
+        Default None: ``REGC_LAMMPS_NAME``, else the default library.
 
     Returns
     -------
@@ -112,9 +256,11 @@ def lammps_ase_calculator(pair_commands: Sequence[str], species: Sequence[str]):
         The calculator.
     """
     from ase.calculators.lammpslib import LAMMPSlib
+    name = resolve_lammps_name(lammps_name)
+    open_lammps(name).close()   # fails early if missing; relaxes a version mismatch (see open_lammps)
     return LAMMPSlib(lmpcmds=list(pair_commands),
                      atom_types={s: i + 1 for i, s in enumerate(species)},
-                     log_file=None, keep_alive=True)
+                     lammps_name=name, log_file=None, keep_alive=True)
 
 
 class LammpsCalculator(Calculator):
@@ -126,7 +272,9 @@ class LammpsCalculator(Calculator):
     pair_commands : sequence of str
         The LAMMPS commands defining the interaction, e.g.
         ``["pair_style eam/fs", "pair_coeff * * Fe-H.eam.fs Fe H"]`` or
-        ``["pair_style grace/fs", "pair_coeff * * model.yaml Fe H"]``.
+        ``["pair_style grace/fs", "pair_coeff * * model.yaml Fe H"]`` or, with
+        a grace-runtime build (``lammps_name="grace"``),
+        ``["pair_style grace/runtime", "pair_coeff * * kokkos.npz Fe H"]``.
     species : sequence of str
         Species in LAMMPS atom-type order (type 1 = species[0], ...); must
         match the element order in `pair_commands`.
@@ -141,6 +289,12 @@ class LammpsCalculator(Calculator):
     z_padding : float, optional
         Extra space (A) below the lowest and above the highest atom/wall
         in the non-periodic z direction of the LAMMPS box. Default 5.0.
+    lammps_name : str, optional
+        Which LAMMPS shared library to load: ``"grace"`` loads
+        ``liblammps_grace.so``, ``""`` the default ``liblammps.so``.
+        Default None: the environment variable ``REGC_LAMMPS_NAME`` of the
+        process that evaluates (worker processes inherit it), else the
+        default library. See `open_lammps`.
     """
 
     supports_incremental = False
@@ -148,7 +302,7 @@ class LammpsCalculator(Calculator):
 
     def __init__(self, pair_commands: Sequence[str], species: Sequence[str],
                  masses: Optional[dict] = None, min_distance: Optional[float] = None,
-                 z_padding: float = 5.0):
+                 z_padding: float = 5.0, lammps_name: Optional[str] = None):
         """
         Store the potential definition; LAMMPS starts lazily on first use.
 
@@ -164,6 +318,9 @@ class LammpsCalculator(Calculator):
             Hard-core distance (A). Default None (off).
         z_padding : float, optional
             Extra box height (A) beyond the atoms/walls. Default 5.0.
+        lammps_name : str, optional
+            LAMMPS library name. Default None (``REGC_LAMMPS_NAME``, else
+            the default library).
         """
         self.pair_commands = list(pair_commands)
         self.species = list(species)
@@ -171,6 +328,7 @@ class LammpsCalculator(Calculator):
         self.masses = dict(masses) if masses else {}
         self.min_distance = min_distance
         self.z_padding = z_padding
+        self.lammps_name = lammps_name
         self._lmp = None
         self._box_key = None
 
@@ -245,20 +403,20 @@ class LammpsCalculator(Calculator):
         ValueError
             If the cell is not in LAMMPS's restricted-triclinic form.
         """
-        from lammps import lammps
         H = self._cell_matrix(system)
         if abs(H[0, 1]) > 1e-12 or abs(H[0, 2]) > 1e-12 or abs(H[1, 2]) > 1e-12:
             raise ValueError("LammpsCalculator needs a1 along x and a2 in the xy plane "
                              "(LAMMPS's restricted-triclinic convention)")
         Lx, xy, Ly = H[0, 0], H[1, 0], H[1, 1]
-        key = (tuple(self.pair_commands), tuple(self.species),
+        name = resolve_lammps_name(getattr(self, 'lammps_name', None))  # absent in old pickles
+        key = (name, tuple(self.pair_commands), tuple(self.species),
                tuple(sorted((s, self._mass(s)) for s in self.species)),
                tuple(np.round(H.ravel(), 10)), round(z_lo, 10), round(z_hi, 10),
                tuple(getattr(system, 'pbc', (True, True, False))))
         if key in _INSTANCES:
             self._lmp, self._H, self._Hinv, self._z_range = _INSTANCES[key]
             return
-        lmp = lammps(cmdargs=["-log", "none", "-screen", "none", "-nocite"])
+        lmp = open_lammps(name)
         pbc = tuple(getattr(system, 'pbc', (True, True, False)))
         bnd = " ".join("p" if p else "f" for p in pbc)
         tilt = abs(xy) > 1e-12

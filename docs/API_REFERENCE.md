@@ -7,7 +7,7 @@ Everything below is importable as `from regc import <name>`, except the runner f
 ## Contents
 
 - [Calculators (`regc.calculators`)](#calculators-regccalculators): `Calculator`, `LJCalculator`, `PairLJCalculator`, `ASECalculatorAdapter`
-- [LAMMPS backend (`regc.lammps_backend`)](#lammps-backend-regclammps_backend): `LammpsCalculator`, `eam_pair_commands`, `lammps_ase_calculator`
+- [LAMMPS backend (`regc.lammps_backend`)](#lammps-backend-regclammps_backend): `LammpsCalculator`, `eam_pair_commands`, `lammps_ase_calculator`, `open_lammps`
 - [Systems (`regc.systems`)](#systems-regcsystems): `ParticleSystem`, `BulkSystem`, `SlabSystem`, `LJSystem`, `SlabLJSystem`
 - [Structures and slab geometry (`regc.structures`)](#structures-and-slab-geometry-regcstructures): `cubic_lattice_constant`, `slab_geometry_from_atoms`, `SlabGeometry`, `insertion_energy_scan`
 - [Thermodynamic state (`regc.state`)](#thermodynamic-state-regcstate): `ThermoState`
@@ -373,18 +373,19 @@ that order -- what `Replica`'s HMC move expects.
 ### `LammpsCalculator`
 
 ```python
-LammpsCalculator(pair_commands: Sequence[str], species: Sequence[str], masses: Optional[dict] = None, min_distance: Optional[float] = None, z_padding: float = 5.0)
+LammpsCalculator(pair_commands: Sequence[str], species: Sequence[str], masses: Optional[dict] = None, min_distance: Optional[float] = None, z_padding: float = 5.0, lammps_name: Optional[str] = None)
 ```
 
 Energies, forces and native MD from LAMMPS, for any pair style.
 
 **Parameters**
 
-- `pair_commands` (*sequence of str*): The LAMMPS commands defining the interaction, e.g. `["pair_style eam/fs", "pair_coeff * * Fe-H.eam.fs Fe H"]` or `["pair_style grace/fs", "pair_coeff * * model.yaml Fe H"]`.
+- `pair_commands` (*sequence of str*): The LAMMPS commands defining the interaction, e.g. `["pair_style eam/fs", "pair_coeff * * Fe-H.eam.fs Fe H"]` or `["pair_style grace/fs", "pair_coeff * * model.yaml Fe H"]` or, with a grace-runtime build (`lammps_name="grace"`), `["pair_style grace/runtime", "pair_coeff * * kokkos.npz Fe H"]`.
 - `species` (*sequence of str*): Species in LAMMPS atom-type order (type 1 = species[0], ...); must match the element order in `pair_commands`.
 - `masses` (*dict, optional*): Mass (amu) per species; defaults to ASE's tables.
 - `min_distance` (*float, optional*): Hard core: the energy is +inf if any mobile atom is closer than this to any other atom (an exact modification of the potential). Guards GCMC insertions against unphysical, off-training-set configurations of machine-learned potentials. Choose it below any physically reachable separation. Default None (off).
 - `z_padding` (*float, optional*): Extra space (A) below the lowest and above the highest atom/wall in the non-periodic z direction of the LAMMPS box. Default 5.0.
+- `lammps_name` (*str, optional*): Which LAMMPS shared library to load: `"grace"` loads `liblammps_grace.so`, `""` the default `liblammps.so`. Default None: the environment variable `REGC_LAMMPS_NAME` of the process that evaluates (worker processes inherit it), else the default library. See `open_lammps`.
 
 **Constructor**
 
@@ -397,6 +398,7 @@ Store the potential definition; LAMMPS starts lazily on first use.
 - `masses` (*dict, optional*): Mass (amu) per species. Default None (ASE tables).
 - `min_distance` (*float, optional*): Hard-core distance (A). Default None (off).
 - `z_padding` (*float, optional*): Extra box height (A) beyond the atoms/walls. Default 5.0.
+- `lammps_name` (*str, optional*): LAMMPS library name. Default None (`REGC_LAMMPS_NAME`, else the default library).
 
 #### `LammpsCalculator.total_energy`
 
@@ -489,7 +491,7 @@ LAMMPS pair commands for an EAM file, inferring the style from its name.
 ### `lammps_ase_calculator`
 
 ```python
-lammps_ase_calculator(pair_commands: Sequence[str], species: Sequence[str])
+lammps_ase_calculator(pair_commands: Sequence[str], species: Sequence[str], lammps_name: Optional[str] = None)
 ```
 
 An ASE calculator running the same LAMMPS potential.
@@ -502,10 +504,53 @@ simulation's `LammpsCalculator` uses.
 
 - `pair_commands` (*sequence of str*): LAMMPS `pair_style`/`pair_coeff` lines.
 - `species` (*sequence of str*): Species in LAMMPS type order.
+- `lammps_name` (*str, optional*): LAMMPS library to load (`"grace"` -> `liblammps_grace.so`). Default None: `REGC_LAMMPS_NAME`, else the default library.
 
 **Returns**
 
 - *ase.calculators.lammpslib.LAMMPSlib*: The calculator.
+
+---
+
+### `open_lammps`
+
+```python
+open_lammps(lammps_name: Optional[str] = None, cmdargs: Sequence[str] = ('-log', 'none', '-screen', 'none', '-nocite'))
+```
+
+Start a LAMMPS instance from a chosen shared library.
+
+The LAMMPS Python module loads `liblammps_<name>.so` (`liblammps.so`
+for an empty name) from its own directory or, failing that, from the
+dynamic loader's search path (the environment's `lib/`,
+`LD_LIBRARY_PATH`). Several LAMMPS builds can so live in one
+environment, e.g. conda-forge's as the default and a grace-runtime build
+as `liblammps_grace.so` (`hpc/build_lammps.sh`).
+
+A process can use only one LAMMPS library: asking for a second, different
+one raises instead of loading it (two builds in one process share
+symbols and corrupt each other's memory). Compare builds in separate
+processes.
+
+The module refuses a library of another LAMMPS version than its own.
+The C library interface regc uses (commands, atom creation and
+gathering, thermo output) is stable across versions, so when a named
+library has a different version this function warns and turns the
+module's version check off for the rest of the process.
+
+**Parameters**
+
+- `lammps_name` (*str, optional*): Library name (see `resolve_lammps_name`). Default None (`REGC_LAMMPS_NAME`, else the default library).
+- `cmdargs` (*sequence of str, optional*): LAMMPS command-line arguments. Default: no log file, no screen output, no citation reminder.
+
+**Returns**
+
+- *lammps.lammps*: The instance.
+
+**Raises**
+
+- *OSError*: If the library cannot be found or loaded.
+- *RuntimeError*: If this process already uses another LAMMPS library.
 
 ## Systems (`regc.systems`)
 
