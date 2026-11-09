@@ -499,10 +499,13 @@ calc = LammpsCalculator(pair, ["Fe", "H"], min_distance=0.6, lammps_name="grace"
 - **Getting a model:** pretrained models come from `grace-runtime models
   download <name>` (pip package `grace-runtime`). Your own fits come from
   `grace_utils -p model.yaml -c CHECKPOINT export_kokkos -o model.npz`.
-- **H₂ reference:** OMAT-trained models describe isolated atoms poorly.
-  GRACE-2L-OMAT-medium-ft-E gives D0(H₂) = 7.5 eV, against 4.48 eV in
-  experiment, so use `d0="experimental"` (YAML `d0: experimental`) with
-  them.
+- **Gas reference: keep `d0="self"`.** Foundation models (OMAT, OAM, ...)
+  describe isolated atoms poorly, because isolated atoms are not in their
+  training data. Molecules are, in molecular crystals. GRACE-2L-OMAT-medium-ft-E
+  gives D0(H₂) = 7.5 eV, against 4.48 eV in experiment, because its
+  isolated-H energy is off. With `d0="self"`, μ is referenced to the model's
+  own molecule (μ = ½(μ_X₂ − D0) + e_atom, and the model's e_atom cancels).
+  An experimental D0 would bring the bad e_atom back into μ.
 - **`pace/runtime`:** reads pacemaker ACE `.yaml` files on the same
   runtime.
 
@@ -1364,6 +1367,13 @@ Two annotated example configs cover every key:
 - `examples/fe100_h_eam_example.yaml`: Fe(100) + H with the Wen EAM in
   LAMMPS, with displaceable layers, MD diffusion and checkpoints. The
   production setup of example 13.
+
+There is also `examples/pd111_o_grace/`, which holds `pd111_o_grace.yaml`
+and `run.sh`. It models Pd(111) + O from O₂ with a GRACE model through
+`pair_style grace/runtime` (`lammps_name: grace`, §3.2.1), with a non-H
+diatomic reservoir (O₂ spectroscopic constants). `./run.sh check` comes
+first, then `run`, `resume` or `analyze`. It is a production-size setup,
+meant for a cluster node.
 
 ### 12.1 More config files
 

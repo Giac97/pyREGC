@@ -586,7 +586,9 @@ from one config file: structure -> REGC -> MBAR -> (T, p) phase diagram.
 Two annotated configs cover every key:
 `examples/pd111_emt_example.yaml` (small, EMT) and
 `examples/fe100_h_eam_example.yaml` (Fe(100) + H with the Wen EAM through
-LAMMPS, checkpointed: the setup of example 13).
+LAMMPS, checkpointed: the setup of example 13). `examples/pd111_o_grace/`
+(config + `run.sh`) does Pd(111) + O from O₂ with a GRACE model through
+LAMMPS `grace/runtime`.
 
 | Section | What it sets |
 |---|---|

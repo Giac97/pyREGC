@@ -1,0 +1,105 @@
+# O on Pd(111) from O2 gas, with a GRACE foundation model running in LAMMPS
+# (pair_style grace/runtime). Start it with ./run.sh in this folder (see the
+# header of run.sh); the regc-run commands it wraps are
+#
+#   regc-run pd111_o_grace.yaml --check            # setup, the model's O2, the mu ladder
+#   regc-run pd111_o_grace.yaml                    # run + analysis
+#   regc-run pd111_o_grace.yaml --resume --time-limit 85000   # batch jobs: exit 75 = resubmit
+#   regc-run pd111_o_grace.yaml --analyze-only     # re-analyse the saved samples
+#
+# Needs the grace-runtime LAMMPS build (bash hpc/build_lammps.sh, which installs
+# liblammps_grace.so into the env) and a GRACE model as model.npz in this folder.
+# run.sh links model.npz to a model in the GRACE cache, or downloads one; any
+# kokkos.npz works, e.g. one of your own fits exported with
+#   grace_utils -p model.yaml -c CHECKPOINT export_kokkos -o model.npz
+#
+# Physics:
+# - What to expect. On Pd(111), O forms the p(2x2)-O overlayer (0.25 O per
+#   surface Pd) over a wide (T, p) range. At high O2 pressure or low T, the
+#   Pd5O4 surface oxide and then bulk PdO become stable. The 4x4 cell holds
+#   p(2x2) and the denser overlayers, but not the (sqrt6 x sqrt6) oxide cell.
+#   Forming an oxide also means moving Pd atoms, which O insertion/removal
+#   plus MD can only partly do. Read high coverages as "beyond the overlayer
+#   regime", not as an oxide structure.
+# - The O2 reference. d0: self takes O2 from the model itself, so mu_O is
+#   referenced to the model's O2 molecule, and the model's energy of an
+#   isolated O atom (e_atom) cancels. That is the right choice for
+#   foundation models (OMAT, OAM, ...): isolated atoms are not in their
+#   training data, while O2 (in molecular crystals) is. --check prints the
+#   model's D0. Experiment gives 5.12 eV. A D0 far from that with a sensible
+#   O2 bond length usually just reflects a bad e_atom, which cancels here.
+#   Setting D0_eV: 5.116 instead would bring that bad e_atom back into mu_O.
+# - Spin. The reservoir treats O2 as a closed-shell rotor. The triplet ground
+#   state's degeneracy would lower mu_O by (kT/2) ln 3: 0.014 eV at 300 K,
+#   0.047 eV at 1000 K.
+#
+# Cost: 64 Pd + O atoms. A GRACE-2L energy call takes roughly 30-60 ms on one
+# core, and there are 48 replicas. Use as many workers as replicas, on a
+# cluster node (hpc/ shows the Slurm setup), and check convergence
+# (rho(u), the N_ads time series) before trusting the diagram.
+
+structure:
+  build:
+    surface: fcc111
+    symbol: Pd
+    size: [4, 4, 4]             # 16 Pd per layer: p(2x2), (2x1), ... fit
+    a: 3.891                     # fcc lattice constant fitted to the model
+  n_frozen_layers: 2            # bottom 2 layers rigid, top 2 displaceable (moved by MD)
+  headroom_angstrom: 5.0        # O lives in z in (0, top + 5 A]: subsurface sites included
+
+gas:
+  species: O
+  mass_amu: 15.999
+
+calculator:
+  type: LAMMPS
+  lammps_name: grace            # liblammps_grace.so: the grace-runtime build
+  pair_style: grace/runtime     # GRACE-1L/2L/3L models in kokkos.npz format
+  pair_coeff: "* * model.npz Pd O"
+  species: [Pd, O]              # LAMMPS atom-type order, as in pair_coeff
+  min_distance: 1.0             # A hard core: no insertions closer than this (O-O in O2: 1.21 A)
+
+reservoir:
+  type: diatomic                # O2 gas exchanging O atoms
+  d0: self                      # the model's own O2 (see above); or D0_eV: 5.116
+  bond_length_angstrom: 1.2075  # O2 spectroscopic constants (rotations, vibrations of the gas)
+  vibrational_wavenumber_cm: 1580.2
+  symmetry_number: 2
+
+replica_exchange:
+  temperatures_K: [300, 381.7, 485.6, 617.8, 786.0, 1000]   # geometric ladder
+  pressures: [1.0e-12, 1.0e-10, 1.0e-8, 1.0e-6, 1.0e-4, 1.0e-2, 1.0, 1.0e+2]
+  pressure_unit: bar            # O2 partial pressure
+  scheme: regc
+  n_steps: 20000                # may stop earlier on rho(u) convergence
+  x0: 0.9                       # probability of a GC step (else a replica swap)
+  diffusion: md                 # Bussi NVT MD, native in LAMMPS; or hmc
+  diffusion_steps: 40
+  md: {timestep_fs: 1.0, thermostat: bussi, taut_fs: 50.0}
+  hmc: {leapfrog_steps: 10, timestep_fs: 1.0}     # used with diffusion: hmc
+  record_every: 10
+  convergence_every: 2000
+  convergence_tol: 0.05
+  adsorbed_cutoff: 2.6          # record N_ads: O within 2.6 A of a Pd atom (Pd-O ~ 2.0 A)
+  max_disp: 0.3
+  seed: 0
+  n_workers: auto               # all cores; run.sh's WORKERS=n overrides
+
+checkpoint:
+  chunk: 1000                   # samples.npz + checkpoint.pkl every 1000 steps
+
+phase_diagram:
+  T_min_K: 300
+  T_max_K: 1000
+  n_T: 120
+  p_min: 1.0e-14
+  p_max: 1.0e+2
+  n_p: 150
+  pressure_unit: bar
+  observable: N_ads
+  coverage_per: surface_atom    # O per surface Pd: p(2x2) = 0.25
+  most_probable: true
+  discard: 0.2
+
+output:
+  directory: output_pd111_o_grace   # relative to the working directory (run.sh: this folder)
