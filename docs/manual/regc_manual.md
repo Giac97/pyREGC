@@ -349,7 +349,9 @@ do. Each one is recorded with every sample and reweighted by Eq. (7):
 | `FunctionObservable` | anything `f(system)` returns | $\langle f\rangle$ |
 
 The selection `'substrate'` means all slab or cluster atoms, frozen and
-displaceable; `'mobile'` means the exchanged atoms.
+displaceable; `'frozen'` only the frozen ones; `'mobile'` the exchanged
+atoms; a species label or `'group:species'` (e.g. `'substrate:Pd'`)
+narrows any of them.
 
 Ratios are formed after reweighting: ⟨bonds⟩/⟨centres⟩, not ⟨bonds/centres⟩.
 The latter weights a configuration with one centre as much as one with
@@ -513,6 +515,15 @@ observables = [
     CoordinationNumber("cn_HFe", r_cut=2.2, center="mobile", neighbor="substrate"),
     RadialDistribution("rdf_HFe", r_max=4.0, n_bins=80, a="mobile", b="substrate"),
 ]
+```
+
+In a config file the same two are list entries of `observables` (§6 has
+the full table of keys):
+
+```yaml
+observables:
+  - {type: coordination, name: cn_HFe, r_cut: 2.2, center: mobile, neighbor: substrate}
+  - {type: rdf, name: rdf_HFe, r_max: 4.0, n_bins: 80, a: mobile, b: substrate}
 ```
 
 ### Step 5 — sampling
@@ -1156,6 +1167,42 @@ phase_diagram:
   bootstrap: {n: 100, seed: 0}                     # intervals, label agreement, C_V peak support
 output: {directory: output}
 ```
+
+**Several observables.** `observables` is a list with one entry per
+observable: a `type`, a unique `name`, and the keys of that type. Flow
+style (`- {type: ..., name: ..., ...}`) and block style are equivalent.
+
+| `type` | Required | Optional (default) |
+|---|---|---|
+| `coordination` | `name`, `r_cut` | `center` (`mobile`), `neighbor` (`substrate`), `z_range` |
+| `coordination_histogram` | `name`, `r_cut` | `max_cn` (12), `center` (`substrate`), `neighbor` (`all`), `z_range` |
+| `rdf` | `name`, `r_max` | `n_bins` (100), `a` (`mobile`), `b` (`substrate`), `z_range` |
+
+```yaml
+observables:
+  - {type: coordination, name: cn_OPd, r_cut: 2.6}                 # O–Pd per O
+  - {type: coordination, name: cn_OO, r_cut: 3.2, center: mobile, neighbor: mobile}
+  - {type: coordination_histogram, name: cnh_top, r_cut: 2.6, max_cn: 4,
+     center: "substrate:Pd", neighbor: O, z_range: [4.0, 9.6]}     # heights from --check
+  - {type: rdf, name: rdf_OO, r_max: 6.0, n_bins: 120, a: mobile, b: mobile}
+  - {type: rdf, name: rdf_OPd, r_max: 4.0, n_bins: 80, a: O, b: Pd}
+```
+
+- **Atom selections** (`center`, `neighbor`, `a`, `b`): `mobile`,
+  `substrate` (all slab atoms, frozen and displaceable), `frozen`, `all`,
+  a species label (`O`, `Pd`), or `group:species` (`substrate:Pd`).
+- **`z_range`** keeps centre atoms (for `rdf`, the `a` atoms) between two
+  absolute heights in Å. The top frozen layer is at z = 0; read the
+  heights of the surface from `regc-run --check`.
+- **Outputs.** Every `coordination` gets a map (`<plot>_cn_<name>.png`);
+  histograms go to `phase_diagram_data.npz`; every `rdf` is plotted at the
+  `phase_diagram.rdf_states`.
+- **They belong to the run.** Observables are computed while sampling: a
+  resume with different observables is refused, and a merge keeps only the
+  ones every run recorded. New observables need a new run, or stored
+  configurations (`configurations` or `records`) evaluated in Python.
+- Names must be unique, not `U`, `N`, `N_ads` or `N_s`, and without `:`; cutoffs stay
+  below half the shortest periodic cell length.
 
 ```mermaid
 flowchart LR

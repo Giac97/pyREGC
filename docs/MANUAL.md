@@ -2476,27 +2476,87 @@ With this section the run goes through `run_with_checkpoints`
 
 ### 14.7b `observables` and `configurations`
 
-`observables` is a list; each entry is one structural observable
-([§9.1](#91-structural-observables)):
+`observables` is a top-level list with one entry per structural
+observable ([§9.1](#91-structural-observables)). Each entry has a `type`
+and a `name`; the other keys depend on the type. Flow style (one entry per
+line) and block style are equivalent:
 
 ```yaml
 observables:
-  - {type: coordination, name: cn_HFe, r_cut: 2.2}                   # center mobile, neighbor substrate
-  - {type: coordination_histogram, name: cn_top, r_cut: 2.6, max_cn: 6,
-     center: substrate, neighbor: all, z_range: [2.0, 5.5]}         # absolute z; top_z from --check
-  - {type: rdf, name: rdf_HH, r_max: 4.5, n_bins: 90, a: mobile, b: mobile}
+  - {type: coordination, name: cn_OPd, r_cut: 2.6}                  # O–Pd neighbours per O
+  - {type: coordination, name: cn_OO, r_cut: 3.2,
+     center: mobile, neighbor: mobile}                              # O–O neighbours (islands)
+  - {type: coordination_histogram, name: cnh_top, r_cut: 2.6, max_cn: 4,
+     center: "substrate:Pd", neighbor: O, z_range: [4.0, 9.6]}      # O around top-layer Pd
+  - type: rdf                                                       # block style
+    name: rdf_OO
+    r_max: 6.0
+    n_bins: 120
+    a: mobile
+    b: mobile
+  - {type: rdf, name: rdf_OPd, r_max: 4.0, n_bins: 80, a: O, b: Pd}
 configurations: {save: true, every: 1}        # -> output/configurations/configs_T*_mu*.extxyz
+
+phase_diagram:
+  rdf_states: [[300, 1.0e-6], [600, 1.0]]     # [T_K, p] at which every rdf is plotted
 ```
+
+| `type` | Required | Optional (default) | Recorded per sample |
+|---|---|---|---|
+| `coordination` | `name`, `r_cut` | `center` (`mobile`), `neighbor` (`substrate`), `z_range` | bonds and number of centres; reported as ⟨bonds⟩/⟨centres⟩ |
+| `coordination_histogram` | `name`, `r_cut` | `max_cn` (12), `center` (`substrate`), `neighbor` (`all`), `z_range` | number of centres with CN = 0 … `max_cn` |
+| `rdf` | `name`, `r_max` | `n_bins` (100), `a` (`mobile`), `b` (`substrate`), `z_range` | pair-distance histogram between `a` and `b` atoms |
+
+**Selecting atoms** (`center`, `neighbor`, `a`, `b`):
+
+| Selector | Atoms |
+|---|---|
+| `mobile` | the exchanged (GCMC) atoms |
+| `substrate` | all slab or cluster atoms, frozen and displaceable |
+| `frozen` | the frozen slab atoms only |
+| `all` | every atom |
+| a species label, e.g. `O`, `Pd` | those atoms in any group |
+| `group:species`, e.g. `substrate:Pd`, `mobile:O` | a species within a group |
+
+- **`z_range: [z_min, z_max]`** keeps only centre atoms (for `rdf`: the
+  `a` atoms) with $z_\text{min} \le z < z_\text{max}$, in absolute Å. In a
+  slab built by the runner the top frozen layer is at z = 0; `regc-run
+  --check` prints the height of the topmost slab atom and the insertion
+  window, so take the numbers from there (e.g. the 3 Å "surface region" of
+  [ZSG] PRL 128, 246101).
+- **Cutoffs** use the minimum-image convention, so `r_cut` and `r_max`
+  must stay below half the shortest periodic cell length (an error says
+  so otherwise).
+- **Names** must be unique, must not be `U`, `N`, `N_ads` or `N_s`, and
+  must not contain `:`.
+- **Observables are part of the run's definition.** They are computed
+  while sampling, so they cannot be added afterwards, and a resume with
+  different observables is refused (the earlier samples would not have
+  them). `merge` keeps only observables recorded identically by every
+  run. To get new ones from an existing run's structures, store
+  configurations (`configurations: {save: true}` or `records: {save:
+  true}`) and evaluate them in Python.
+
+**What the analysis writes for them:**
+
+| Observable | Output |
+|---|---|
+| `coordination` | map of the mean coordination, `<plot>_cn_<name>.png`; `cn_<name>` in `phase_diagram_data.npz` |
+| `coordination_histogram` | `cn_hist_<name>` in `phase_diagram_data.npz` (n_T × n_p × (max_cn + 1), each cell normalised) |
+| `rdf` | `<plot>_rdf_<name>.png` at the `rdf_states`; `rdf_<name>`, `rdf_<name>_r`, `rdf_<name>_states` in the npz |
+
+In Python the same observables are `CoordinationNumber`,
+`CoordinationHistogram`, `RadialDistribution` and `FunctionObservable`
+(any `f(system)`, not available from YAML), passed as
+`ReplicaExchangeGCMC(..., observables=[...])`; the analysis reads them with
+`mean_coordination`, `coordination_distribution`, `radial_distribution`
+and `observable_map` ([§9.1](#91-structural-observables)).
 
 | `configurations` key | Default | Meaning |
 |---|---|---|
 | `save` | false | Store the configuration of recorded samples. |
 | `every` | 1 | Every this many samples. |
 | `directory` | `configurations` | Under `output.directory`. |
-
-Every coordination-number observable is mapped automatically
-(`<plot>_cn_<name>.png`); histograms are saved to
-`phase_diagram_data.npz`.
 
 ### 14.7c `records`
 
