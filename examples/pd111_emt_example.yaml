@@ -88,7 +88,7 @@ phase_diagram:
   observable: N                 # N, N_ads (needs adsorbed_cutoff) or N_<species>
   coverage_per: surface_atom    # area (per A^2), surface_atom or none
   most_probable: true           # also plot the most probable N ([ZSG] Fig. 3)
-  # discard: 0.2                # fraction of each replica's samples dropped as equilibration
+  # discard: 0.2                # fraction of each replica's samples dropped as equilibration (default 0.2)
 
 output:
   directory: output_pd111_emt

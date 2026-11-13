@@ -1,0 +1,18 @@
+flowchart TB
+    accTitle: One REGC step
+    accDescr: With probability x0 every replica attempts an insertion or deletion, otherwise one swap pattern is attempted across the grid; then every replica diffuses at fixed N, a sample is recorded every record_every steps, and the run stops when converged or after n_steps.
+
+    start_step(["Step k"]) --> draw{"r < x₀ ?"}
+    draw -->|"yes"| gc_move["Each replica: insert<br/>or delete one atom"]
+    draw -->|"no"| swap["Attempt the swaps of one<br/>pattern and parity"]
+    gc_move --> diffuse["Diffusion at fixed N<br/>(MC, HMC or MD)"]
+    swap --> diffuse
+    diffuse --> store[("Every record_every steps:<br/>U, N, observables, configuration")]
+    store --> check{"Converged or<br/>k = n_steps ?"}
+    check -->|"no"| start_step
+    check -->|"yes"| stop_run(["Stop"])
+
+    classDef decision fill:#fef9c3,stroke:#ca8a04,stroke-width:2px,color:#713f12
+    classDef data fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    class draw,check decision
+    class store data

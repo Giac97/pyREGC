@@ -1,0 +1,14 @@
+flowchart LR
+    accTitle: regc-run command modes
+    accDescr: The check mode builds and prints the setup without sampling, a normal run samples and analyses, a resumed run continues from the checkpoint, and analyze-only recomputes maps and exports from saved samples.
+
+    config[/"config.yaml"/] --> check_mode["regc-run<br/>--check"]
+    config --> run_mode["regc-run<br/>sample + analyse"]
+    run_mode -->|"exit 75"| resume_mode["regc-run<br/>--resume"]
+    resume_mode --> run_mode
+    run_mode --> outputs[("output/<br/>samples, maps, structures")]
+    outputs --> analyze_mode["regc-run<br/>--analyze-only"]
+    analyze_mode --> outputs
+
+    classDef store fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    class outputs store

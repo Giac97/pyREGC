@@ -27,7 +27,7 @@ import math
 
 import numpy as np
 
-# CODATA 2018 values (the same ones ASE's own ase.units module uses)
+# CODATA 2018 values (ASE's ase.units defaults to CODATA 2014; the difference is ~1e-6)
 PLANCK_H = 6.62607015e-34          # J s
 BOLTZMANN_K_SI = 1.380649e-23      # J / K
 AMU = 1.66053906660e-27            # kg

@@ -1,0 +1,13 @@
+flowchart LR
+    accTitle: One bootstrap resample
+    accDescr: Block lengths are fixed once from each replica's statistical inefficiency; each resample redraws every replica's samples in blocks, builds a resampled sample set, re-solves the MBAR free energies by warm-started Newton, rebuilds the reweighting denominators and recomputes the statistic; the replicates give standard errors, percentile intervals and agreement.
+
+    g["0 once:<br/>block b = ⌈2g⌉<br/>per replica"] --> loop
+    subgraph loop["repeated n_boot times"]
+        direction TB
+        draw["1 redraw each replica in blocks"] --> set["2 resampled sample set"]
+        set --> solve["3 MBAR f_k (Newton, warm start)"]
+        solve --> den["4 mixture denominators"]
+        den --> stat["5 statistic: map, C_V, N*"]
+    end
+    loop --> sum["6 std, percentile<br/>intervals, agreement"]

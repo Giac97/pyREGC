@@ -1,0 +1,12 @@
+flowchart LR
+    accTitle: Modules of the regc package
+    accDescr: Setup modules build systems and reservoirs, the engine samples them using calculators and records observables and configurations, and the analysis modules turn the saved samples into maps, plots and exported structures.
+
+    setup["<b>Setup</b><br/>structures · calculators<br/>lammps_backend · reservoir<br/>units · observables"]
+    sampling["<b>Sampling</b><br/>systems → replica → engine<br/>driver (checkpoints)"]
+    records[("<b>Records</b><br/>samples.npz (io)<br/>configs_*.extxyz (trajectory)")]
+    analysis["<b>Analysis</b><br/>analysis: MBAR, C_V, export<br/>plotting · runner"]
+    setup --> sampling --> records --> analysis
+
+    classDef store fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    class records store

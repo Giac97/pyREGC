@@ -71,13 +71,13 @@ for T_K in (350.0, 450.0):
 for mu_H in (-0.2, 0.8):
     p_bar = reservoir.pressure_pascal(400.0, mu_H) / 1e5
     print(f"\nmu_H = {mu_H:+.1f} eV at 400 K  <->  p(H2) = {p_bar:.3e} bar")
-print("So the simulated mu_H window contains the whole lab-relevant 1e-4 to 1e6 atm range.")
+print("So the simulated mu_H window contains the whole lab-relevant 1e-4 to 1e6 bar range.")
 
 # =============================================================================
 # 3. The actual simulation -- identical setup to examples/05_emt_metal_surface.py,
 #    on a mu_H grid. Step 2 shows how that axis maps to real pressure:
 #    -0.2 to 0.8 eV spans ~1e-19 to ~2e7 bar at 400 K, so the realistic
-#    1e-4 to 1e6 atm window (mu_H ~ +0.3 to +0.75 eV) lies inside it;
+#    1e-4 to 1e6 bar window (mu_H ~ +0.3 to +0.75 eV) lies inside it;
 #    examples/07 plots the same samples on a pressure axis.
 # =============================================================================
 slab = fcc111(METAL, size=(4, 4, 3), vacuum=8.0, orthogonal=True, periodic=False)
@@ -132,7 +132,7 @@ if __name__ == "__main__":
         ax.set_xlabel("mu_H (eV)")
         ax.set_ylabel("temperature (K)")
         ax.set_title(f"{METAL}(111) + H via EMT: coverage(T, mu_H)\n"
-                      f"(1e-4 to 1e6 atm H2 corresponds to mu_H ~ +0.3 to +0.75 eV)")
+                      f"(1e-4 to 1e6 bar H2 corresponds to mu_H ~ +0.3 to +0.75 eV)")
         fig.colorbar(mesh, ax=ax, label="coverage (H / Angstrom^2)")
         fig.tight_layout()
         fig.savefig("real_units_phase_diagram.png", dpi=150)

@@ -72,3 +72,16 @@ def test_N_ads_missing_is_a_clear_error():
         sim.run(n_cycles=10, sweeps_per_cycle=5, record_every=2, verbose=False)
     with pytest.raises(ValueError, match="adsorbed_cutoff"):
         MBARSurfaceAnalysis(sim).phase_diagram([1.0], [-2.0], observable="N_ads")
+
+
+def test_resume_refuses_a_changed_adsorbed_cutoff(tmp_path):
+    path = str(tmp_path / "c.pkl")
+    with ReplicaExchangeGCMC([1.0], [-2.0, 0.0], _slab, seed=3, adsorbed_cutoff=1.0) as sim:
+        sim.run_regc(n_steps=20, x0=0.8, record_every=5, verbose=False)
+        sim.save_checkpoint(path)
+    with ReplicaExchangeGCMC([1.0], [-2.0, 0.0], _slab, seed=3, adsorbed_cutoff=3.0) as other:
+        with pytest.raises(ValueError, match="adsorbed_cutoff"):
+            other.load_checkpoint(path)
+    with ReplicaExchangeGCMC([1.0], [-2.0, 0.0], _slab, seed=3) as other:
+        with pytest.raises(ValueError, match="adsorbed_cutoff"):
+            other.load_checkpoint(path)

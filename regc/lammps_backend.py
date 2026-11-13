@@ -28,6 +28,7 @@ lazily in the receiving process.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import warnings
 from typing import Optional, Sequence
@@ -37,6 +38,8 @@ import numpy as np
 from .calculators import Calculator
 
 KB_EV_PER_K = 8.617333262e-5
+# LAMMPS metal units: m v^2 in amu (A/ps)^2 -> eV
+MVV2E_METAL = 1.66053906660e-27 * 1.0e4 / 1.602176634e-19
 
 # LAMMPS instances shared by all LammpsCalculators of this process with the same
 # pair commands, species, masses and box: a worker process then loads the
@@ -54,6 +57,45 @@ LAMMPS_NAME_ENV = "REGC_LAMMPS_NAME"
 # the same process binds part of its calls to the first one's symbols: the two
 # must never be mixed in one process.
 _LOADED_LIBRARY: Optional[str] = None
+
+# What each LAMMPS instance currently holds (keyed by id(lmp)): atom count, types, box,
+# and whether it has been set up since its last change of fixes (MD). With the same atoms
+# only the positions are sent and the energy comes from `run 1 pre no` (one step, no
+# integrator), which skips LAMMPS's setup -- most of the cost of an energy call -- while
+# still refreshing ghost atoms and rebuilding neighbour lists when atoms moved too far.
+_LOADED: dict = {}
+_ENERGY_CACHE_SIZE = 2   # the configurations before and after the last trial move
+# REGC_LAMMPS_FAST=0 turns the fast path, the energy cache and the MD end-energy hand-off
+# off (every evaluation is a full reload + setup): for checks and benchmarks.
+FAST_ENV = "REGC_LAMMPS_FAST"
+
+
+def _fast() -> bool:
+    """
+    Whether the fast evaluation path is enabled.
+
+    Returns
+    -------
+    bool
+        False only if the environment variable ``REGC_LAMMPS_FAST`` is ``'0'``.
+    """
+    return os.environ.get(FAST_ENV, "1") != "0"
+
+
+
+def _preload_h5py() -> None:
+    """
+    Import h5py (if installed) before the LAMMPS library is loaded.
+
+    A conda LAMMPS can link another HDF5 than h5py's; whichever loads
+    first wins, and h5py imported after it fails ("Not a datatype"). Loading
+    h5py first keeps per-sample records (`regc.records`) usable in LAMMPS
+    runs; LAMMPS itself works with either.
+    """
+    try:
+        import h5py  # noqa: F401
+    except Exception:  # not installed (or broken): nothing to protect
+        pass
 
 
 def resolve_lammps_name(lammps_name: Optional[str] = None) -> str:
@@ -122,6 +164,7 @@ def open_lammps(lammps_name: Optional[str] = None,
         If this process already uses another LAMMPS library.
     """
     global _LOADED_LIBRARY
+    _preload_h5py()
     import lammps as lammps_module
     name = resolve_lammps_name(lammps_name)
     if _LOADED_LIBRARY is not None and name != _LOADED_LIBRARY:
@@ -347,6 +390,7 @@ class LammpsCalculator(Calculator):
         state = self.__dict__.copy()
         state['_lmp'] = None  # not picklable; rebuilt on first use
         state['_box_key'] = None
+        state.pop('_run0', None)
         return state
 
     def _mass(self, s: str) -> float:
@@ -482,6 +526,7 @@ class LammpsCalculator(Calculator):
         cmds += ["neighbor 1.0 bin", "neigh_modify every 1 delay 0 check yes",
                  "thermo_style custom step pe", "thermo 0"]
         lmp.commands_list(cmds)
+        _LOADED.pop(id(lmp), None)
         self._lmp = lmp
         self._H = H
         self._Hinv = np.linalg.inv(H)
@@ -495,7 +540,12 @@ class LammpsCalculator(Calculator):
         Positions are wrapped into the cell along periodic axes; along the
         others the box grows (a new instance) if an atom or wall lies
         outside it. Atom ids follow `full_configuration`'s order (frozen
-        1..n_frozen, then substrate, then mobile).
+        1..n_frozen, then substrate, then mobile). When the instance already
+        holds the same atoms (count, types, box), only the positions are
+        sent; the run command to use next is left in ``self._run0``:
+        ``run 1 pre no`` (one step without an integrator: no setup, but ghost
+        atoms refreshed and neighbour lists rebuilt when needed), or a full
+        ``run 0`` after any change of atoms or fixes.
 
         Parameters
         ----------
@@ -530,19 +580,39 @@ class LammpsCalculator(Calculator):
             self._setup(system, lo - self.z_padding, hi + self.z_padding)
             self._box_key = key
         lmp = self._lmp
-        lmp.command("delete_atoms group all compress yes")
         n = len(pos)
+        x = pos
         if n:
             frac = pos @ self._Hinv
             for k in range(3):
                 if pbc[k]:
                     frac[:, k] %= 1.0
             x = frac @ self._H
-            types = [self.type_of[str(s)] for s in sp]
-            lmp.create_atoms(n, list(range(1, n + 1)), types, x.ravel().tolist())
+        types = tuple(self.type_of[str(s)] for s in sp)
+        state = _LOADED.get(id(lmp))
+        if (_fast() and state is not None and state["n"] == n and n > 0
+                and state["types"] == types and state["box"] == key):
+            # same atoms: only move them
+            lmp.scatter_atoms("x", 1, 3, (ctypes.c_double * (3 * n))(*x.ravel()))
+            if state["valid"]:
+                # one step without integrator: LAMMPS refreshes the ghost atoms, or
+                # rebuilds the neighbour lists itself if an atom moved more than half
+                # the skin (neigh_modify check yes); `run 0 pre no` would skip the
+                # ghost update and give wrong energies
+                self._run0 = "run 1 pre no post no"
+            else:
+                self._run0 = "run 0 post no"
+                state["valid"] = True
+            return system.frozen_positions.shape[0]
+        lmp.command("delete_atoms group all compress yes")
+        if n:
+            lmp.create_atoms(n, list(range(1, n + 1)), list(types), x.ravel().tolist())
             if lmp.get_natoms() != n:
+                _LOADED.pop(id(lmp), None)
                 raise RuntimeError(f"LAMMPS kept {lmp.get_natoms()} of {n} atoms "
                                    "(an atom outside the box?)")
+        _LOADED[id(lmp)] = {"n": n, "types": types, "box": key, "valid": True}
+        self._run0 = "run 0 post no"
         return system.frozen_positions.shape[0]
 
     def _gather(self, name: str, n: int) -> np.ndarray:
@@ -595,6 +665,11 @@ class LammpsCalculator(Calculator):
         """
         Potential energy of the full configuration (``run 0``).
 
+        The energies of the last two configurations are cached (exact
+        match of positions, species and cell), so the energy before a
+        trial move -- the configuration evaluated at the previous move --
+        costs nothing; see also `_load` for the cheap re-evaluation.
+
         Parameters
         ----------
         system : ParticleSystem
@@ -606,13 +681,23 @@ class LammpsCalculator(Calculator):
             The LAMMPS potential energy in eV (0 for an empty system;
             +inf if the optional hard core is violated).
         """
-        if system.full_configuration()[0].shape[0] == 0:
+        pos, sp = system.full_configuration()
+        if pos.shape[0] == 0:
             return 0.0
         if self._violates_hard_core(system):
             return np.inf
+        key = (np.ascontiguousarray(pos, dtype=float).tobytes(), tuple(map(str, sp)),
+               np.asarray(system.cell, dtype=float).tobytes())
+        cache = self.__dict__.setdefault("_energy_cache", {})
+        if key in cache and _fast():   # e.g. the energy before a trial move
+            return cache[key]
         self._load(system)
-        self._lmp.command("run 0 post no")
-        return float(self._lmp.get_thermo("pe"))
+        self._lmp.command(self._run0)
+        energy = float(self._lmp.get_thermo("pe"))
+        cache[key] = energy
+        while len(cache) > _ENERGY_CACHE_SIZE:
+            cache.pop(next(iter(cache)))
+        return energy
 
     def forces(self, system) -> np.ndarray:
         """
@@ -633,21 +718,47 @@ class LammpsCalculator(Calculator):
         if n_tot - n_fr == 0:
             return np.zeros((0, 3))
         self._load(system)
-        self._lmp.command("run 0 post no")
+        self._lmp.command(self._run0)
         return self._gather("f", n_tot)[n_fr:]
+
+    def energy_after_md(self, system) -> float:
+        """
+        Potential energy of the configuration `run_md` just produced.
+
+        Parameters
+        ----------
+        system : ParticleSystem
+            The system after its positions were updated from `run_md`.
+
+        Returns
+        -------
+        float
+            The LAMMPS potential energy of the segment's last step (no
+            re-evaluation), +inf if the optional hard core is violated.
+        """
+        if not _fast():
+            return self.total_energy(system)
+        if self._violates_hard_core(system):
+            return np.inf
+        return self.last_md_energy
 
     # -- native MD -----------------------------------------------------------------
     def run_md(self, system, n_steps: int, temperature_eV: float, timestep_fs: float,
-               taut_fs: float, seed: int, thermostat: str = "bussi") -> np.ndarray:
+               taut_fs: float, seed: int, thermostat: str = "bussi",
+               friction_per_fs: Optional[float] = None) -> np.ndarray:
         """
         One NVT MD segment inside LAMMPS.
 
-        Fresh Maxwell-Boltzmann velocities at T for the moving atoms
-        (exact: momenta and positions are independent in the canonical
-        ensemble), ``fix nve`` + ``fix temp/csvr`` (Bussi; or ``langevin``),
-        ``fix wall/reflect`` at the system's hard walls (`md_wall_bounds`:
-        the z-walls of a slab, the six faces of a cluster box), frozen
-        atoms excluded from integration.
+        Fresh Maxwell-Boltzmann velocities at T for the moving atoms, drawn
+        here (not with ``velocity create``, which rescales the draw to
+        exactly T and fails for a single atom), so the start is an exact
+        canonical momentum sample; ``fix nve`` + ``fix temp/csvr`` (Bussi;
+        or ``langevin``), ``fix wall/reflect`` at the system's hard walls
+        (`md_wall_bounds`: the z-walls of a slab, the six faces of a
+        cluster box), frozen atoms excluded from integration. The Bussi
+        thermostat's temperature counts 3N degrees of freedom (``extra/dof
+        0``): frozen atoms and walls break momentum conservation, and the
+        ASE path (`Replica._diffuse_md`) counts the same.
 
         Parameters
         ----------
@@ -658,11 +769,14 @@ class LammpsCalculator(Calculator):
         temperature_eV : float
             k_B T in eV.
         timestep_fs, taut_fs : float
-            Time step and thermostat time constant, in fs.
+            Time step and Bussi thermostat time constant, in fs.
         seed : int
             Random seed (velocities and thermostat).
         thermostat : str, optional
             ``'bussi'`` (default) or ``'langevin'``.
+        friction_per_fs : float, optional
+            Langevin friction in 1/fs (damping time 1/friction), as in the
+            ASE path. Default None: damping time `taut_fs`.
 
         Returns
         -------
@@ -675,26 +789,35 @@ class LammpsCalculator(Calculator):
         ValueError
             If `thermostat` is unknown.
         """
+        if thermostat not in ("bussi", "langevin"):
+            raise ValueError(f"thermostat must be 'bussi' or 'langevin', got {thermostat!r}")
         n_fr = self._load(system)
-        n_tot = system.full_configuration()[0].shape[0]
+        _, species = system.full_configuration()
+        n_tot = len(species)
         lmp = self._lmp
         T_K = temperature_eV / KB_EV_PER_K
         seed = int(seed) % 900000000 + 1
+        # Maxwell-Boltzmann velocities in metal units (A/ps): v = sqrt(kT / (m mvv2e))
+        masses = np.array([self._mass(str(sp)) for sp in species[n_fr:]])
+        sigma = np.sqrt(temperature_eV / (masses * MVV2E_METAL))
+        v = np.zeros((n_tot, 3))
+        v[n_fr:] = np.random.default_rng(seed).standard_normal((n_tot - n_fr, 3)) * sigma[:, None]
+        lmp.scatter_atoms("v", 1, 3, (ctypes.c_double * (3 * n_tot))(*v.ravel()))
         cmds = []
         if n_fr:
             cmds += [f"group frozen id 1:{n_fr}", "group mobile subtract all frozen"]
         else:
             cmds += ["group mobile union all"]
-        cmds += [f"velocity mobile create {_f(T_K)} {seed} dist gaussian mom no rot no",
-                 f"timestep {_f(timestep_fs / 1000.0)}", "fix gcmc_nve mobile nve"]
+        cmds += [f"timestep {_f(timestep_fs / 1000.0)}", "fix gcmc_nve mobile nve"]
         if thermostat == "bussi":
-            cmds.append(f"fix gcmc_thermo mobile temp/csvr {_f(T_K)} {_f(T_K)} "
-                        f"{_f(taut_fs / 1000.0)} {seed + 1}")
-        elif thermostat == "langevin":
-            cmds.append(f"fix gcmc_thermo mobile langevin {_f(T_K)} {_f(T_K)} "
-                        f"{_f(taut_fs / 1000.0)} {seed + 1}")
+            cmds += ["compute gcmc_temp mobile temp", "compute_modify gcmc_temp extra/dof 0",
+                     f"fix gcmc_thermo mobile temp/csvr {_f(T_K)} {_f(T_K)} "
+                     f"{_f(taut_fs / 1000.0)} {seed + 1}",
+                     "fix_modify gcmc_thermo temp gcmc_temp"]
         else:
-            raise ValueError(f"thermostat must be 'bussi' or 'langevin', got {thermostat!r}")
+            damp_fs = taut_fs if friction_per_fs is None else 1.0 / friction_per_fs
+            cmds.append(f"fix gcmc_thermo mobile langevin {_f(T_K)} {_f(T_K)} "
+                        f"{_f(damp_fs / 1000.0)} {seed + 1}")
         pbc = self._pbc(system)
         faces = [f"{ax}lo {_f(b[0])} {ax}hi {_f(b[1])}"
                  for ax, b, p in zip("xyz", self._walls(system), pbc) if b is not None and not p]
@@ -703,7 +826,14 @@ class LammpsCalculator(Calculator):
         lmp.commands_list(cmds)
         lmp.command(f"run {int(n_steps)} post no")
         x = self._gather("x", n_tot)
+        # the potential energy of the end point (thermo is evaluated on the last step):
+        # spares a full re-evaluation after the segment (see `energy_after_md`)
+        self.last_md_energy = float(lmp.get_thermo("pe"))
+        state = _LOADED.get(id(lmp))
+        if state is not None:   # fixes were added and removed: the next run needs a setup
+            state["valid"] = False
         lmp.commands_list(["unfix gcmc_nve", "unfix gcmc_thermo"]
                           + (["unfix gcmc_walls"] if faces else [])
+                          + (["uncompute gcmc_temp"] if thermostat == "bussi" else [])
                           + ["group mobile delete"] + (["group frozen delete"] if n_fr else []))
         return x[n_fr:]

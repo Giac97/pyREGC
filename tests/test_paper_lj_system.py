@@ -161,11 +161,15 @@ def test_hex_ideal_gas_density_exact():
 def _naive_run_regc(sim, n_steps, x0, record_every, mode, n):
     """Reference: the step-by-step loop that run_regc's blocks must equal."""
     samples = {k: {'U': [], 'N': []} for k in sim.grid}
+    usable = [(t, p) for t in SWAP_TYPES for p in (0, 1) if sim.swap_pairs(t, p)]
     for step in range(1, n_steps + 1):
         do_gc = bool(sim.rng.random() < x0)
         if not do_gc:
-            t = SWAP_TYPES[int(sim.rng.integers(len(SWAP_TYPES)))]
-            sim._exchange_round(t, int(sim.rng.integers(2)))
+            if sim.skip_empty_swaps:
+                sim._exchange_round(*usable[int(sim.rng.integers(len(usable)))])
+            else:
+                t = SWAP_TYPES[int(sim.rng.integers(len(SWAP_TYPES)))]
+                sim._exchange_round(t, int(sim.rng.integers(2)))
         for r in sim.grid.values():
             r.regc_local_step(do_gc, mode, n)
         if step % record_every == 0:
@@ -175,14 +179,15 @@ def _naive_run_regc(sim, n_steps, x0, record_every, mode, n):
     return samples
 
 
+@pytest.mark.parametrize("skip", [True, False], ids=["skip_empty", "all_patterns"])
 @pytest.mark.parametrize("x0", [0.99, 0.5])
-def test_block_execution_equals_naive_loop(x0):
+def test_block_execution_equals_naive_loop(x0, skip):
     def make(rng):
         return LJSystem(5.0, LJCalculator(1.0, 1.0, 2.5))
     args = ([0.9, 1.2], [[-3.5, -3.0], [-3.5, -3.0]], make)
-    ref = ReplicaExchangeGCMC(*args, seed=21)
+    ref = ReplicaExchangeGCMC(*args, seed=21, skip_empty_swaps=skip)
     expected = _naive_run_regc(ref, 400, x0, 7, 'mc_moves', 3)
-    sim = ReplicaExchangeGCMC(*args, seed=21)
+    sim = ReplicaExchangeGCMC(*args, seed=21, skip_empty_swaps=skip)
     sim.run_regc(n_steps=400, x0=x0, diffusion='mc_moves', diffusion_steps=3,
                  record_every=7, verbose=True)  # verbose adds block boundaries too
     assert sim.samples == expected

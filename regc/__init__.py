@@ -34,8 +34,13 @@ Running and analysing
 ---------------------
 driver    run_with_checkpoints, RunStatus, EXIT_RESUBMIT -- long/batch runs
 io        save_samples, load_samples, SampleSet
-analysis  MBARSurfaceAnalysis  (needs pymbar)
-plotting  plot_phase_diagram   (needs matplotlib)
+observables  CoordinationNumber, CoordinationHistogram, RadialDistribution,
+             FunctionObservable -- structural observables recorded with every sample
+analysis  MBARSurfaceAnalysis, heat_capacity_ridges, export_phase_configurations
+          (needs pymbar)
+diagnostics  statistical_inefficiency, replica_inefficiencies, bootstrap,
+             neighbour_overlap, ridge_support -- how far to trust a map (needs pymbar)
+plotting  plot_phase_diagram, plot_map, plot_radial_distribution  (needs matplotlib)
 runner    run_from_config      -- the YAML/JSON-driven pipeline
 
 Optional dependencies are imported lazily, inside the functions that need
@@ -58,8 +63,11 @@ from .pressure import (
     p0_reduced_units,
     pressure_from_mu,
 )
-from .analysis import MBARSurfaceAnalysis
-from .plotting import plot_phase_diagram
+from .analysis import MBARSurfaceAnalysis, export_phase_configurations, heat_capacity_ridges
+from .observables import (CoordinationHistogram, CoordinationNumber, FunctionObservable,
+                          Observable, RadialDistribution)
+from .plotting import plot_map, plot_phase_diagram, plot_radial_distribution
+from .records import RecordWriter, Records, attach_energies, reevaluate
 from .units import (
     PRESSURE_UNITS,
     SpeciesLambdaCubed,
@@ -124,7 +132,13 @@ __all__ = [
     # running and analysis
     "run_with_checkpoints", "RunStatus", "EXIT_RESUBMIT",
     "save_samples", "load_samples", "SampleSet",
-    "MBARSurfaceAnalysis", "plot_phase_diagram",
+    "MBARSurfaceAnalysis", "plot_phase_diagram", "plot_map", "plot_radial_distribution",
+    "heat_capacity_ridges", "export_phase_configurations",
+    # observables
+    "Observable", "CoordinationNumber", "CoordinationHistogram", "RadialDistribution",
+    "FunctionObservable",
+    # per-sample records and other potentials
+    "RecordWriter", "Records", "attach_energies", "reevaluate",
 ]
 
 try:  # written by setuptools-scm at install time, from the git tag (see pyproject.toml)

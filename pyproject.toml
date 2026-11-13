@@ -37,7 +37,8 @@ ase = ["ase>=3.23"]                          # EAM/EMT/MLIP calculators, structu
 mbar = ["pymbar>=4.0", "scipy>=1.7"]         # MBAR reweighting / phase diagrams
 plot = ["matplotlib>=3.5"]
 yaml = ["pyyaml>=6.0"]                       # YAML configs for regc-run
-all = ["regc[ase,mbar,plot,yaml]"]
+records = ["h5py>=3.0"]                      # per-sample records, re-evaluation with other potentials
+all = ["regc[ase,mbar,plot,yaml,records]"]
 dev = ["regc[all]", "pytest>=7.0", "build"]
 # LAMMPS (LammpsCalculator) is deliberately not an extra: install it from conda-forge
 # (see environment.yml) or build it yourself (hpc/build_lammps.sh, e.g. for grace/fs).
@@ -45,6 +46,8 @@ dev = ["regc[all]", "pytest>=7.0", "build"]
 [project.scripts]
 regc-run = "regc.runner:main"
 gcmc-re-run = "regc.runner:main"          # former name, kept for existing batch scripts
+regc-reevaluate = "regc.runner:reevaluate_main"
+regc-monitor = "regc.monitor:main"
 
 [tool.setuptools_scm]
 # The version comes from git: a tag vX.Y.Z gives X.Y.Z; commits after it give

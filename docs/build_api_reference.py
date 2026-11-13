@@ -39,9 +39,11 @@ MODULE_ORDER = [
     ("reservoir", "Gas reservoirs"),
     ("analysis", "MBAR analysis"),
     ("plotting", "Plotting"),
+    ("records", "Per-sample records and other potentials"),
 ]
 RUNNER_FUNCS = ["load_config", "validate_config", "setup_from_config", "run_from_config",
-                "analyze_from_config", "check_config", "main"]
+                "analyze_from_config", "check_config", "reevaluate_from_config", "main",
+                "reevaluate_main"]
 LIST_SECTIONS = {"Parameters", "Other Parameters", "Returns", "Yields", "Raises", "Attributes",
                  "Warns"}
 

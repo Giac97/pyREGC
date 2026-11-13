@@ -1,0 +1,13 @@
+stateDiagram-v2
+    accTitle: Life cycle of a checkpointed run
+    accDescr: A run is set up, then alternates sampling chunks and checkpoints; a time limit ends the job with exit code 75 for resubmission, a resumed run reloads the checkpoint, and the run ends when the steps are done or the convergence test passes.
+
+    [*] --> setup
+    setup --> chunk: fresh start (metadata saved)
+    chunk --> checkpoint: chunk steps done
+    checkpoint --> chunk: time left
+    checkpoint --> stopped: next chunk would pass the time limit
+    stopped --> resumed: resubmit (exit code 75)
+    resumed --> chunk: checkpoint and metadata match
+    checkpoint --> finished: n_steps done or ρ(u) converged
+    finished --> [*]

@@ -14,7 +14,7 @@ lammps = pytest.importorskip("lammps", reason="LAMMPS Python module not installe
 pytest.importorskip("ase", reason="pip install ase")
 
 from regc import ReplicaExchangeGCMC, SlabLJSystem, kelvin_to_eV  # noqa: E402
-from regc.lammps_backend import LammpsCalculator  # noqa: E402
+from regc.lammps_backend import MVV2E_METAL, LammpsCalculator  # noqa: E402
 from regc.replica import Replica  # noqa: E402
 from regc.state import ThermoState  # noqa: E402
 
@@ -169,24 +169,47 @@ def test_native_md_segment(eam_file):
     assert rep.energy == pytest.approx(system.total_energy(), abs=1e-8)
 
 
-def test_native_md_thermostat_reaches_temperature(eam_file):
-    """Bussi thermostat: the time-averaged kinetic temperature of the moving
-    atoms over a long segment is the target T."""
-    calc = _lmp_calc(eam_file)
-    system = _bcc110_slab(calc, n_h=0)
-    T_K = 500.0
-    calc.run_md(system, 10, kelvin_to_eV(T_K), 0.5, 20.0, seed=7)  # sets up the instance
-    lmp = calc._lmp
-    n_fr = calc._load(system)
-    lmp.commands_list(["reset_timestep 0", f"group frozen id 1:{n_fr}",
-                       "group mobile subtract all frozen",
-                       f"velocity mobile create {T_K} 11 dist gaussian mom no rot no",
-                       "timestep 0.0005", "fix a mobile nve",
-                       f"fix b mobile temp/csvr {T_K} {T_K} 0.02 12",
-                       "compute tm mobile temp", "fix ave all ave/time 1 4000 4000 c_tm",
-                       "run 4000 post no"])
-    t_avg = lmp.extract_fix("ave", 0, 0)
-    assert t_avg == pytest.approx(T_K, rel=0.1)
+def _few_atoms_on_frozen_block(n_mobile):
+    """Free particles (pair_style zero) above a frozen block, inside reflecting
+    z-walls: no momentum is conserved, so all 3N degrees of freedom are thermal."""
+    calc = LammpsCalculator(["pair_style zero 3.0", "pair_coeff * *"], ["Fe", "H"])
+    a = 2.62
+    layer = np.array([[i * a, j * a, 0.0] for i in range(3) for j in range(3)])
+    rng = np.random.default_rng(0)
+    h = np.column_stack([rng.random((n_mobile, 2)) * 3 * a, 2.0 + 3.0 * rng.random(n_mobile)])
+    return SlabLJSystem(3 * a, 3 * a, 8.0, calc, exchange_species="H",
+                        frozen_positions=layer, frozen_species=np.array(["Fe"] * 9),
+                        positions=h)
+
+
+@pytest.mark.parametrize("thermostat", ["bussi", "langevin"])
+def test_native_md_kinetic_temperature_of_few_atoms(thermostat):
+    """run_md's own velocities and thermostat give <KE> = (3N/2) kT, also for
+    N = 2 moving atoms. ``velocity create`` (rescaled to exactly T) and the
+    default 3N - 3 thermostat dof gave <KE> / (3N/2 kT) = 0.55 here."""
+    system = _few_atoms_on_frozen_block(2)
+    calc = system.calculator
+    T = kelvin_to_eV(500.0)
+    n_fr = system.frozen_positions.shape[0]
+    ke = []
+    for seg in range(300):
+        calc.run_md(system, 40, T, 1.0, 20.0, seed=seg, thermostat=thermostat)
+        v = calc._gather("v", n_fr + system.n)[n_fr:]
+        m = calc._mass("H")
+        ke.append(0.5 * m * MVV2E_METAL * np.sum(v ** 2))
+    ratio = np.mean(ke) / (1.5 * system.n * T)
+    assert ratio == pytest.approx(1.0, abs=0.12)
+
+
+def test_native_md_with_a_single_moving_atom():
+    """One moving atom over a frozen block: ``velocity create`` used to abort
+    ("Attempting to rescale a 0.0 temperature")."""
+    system = _few_atoms_on_frozen_block(1)
+    rep = Replica(ThermoState(kelvin_to_eV(300.0), -2.0, (0, 0)), system,
+                  np.random.default_rng(1))
+    z0 = system.positions.copy()
+    rep.diffuse('md', n=50, timestep_fs=1.0, taut_fs=20.0)
+    assert not np.allclose(system.positions, z0)
 
 
 def test_hard_core_and_md_revert(eam_file):
@@ -315,3 +338,69 @@ def test_named_build_matches_default_for_eam(eam_file, tmp_path):
             raise AssertionError(res.stderr[-2000:])
         results[name] = np.load(out)
     np.testing.assert_allclose(results["grace"], results[""], atol=1e-8)
+
+
+def test_fast_path_equals_full_setup_over_a_random_walk(eam_file, monkeypatch):
+    """Same atoms: positions scattered + `run 1 pre no`; after insert/delete/MD: a full
+    reload. Every energy must equal a full setup on a separate LAMMPS instance, including
+    moves across the periodic boundary and beyond half the neighbour skin."""
+    from regc.lammps_backend import _LOADED
+    system = _bcc110_slab(_lmp_calc(eam_file), n_h=4)
+    calc = system.calculator
+    ref = _lmp_calc(eam_file, z_padding=5.0001)          # another box: another instance
+
+    def reference():
+        ref._load(system)
+        ref._lmp.command("run 0 post no")
+        return float(ref._lmp.get_thermo("pe"))
+    rng = np.random.default_rng(3)
+    Lx = system.cell[0]
+    n_fast = 0
+    for k in range(400):
+        r = rng.random()
+        if r < 0.55 and system.n:
+            i = rng.integers(system.n)
+            system.apply_move(i, system.positions[i] + rng.uniform(-0.2, 0.2, 3))
+        elif r < 0.65 and system.n:
+            i = rng.integers(system.n)
+            system.apply_move(i, system.positions[i] + rng.uniform(-1.5, 1.5, 3))
+        elif r < 0.72 and system.n:
+            i = rng.integers(system.n)
+            p = system.positions[i].copy()
+            p[0] = Lx + 0.02                              # wraps to the other side
+            system.apply_move(i, p)
+        elif r < 0.82:
+            system.apply_insert(system.random_insertion_position(rng))
+        elif r < 0.92 and system.n > 1:
+            system.apply_delete(rng.integers(system.n))
+        else:
+            new = calc.run_md(system, 10, kelvin_to_eV(500.0), 0.5, 20.0, seed=k)
+            for j in range(system.n_substrate):
+                system.apply_move_substrate(j, new[j])
+            for j in range(system.n):
+                system.apply_move(j, new[system.n_substrate + j])
+            assert calc.energy_after_md(system) == pytest.approx(reference(), abs=1e-9)
+        calc.__dict__.pop("_energy_cache", None)          # test the evaluation itself
+        e = calc.total_energy(system)
+        n_fast += "pre no" in calc._run0
+        assert e == pytest.approx(reference(), abs=1e-9)
+    assert n_fast > 150
+    # the switch restores the full path, and the cache returns what it stored
+    monkeypatch.setenv("REGC_LAMMPS_FAST", "0")
+    assert calc.total_energy(system) == pytest.approx(reference(), abs=1e-9)
+    assert "pre no" not in calc._run0
+    monkeypatch.delenv("REGC_LAMMPS_FAST")
+    e1 = calc.total_energy(system)
+    assert calc.total_energy(system) == e1
+
+
+def test_md_end_energy_matches_a_full_evaluation(eam_file):
+    calc = _lmp_calc(eam_file)
+    system = _slab(calc)
+    rep = Replica(ThermoState(kelvin_to_eV(600.0), -2.0, (0, 0)), system, np.random.default_rng(4))
+    rep.diffuse('md', n=50, timestep_fs=0.5, taut_fs=20.0)
+    fresh = _lmp_calc(eam_file, z_padding=5.0002)
+    fresh._load(system)
+    fresh._lmp.command("run 0 post no")
+    assert rep.energy == pytest.approx(float(fresh._lmp.get_thermo("pe")) +
+                                       system.external_energy_total(), abs=1e-8)

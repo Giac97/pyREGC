@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import functools
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional, Sequence, Tuple, Union
 
@@ -53,6 +54,7 @@ from .units import (AMU, BOLTZMANN_K_SI, EV_IN_JOULES, PLANCK_H, ThermalWaveleng
                     thermal_wavelength_cubed_angstrom3)
 
 PLANCK_HBAR = PLANCK_H / (2.0 * math.pi)
+SPEED_OF_LIGHT_CM_PER_S = 2.99792458e10
 
 # Standard experimental H2 spectroscopic constants (calculator-independent --
 # real physics of the gas-phase molecule, not tied to any particular
@@ -63,6 +65,27 @@ H2_VIBRATIONAL_WAVENUMBER_CM = 4401.2
 H_MASS_AMU = 1.008
 H2_MASS_AMU = 2.016
 H2_D0_EXPERIMENTAL_EV = 4.478   # zero-point-corrected dissociation energy of H2
+
+# Degeneracy of the electronic ground state of homonuclear diatomics that are not
+# closed-shell singlets (O2: triplet 3Sigma_g^-); every other element defaults to 1.
+ELECTRONIC_GROUND_STATE_DEGENERACY = {"O": 3}
+
+
+def default_electronic_degeneracy(symbol: str) -> int:
+    """
+    Electronic ground-state degeneracy of the X2 molecule of element `symbol`.
+
+    Parameters
+    ----------
+    symbol : str
+        Element symbol.
+
+    Returns
+    -------
+    int
+        3 for O (triplet O2), 1 otherwise.
+    """
+    return ELECTRONIC_GROUND_STATE_DEGENERACY.get(symbol, 1)
 
 
 def diatomic_dissociation_energy_eV(ase_calculator, symbol: str,
@@ -168,9 +191,53 @@ def diatomic_dissociation_energy_eV(ase_calculator, symbol: str,
     }
 
 
+def _diatomic_p0_and_q_internal(T_kelvin: float, mass_molecule_amu: float,
+                                bond_length_angstrom: float, vib_wavenumber_cm: float,
+                                symmetry_number: int, electronic_degeneracy: int
+                                ) -> Tuple[float, float]:
+    """
+    Reference pressure and internal partition function of a homonuclear diatomic.
+
+    Parameters
+    ----------
+    T_kelvin : float
+        Temperature, in Kelvin.
+    mass_molecule_amu : float
+        Molecular mass, in atomic mass units.
+    bond_length_angstrom : float
+        Equilibrium bond length, in Angstrom.
+    vib_wavenumber_cm : float
+        Vibrational wavenumber, in cm^-1.
+    symmetry_number : int
+        Rotational symmetry number.
+    electronic_degeneracy : int
+        Degeneracy of the electronic ground state.
+
+    Returns
+    -------
+    tuple of float
+        ``(p0_pascal, q_internal)``: k_B T / Lambda_mol^3 in Pascal, and
+        g_el * q_rot * q_vib (q_vib measured from the v = 0 level), so that
+        mu_molecule = k_B T ln(p / p0) - k_B T ln(q_internal).
+    """
+    lam_m = thermal_wavelength_angstrom(T_kelvin, mass_molecule_amu) * 1.0e-10
+    p0_pascal = BOLTZMANN_K_SI * T_kelvin / lam_m ** 3
+
+    # homonuclear: reduced mass = m_atom / 2 = m_molecule / 4
+    r_m = bond_length_angstrom * 1.0e-10
+    reduced_mass_kg = (mass_molecule_amu * AMU) / 4.0
+    I = reduced_mass_kg * r_m ** 2
+    theta_rot = PLANCK_HBAR ** 2 / (2.0 * I * BOLTZMANN_K_SI)
+    q_rot = T_kelvin / (symmetry_number * theta_rot)
+
+    theta_vib = PLANCK_H * (vib_wavenumber_cm * SPEED_OF_LIGHT_CM_PER_S) / BOLTZMANN_K_SI
+    q_vib = 1.0 / (1.0 - math.exp(-theta_vib / T_kelvin))
+    return p0_pascal, electronic_degeneracy * q_rot * q_vib
+
+
 def diatomic_gas_mu_eV(T_kelvin: float, p_pascal: float, mass_amu: float,
                         bond_length_angstrom: float, vib_wavenumber_cm: float,
-                        symmetry_number: int = 2) -> float:
+                        symmetry_number: int = 2, electronic_degeneracy: int = 1) -> float:
     """
     Compute the chemical potential of a real diatomic gas at (T, p).
 
@@ -183,8 +250,9 @@ def diatomic_gas_mu_eV(T_kelvin: float, p_pascal: float, mass_amu: float,
 
     Uses the classical (high-temperature) rotational partition function,
     valid whenever T is well above the rotational temperature theta_rot
-    (true for H2 -- theta_rot ~ 87 K -- at any remotely ordinary
-    temperature).
+    (H2: 87.6 K; O2: 2.08 K). Against NIST-JANAF at 1 bar it is within
+    ~7 meV per H2 and ~2 meV per O2 (with ``electronic_degeneracy=3``) at
+    300-1000 K.
 
     Parameters
     ----------
@@ -201,33 +269,28 @@ def diatomic_gas_mu_eV(T_kelvin: float, p_pascal: float, mass_amu: float,
     symmetry_number : int, optional
         Rotational symmetry number (2 for a homonuclear diatomic).
         Default is 2.
+    electronic_degeneracy : int, optional
+        Degeneracy of the electronic ground state: 1 for closed-shell
+        molecules (H2, N2, Cl2), 3 for the triplet ground state of O2.
+        Default is 1.
 
     Returns
     -------
     float
         The molecule's chemical potential, in eV.
     """
+    p0_pascal, q_int = _diatomic_p0_and_q_internal(
+        T_kelvin, mass_amu, bond_length_angstrom, vib_wavenumber_cm, symmetry_number,
+        electronic_degeneracy)
     T_eV = kelvin_to_eV(T_kelvin)
-    lam_m = thermal_wavelength_angstrom(T_kelvin, mass_amu) * 1.0e-10
-    T_J = BOLTZMANN_K_SI * T_kelvin
-    p0_pascal = T_J / lam_m ** 3
-
-    r_m = bond_length_angstrom * 1.0e-10
-    mu_reduced_kg = (mass_amu * AMU) / 2.0
-    I = mu_reduced_kg * r_m ** 2
-    theta_rot = PLANCK_HBAR ** 2 / (2.0 * I * BOLTZMANN_K_SI)
-    q_rot = T_kelvin / (symmetry_number * theta_rot)
-
-    theta_vib = PLANCK_H * (vib_wavenumber_cm * 2.99792458e10) / BOLTZMANN_K_SI
-    q_vib = 1.0 / (1.0 - math.exp(-theta_vib / T_kelvin))
-
-    return T_eV * math.log(p_pascal / p0_pascal) - T_eV * math.log(q_rot * q_vib)
+    return T_eV * math.log(p_pascal / p0_pascal) - T_eV * math.log(q_int)
 
 
 def mu_atomic_from_diatomic_reservoir_eV(T_kelvin: float, p_pascal: float, D0_eV: float,
                                           mass_molecule_amu: float, bond_length_angstrom: float,
                                           vib_wavenumber_cm: float, symmetry_number: int = 2,
-                                          *, e_atom_eV: float) -> float:
+                                          *, e_atom_eV: float,
+                                          electronic_degeneracy: int = 1) -> float:
     """
     Compute an atomic species' chemical potential from a diatomic reservoir.
 
@@ -261,6 +324,9 @@ def mu_atomic_from_diatomic_reservoir_eV(T_kelvin: float, p_pascal: float, D0_eV
         The calculator's energy of one isolated atom (keyword-only,
         required): the zero of the GCMC energy scale. ``'e_atom_eV'`` from
         `diatomic_dissociation_energy_eV`; 0 for `LJCalculator`.
+    electronic_degeneracy : int, optional
+        Degeneracy of the molecule's electronic ground state (keyword-only;
+        3 for O2). Default is 1.
 
     Returns
     -------
@@ -269,14 +335,16 @@ def mu_atomic_from_diatomic_reservoir_eV(T_kelvin: float, p_pascal: float, D0_eV
         energy scale.
     """
     mu_molecule = diatomic_gas_mu_eV(T_kelvin, p_pascal, mass_molecule_amu,
-                                      bond_length_angstrom, vib_wavenumber_cm, symmetry_number)
+                                      bond_length_angstrom, vib_wavenumber_cm, symmetry_number,
+                                      electronic_degeneracy)
     return 0.5 * (mu_molecule - D0_eV) + e_atom_eV
 
 
 def pressure_from_atomic_mu_reservoir_pascal(T_kelvin: float, mu_atom_eV: float, D0_eV: float,
                                               mass_molecule_amu: float, bond_length_angstrom: float,
                                               vib_wavenumber_cm: float, symmetry_number: int = 2,
-                                              *, e_atom_eV: float) -> float:
+                                              *, e_atom_eV: float,
+                                              electronic_degeneracy: int = 1) -> float:
     """
     Invert `mu_atomic_from_diatomic_reservoir_eV` for the reservoir pressure.
 
@@ -305,28 +373,42 @@ def pressure_from_atomic_mu_reservoir_pascal(T_kelvin: float, mu_atom_eV: float,
     e_atom_eV : float
         The calculator's isolated-atom energy (keyword-only, required);
         see `mu_atomic_from_diatomic_reservoir_eV`.
+    electronic_degeneracy : int, optional
+        Degeneracy of the molecule's electronic ground state (keyword-only;
+        3 for O2). Default is 1.
 
     Returns
     -------
     float
         The reservoir gas pressure, in Pascal.
     """
-    T_eV = kelvin_to_eV(T_kelvin)
-    lam_m = thermal_wavelength_angstrom(T_kelvin, mass_molecule_amu) * 1.0e-10
-    T_J = BOLTZMANN_K_SI * T_kelvin
-    p0_pascal = T_J / lam_m ** 3
-
-    r_m = bond_length_angstrom * 1.0e-10
-    mu_reduced_kg = (mass_molecule_amu * AMU) / 2.0
-    I = mu_reduced_kg * r_m ** 2
-    theta_rot = PLANCK_HBAR ** 2 / (2.0 * I * BOLTZMANN_K_SI)
-    q_rot = T_kelvin / (symmetry_number * theta_rot)
-
-    theta_vib = PLANCK_H * (vib_wavenumber_cm * 2.99792458e10) / BOLTZMANN_K_SI
-    q_vib = 1.0 / (1.0 - math.exp(-theta_vib / T_kelvin))
-
+    p0_pascal, q_int = _diatomic_p0_and_q_internal(
+        T_kelvin, mass_molecule_amu, bond_length_angstrom, vib_wavenumber_cm, symmetry_number,
+        electronic_degeneracy)
     mu_molecule = 2.0 * (mu_atom_eV - e_atom_eV) + D0_eV
-    return p0_pascal * math.exp(mu_molecule / T_eV) * q_rot * q_vib
+    return p0_pascal * math.exp(mu_molecule / kelvin_to_eV(T_kelvin)) * q_int
+
+
+def _pressure_unit(unit: Optional[str]) -> str:
+    """
+    The pressure unit to use; warns when none was given.
+
+    Parameters
+    ----------
+    unit : str or None
+        The unit the caller gave.
+
+    Returns
+    -------
+    str
+        `unit`, or ``'Pa'`` (with a FutureWarning) for None.
+    """
+    if unit is None:
+        warnings.warn("no pressure unit given: assuming Pa. Pass unit= ('Pa', 'bar', 'atm', ...) "
+                      "explicitly; the implicit default will be removed", FutureWarning,
+                      stacklevel=3)
+        return "Pa"
+    return unit
 
 
 # =============================================================================
@@ -399,7 +481,7 @@ class Reservoir:
         raise NotImplementedError
 
     def mu_grid(self, temperatures_K: Sequence[float], pressures: Sequence[float],
-                unit: str = "Pa") -> np.ndarray:
+                unit: Optional[str] = None) -> np.ndarray:
         """
         Chemical potentials of a (temperature x pressure) replica ladder.
 
@@ -410,7 +492,10 @@ class Reservoir:
         pressures : sequence of float
             Pressures, in `unit`.
         unit : str, optional
-            Pressure unit (see `regc.units.PRESSURE_UNITS`). Default ``'Pa'``.
+            Pressure unit (see `regc.units.PRESSURE_UNITS`). Give it
+            explicitly: the default None means Pa, with a FutureWarning
+            (bar is the runner's default, so values in bar would otherwise
+            be read as Pa, a factor 1e5).
 
         Returns
         -------
@@ -418,7 +503,7 @@ class Reservoir:
             Shape (len(temperatures_K), len(pressures)): mu in eV, ready for
             `ReplicaExchangeGCMC`'s 2D ``mus`` argument.
         """
-        f = pascal_per(unit)
+        f = pascal_per(_pressure_unit(unit))
         return np.array([[self.mu_eV(T, p * f) for p in pressures] for T in temperatures_K])
 
     def lambda_cubed_of_T(self) -> ThermalWavelengthCubed:
@@ -433,7 +518,7 @@ class Reservoir:
         """
         return ThermalWavelengthCubed(self.mass_exchanged_amu)
 
-    def mu_at_T_eV(self, T_eV: float, p: float, unit: str = "Pa") -> float:
+    def mu_at_T_eV(self, T_eV: float, p: float, unit: Optional[str] = None) -> float:
         """
         `mu_eV` with the engine's temperature unit (k_B*T in eV).
 
@@ -444,16 +529,16 @@ class Reservoir:
         p : float
             Pressure, in `unit`.
         unit : str, optional
-            Pressure unit. Default ``'Pa'``.
+            Pressure unit. Default None: Pa, with a FutureWarning.
 
         Returns
         -------
         float
             mu, in eV.
         """
-        return self.mu_eV(eV_to_kelvin(T_eV), p * pascal_per(unit))
+        return self.mu_eV(eV_to_kelvin(T_eV), p * pascal_per(_pressure_unit(unit)))
 
-    def pressure_at_T_eV(self, T_eV: float, mu_eV: float, unit: str = "Pa") -> float:
+    def pressure_at_T_eV(self, T_eV: float, mu_eV: float, unit: Optional[str] = None) -> float:
         """
         `pressure_pascal` with the engine's temperature unit, in `unit`.
 
@@ -464,29 +549,32 @@ class Reservoir:
         mu_eV : float
             Chemical potential, in eV.
         unit : str, optional
-            Pressure unit of the result. Default ``'Pa'``.
+            Pressure unit of the result. Default None: Pa, with a
+            FutureWarning.
 
         Returns
         -------
         float
             Pressure, in `unit`.
         """
-        return self.pressure_pascal(eV_to_kelvin(T_eV), mu_eV) / pascal_per(unit)
+        return self.pressure_pascal(eV_to_kelvin(T_eV), mu_eV) / pascal_per(_pressure_unit(unit))
 
-    def analysis_functions(self, unit: str = "Pa") -> Tuple[Callable, Callable]:
+    def analysis_functions(self, unit: Optional[str] = None) -> Tuple[Callable, Callable]:
         """
         The ``(mu_of_Tp, p_of_Tmu)`` pair for `MBARSurfaceAnalysis`.
 
         Parameters
         ----------
         unit : str, optional
-            Pressure unit the analysis will be given/return. Default ``'Pa'``.
+            Pressure unit the analysis will be given/return. Default None:
+            Pa, with a FutureWarning.
 
         Returns
         -------
         tuple of callable
             ``mu_of_Tp(T_eV, p)`` and ``p_of_Tmu(T_eV, mu)`` (picklable).
         """
+        unit = _pressure_unit(unit)
         return (functools.partial(self.mu_at_T_eV, unit=unit),
                 functools.partial(self.pressure_at_T_eV, unit=unit))
 
@@ -596,6 +684,9 @@ class DiatomicReservoir(Reservoir):
         Vibrational wavenumber, in cm^-1.
     symmetry_number : int, optional
         Rotational symmetry number. Default 2 (homonuclear).
+    electronic_degeneracy : int, optional
+        Degeneracy of the molecule's electronic ground state (3 for O2).
+        Default 1; `from_calculator` picks it from the element.
     calculator_info : dict, optional
         Diagnostics of the potential's own molecule (r0, De, D0, ZPE,
         e_atom), as filled in by `from_calculator`. Default None.
@@ -607,6 +698,7 @@ class DiatomicReservoir(Reservoir):
     bond_length_angstrom: float
     vib_wavenumber_cm: float
     symmetry_number: int = 2
+    electronic_degeneracy: int = 1
     calculator_info: Optional[dict] = field(default=None, repr=False)
 
     @property
@@ -632,7 +724,8 @@ class DiatomicReservoir(Reservoir):
         """
         return mu_atomic_from_diatomic_reservoir_eV(
             T_kelvin, p_pascal, self.D0_eV, self.mass_molecule_amu, self.bond_length_angstrom,
-            self.vib_wavenumber_cm, self.symmetry_number, e_atom_eV=self.e_atom_eV)
+            self.vib_wavenumber_cm, self.symmetry_number, e_atom_eV=self.e_atom_eV,
+            electronic_degeneracy=self.electronic_degeneracy)
 
     def pressure_pascal(self, T_kelvin: float, mu_eV: float) -> float:
         """
@@ -652,7 +745,8 @@ class DiatomicReservoir(Reservoir):
         """
         return pressure_from_atomic_mu_reservoir_pascal(
             T_kelvin, mu_eV, self.D0_eV, self.mass_molecule_amu, self.bond_length_angstrom,
-            self.vib_wavenumber_cm, self.symmetry_number, e_atom_eV=self.e_atom_eV)
+            self.vib_wavenumber_cm, self.symmetry_number, e_atom_eV=self.e_atom_eV,
+            electronic_degeneracy=self.electronic_degeneracy)
 
     @classmethod
     def hydrogen(cls, D0_eV: float = H2_D0_EXPERIMENTAL_EV, e_atom_eV: float = 0.0
@@ -682,7 +776,8 @@ class DiatomicReservoir(Reservoir):
                         vib_wavenumber_cm: Optional[float] = None,
                         mass_molecule_amu: Optional[float] = None,
                         symmetry_number: int = 2,
-                        r_scan: Optional[np.ndarray] = None) -> "DiatomicReservoir":
+                        r_scan: Optional[np.ndarray] = None,
+                        electronic_degeneracy: Optional[int] = None) -> "DiatomicReservoir":
         """
         A reservoir consistent with a given potential.
 
@@ -710,6 +805,9 @@ class DiatomicReservoir(Reservoir):
             Rotational symmetry number. Default 2.
         r_scan : numpy.ndarray, optional
             Bond lengths (A) for the coarse scan; default 0.4-3.0 A.
+        electronic_degeneracy : int, optional
+            Electronic ground-state degeneracy of the molecule. Default None:
+            `default_electronic_degeneracy` (3 for O2, 1 otherwise).
 
         Returns
         -------
@@ -745,5 +843,8 @@ class DiatomicReservoir(Reservoir):
         else:
             raise ValueError(f"d0 must be 'self', 'experimental' or a number, got {d0!r}")
         info = dict(info, d0_source=d0 if isinstance(d0, str) else "given")
+        if electronic_degeneracy is None:
+            electronic_degeneracy = default_electronic_degeneracy(symbol)
         return cls(D0, info["e_atom_eV"], mass_molecule_amu, bond_length_angstrom,
-                   vib_wavenumber_cm, symmetry_number, calculator_info=info)
+                   vib_wavenumber_cm, symmetry_number, int(electronic_degeneracy),
+                   calculator_info=info)

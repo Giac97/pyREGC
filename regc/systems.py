@@ -102,8 +102,9 @@ class ParticleSystem:
         Raises
         ------
         ValueError
-            If `exchange_species` is an empty or repeated sequence, or names
-            several species while `positions` is given without `species`.
+            If `exchange_species` is an empty or repeated sequence, names
+            several species while `positions` is given without `species`,
+            or is a single species while `species` contains other labels.
         """
         self.calculator = calculator
         if not isinstance(exchange_species, str):
@@ -119,6 +120,14 @@ class ParticleSystem:
             raise ValueError("several exchange_species: pass species= for the initial positions")
         self.species = (np.array([exchange_species] * self.positions.shape[0])
                          if species is None else np.asarray(species))
+        if self.n_exchange_species == 1 and len(self.species):
+            foreign = sorted(set(map(str, self.species)) - {exchange_species})
+            if foreign:
+                # with one exchanged species every mobile particle counts in N and
+                # can be deleted: a mobile particle of another species would be too
+                raise ValueError(f"mobile particles {foreign} are not the exchanged species "
+                                 f"{exchange_species!r}: list every mobile species in "
+                                 f"exchange_species, or make them substrate/frozen atoms")
         self.frozen_positions = (np.zeros((0, 3)) if frozen_positions is None
                                   else np.array(frozen_positions, dtype=float).reshape(-1, 3))
         self.frozen_species = (np.array([], dtype='<U2') if frozen_species is None
@@ -633,11 +642,22 @@ class ParticleSystem:
             since they never move and so can never enter a forbidden
             region).
         """
+        return self.calculator.total_energy(self) + self.external_energy_total()
+
+    def external_energy_total(self) -> float:
+        """
+        Sum of `external_energy` over every mobile and substrate particle.
+
+        Returns
+        -------
+        float
+            The external-field part of `total_energy` (frozen atoms excluded).
+        """
         ext = (sum(self.external_energy(self.positions[i]) for i in range(self.n))
                if self.n else 0.0)
         ext += (sum(self.external_energy(self.substrate_positions[i]) for i in range(self.n_substrate))
                 if self.n_substrate else 0.0)
-        return self.calculator.total_energy(self) + ext
+        return ext
 
     # -- generic path: correct for ANY calculator (used automatically when
     #    calculator.supports_incremental is False) --------------------------
@@ -671,8 +691,10 @@ class ParticleSystem:
         u0 = self.calculator.total_energy(self)
         saved = self.positions[i].copy()
         self.positions[i] = new_pos
-        u1 = self.calculator.total_energy(self)
-        self.positions[i] = saved
+        try:
+            u1 = self.calculator.total_energy(self)
+        finally:
+            self.positions[i] = saved
         return (u1 - u0) + (ext_new - ext_old)
 
     def generic_displace_substrate_dU(self, i: int, new_pos: np.ndarray) -> float:
@@ -703,8 +725,10 @@ class ParticleSystem:
         u0 = self.calculator.total_energy(self)
         saved = self.substrate_positions[i].copy()
         self.substrate_positions[i] = new_pos
-        u1 = self.calculator.total_energy(self)
-        self.substrate_positions[i] = saved
+        try:
+            u1 = self.calculator.total_energy(self)
+        finally:
+            self.substrate_positions[i] = saved
         return (u1 - u0) + (ext_new - ext_old)
 
     def generic_insert_dU(self, pos: np.ndarray, species: Optional[str] = None) -> float:
@@ -733,11 +757,13 @@ class ParticleSystem:
             return np.inf
         sp = self._insert_species(species)
         u0 = self.calculator.total_energy(self)
-        self.positions = np.vstack([self.positions, pos])
-        self.species = np.append(self.species, sp)
-        u1 = self.calculator.total_energy(self)
-        self.positions = self.positions[:-1]
-        self.species = self.species[:-1]
+        saved_pos, saved_sp = self.positions, self.species
+        self.positions = np.vstack([saved_pos, pos])
+        self.species = np.append(saved_sp, sp)
+        try:
+            u1 = self.calculator.total_energy(self)
+        finally:
+            self.positions, self.species = saved_pos, saved_sp
         return (u1 - u0) + ext
 
     def generic_delete_dU(self, i: int) -> float:
@@ -759,14 +785,15 @@ class ParticleSystem:
             removing particle `i`.
         """
         pos = self.positions[i].copy()
-        sp = self.species[i]
         ext = self.external_energy(pos)
         u0 = self.calculator.total_energy(self)
-        self.positions = np.delete(self.positions, i, axis=0)
-        self.species = np.delete(self.species, i)
-        u1 = self.calculator.total_energy(self)
-        self.positions = np.insert(self.positions, i, pos, axis=0)
-        self.species = np.insert(self.species, i, sp)
+        saved_pos, saved_sp = self.positions, self.species
+        self.positions = np.delete(saved_pos, i, axis=0)
+        self.species = np.delete(saved_sp, i)
+        try:
+            u1 = self.calculator.total_energy(self)
+        finally:
+            self.positions, self.species = saved_pos, saved_sp
         return (u1 - u0) - ext
 
 

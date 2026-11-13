@@ -6,8 +6,10 @@ from typing import Dict, Optional
 
 import numpy as np
 
+from .observables import evaluate_observables
 from .state import ThermoState
 from .systems import ParticleSystem
+from .trajectory import snapshot
 
 
 class Replica:
@@ -465,7 +467,8 @@ class Replica:
 
     def regc_local_block(self, gc_flags, first_step: int, record_every: int,
                          burn_in_steps: int, mode: str, n: int,
-                         adsorbed_cutoff: Optional[float] = None, **kwargs) -> "Replica":
+                         adsorbed_cutoff: Optional[float] = None, observables=None,
+                         record_configurations: bool = False, **kwargs) -> "Replica":
         """
         Several consecutive REGC steps with no replica exchange in between.
 
@@ -486,6 +489,13 @@ class Replica:
         adsorbed_cutoff : float, optional
             If given, each sample also carries
             ``system.n_adsorbed(adsorbed_cutoff)``; else None. Default None.
+        observables : sequence of regc.observables.Observable, optional
+            Evaluated on the configuration of every recorded sample.
+            Default None.
+        record_configurations : bool, optional
+            If True, each sample also carries a copy of the configuration
+            (`ParticleSystem.full_configuration` plus the group sizes).
+            Default False.
         mode, n, **kwargs
             Passed to `diffuse`.
 
@@ -493,9 +503,11 @@ class Replica:
         -------
         Replica
             `self`, with the samples of this block in `self.block_samples`
-            as a list of ``(energy, N, N_ads, N_s)``; ``N_s`` is
-            `system.species_counts()` with several exchanged species, else
-            None.
+            as a list of ``(energy, N, N_ads, N_s, obs, config)``; ``N_s``
+            is `system.species_counts()` with several exchanged species,
+            else None; ``obs`` is ``{name: values}`` (empty without
+            observables); ``config`` is ``(positions, species, n_frozen,
+            n_substrate)`` or None.
         """
         self.block_samples = []
         for k, gc in enumerate(gc_flags):
@@ -506,7 +518,10 @@ class Replica:
                          else self.system.n_adsorbed(adsorbed_cutoff))
                 n_s = (self.system.species_counts().tolist()
                        if self.system.n_exchange_species > 1 else None)
-                self.block_samples.append((self.energy, self.system.n, n_ads, n_s))
+                obs = evaluate_observables(observables, self.system) if observables else {}
+                self.block_samples.append((self.energy, self.system.n, n_ads, n_s, obs,
+                                           snapshot(self.system) if record_configurations
+                                           else None))
         return self
 
     def diffuse(self, mode: str = 'mc', n: int = 10, displace_substrate: bool = False,
@@ -625,7 +640,7 @@ class Replica:
         sysm = self.system
         calc = sysm.calculator
         if hasattr(calc, 'run_md'):  # e.g. LammpsCalculator: the whole segment natively
-            self._diffuse_md_native(n_steps, timestep_fs, thermostat, taut_fs)
+            self._diffuse_md_native(n_steps, timestep_fs, thermostat, taut_fs, friction_per_fs)
             return
 
         from ase import Atoms, units
@@ -692,7 +707,7 @@ class Replica:
         self.energy = sysm.total_energy()
 
     def _diffuse_md_native(self, n_steps: int, timestep_fs: float, thermostat: str,
-                           taut_fs: float) -> None:
+                           taut_fs: float, friction_per_fs: float = 0.01) -> None:
         """
         MD segment run by the calculator itself (`calculator.run_md`).
 
@@ -712,7 +727,9 @@ class Replica:
         thermostat : str
             ``'bussi'`` or ``'langevin'``.
         taut_fs : float
-            Thermostat time constant, in fs.
+            Bussi thermostat time constant, in fs.
+        friction_per_fs : float, optional
+            Langevin friction, in 1/fs (as in the ASE path). Default 0.01.
         """
         sysm = self.system
         n_sub = sysm.n_substrate
@@ -720,13 +737,17 @@ class Replica:
             return
         seed = int(self.rng.integers(1, 2 ** 31 - 1))
         new = sysm.calculator.run_md(sysm, n_steps, self.state.temperature, timestep_fs,
-                                     taut_fs, seed, thermostat=thermostat)
+                                     taut_fs, seed, thermostat=thermostat,
+                                     friction_per_fs=friction_per_fs)
         saved_sub, saved_mob = sysm.substrate_positions.copy(), sysm.positions.copy()
         for i in range(n_sub):
             sysm.apply_move_substrate(i, new[i])
         for i in range(sysm.n):
             sysm.apply_move(i, new[n_sub + i])
-        energy = sysm.total_energy()
+        if hasattr(sysm.calculator, "energy_after_md"):   # the segment's own end energy
+            energy = sysm.calculator.energy_after_md(sysm) + sysm.external_energy_total()
+        else:
+            energy = sysm.total_energy()
         if np.isfinite(energy):
             self.energy = energy
         else:
@@ -758,8 +779,8 @@ class Replica:
             Relative probability of a GCMC insertion move. Default is
             0.25.
         p_delete : float, optional
-            Relative probability of a GCMC deletion move. Default is
-            0.25.
+            Relative probability of a GCMC deletion move; must equal
+            `p_insert`. Default is 0.25.
         p_displace_substrate : float, optional
             Relative probability of an independent substrate displacement
             move. Default is 0.0 (off).
@@ -769,7 +790,17 @@ class Replica:
         Replica
             `self`, returned so a process-pool worker can send the
             mutated replica back to the main process.
+
+        Raises
+        ------
+        ValueError
+            If `p_insert` differs from `p_delete` (the acceptance rules
+            assume equal attempt probabilities).
         """
+        if not np.isclose(p_insert, p_delete):
+            raise ValueError(f"p_insert ({p_insert}) must equal p_delete ({p_delete}): the "
+                             f"insertion/deletion acceptance rules assume equal attempt "
+                             f"probabilities (detailed balance)")
         probs = np.array([p_displace, p_insert, p_delete, p_displace_substrate], dtype=float)
         probs /= probs.sum()
         choices = self.rng.choice(4, size=n_steps, p=probs)
@@ -784,6 +815,38 @@ class Replica:
             else:
                 self._move_displace_substrate()
         return self  # returned so a process-pool worker can send the mutated replica back
+
+    def check_energy(self, tol: float = 1e-6) -> "Replica":
+        """
+        Compare the running energy with a full recomputation, and resync it.
+
+        MC moves update the energy incrementally (``energy += dU``); this
+        catches any drift (round-off, or a calculator whose incremental and
+        full energies disagree). A drift larger than `tol` per atom is
+        stored in `last_energy_drift` and the energy is reset to the
+        recomputed value; a smaller one is only recorded, so runs whose
+        energies agree to round-off stay bit-identical.
+
+        Parameters
+        ----------
+        tol : float, optional
+            Tolerance per atom (substrate + mobile), in energy units.
+            Default 1e-6.
+
+        Returns
+        -------
+        Replica
+            `self` (for process-pool workers), with ``last_energy_drift``
+            (running minus recomputed energy) and ``energy_resynced``.
+        """
+        exact = self.system.total_energy()
+        drift = float(self.energy - exact) if np.isfinite(exact) else np.inf
+        n_atoms = max(1, self.system.n + self.system.n_substrate)
+        self.last_energy_drift = drift
+        self.energy_resynced = bool(abs(drift) > tol * n_atoms)
+        if self.energy_resynced and np.isfinite(exact):
+            self.energy = exact
+        return self
 
     def acceptance_rates(self) -> Dict[str, float]:
         """

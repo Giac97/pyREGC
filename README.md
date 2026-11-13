@@ -87,12 +87,16 @@ regc/
 │                      diatomic functions (self-consistent D0 and isolated-atom energy)
 ├── structures.py      cubic_lattice_constant, slab_geometry_from_atoms, SlabGeometry,
 │                      insertion_energy_scan
-├── analysis.py        MBARSurfaceAnalysis (MBAR phase diagrams, lowest-energy maps)
+├── analysis.py        MBARSurfaceAnalysis (MBAR phase diagrams, lowest-energy maps, heat
+│                      capacity, observables), export_phase_configurations
+├── observables.py     coordination numbers/histograms, RDFs, user functions, recorded per sample
+├── diagnostics.py     reliability: statistical inefficiency, block bootstrap, MBAR overlap, C_V peak support
 ├── plotting.py        plot_phase_diagram
-├── trajectory.py      extended-XYZ trajectory snapshots
+├── trajectory.py      extended-XYZ trajectories and sample-tagged configurations
 └── runner.py          config-file-driven pipeline (structure file -> phase diagram)
 
-docs/         MANUAL.md: user manual (library and YAML runner); API_REFERENCE.md: every public name
+docs/         manual/regc_manual.md (+ .pdf): illustrated manual (physics, design, examples);
+              MANUAL.md: reference manual (library and YAML runner); API_REFERENCE.md: every public name
               REGC_algorithm.md/.pdf: the algorithm with every acceptance rule
 examples/     runnable scripts, cheapest first (+ examples/data/ for shipped structure files)
 hpc/          Slurm setup for production runs

@@ -39,14 +39,20 @@ replica is the standard approach. Neither is implemented here.
 from __future__ import annotations
 
 import itertools
+import json
+import os
+import time
+import warnings
 from concurrent.futures import ProcessPoolExecutor
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from .replica import Replica
 from .state import ThermoState
 from .systems import ParticleSystem
+from .observables import Observable, check_observables, evaluate_observables
+from .trajectory import snapshot
 from .units import SpeciesLambdaCubed
 
 
@@ -126,7 +132,11 @@ class ReplicaExchangeGCMC:
                  seed: int = 0, max_disp: float = 0.2, n_workers: int = 1,
                  lambda_cubed_of_T: Callable[[float], float] = lambda T: 1.0,
                  hmc_enabled: bool = False, hmc_leapfrog_steps: int = 10,
-                 hmc_dt: float = 0.005, adsorbed_cutoff: Optional[float] = None):
+                 hmc_dt: float = 0.005, adsorbed_cutoff: Optional[float] = None,
+                 observables: Optional[Sequence[Observable]] = None,
+                 configurations_dir: Optional[str] = None, configurations_every: int = 1,
+                 skip_empty_swaps: bool = True, records_path: Optional[str] = None,
+                 records_potential: str = "sampling", records_every: int = 1):
         """
         Construct the replica-exchange ladder.
 
@@ -176,6 +186,47 @@ class ReplicaExchangeGCMC:
             the adsorbed count can be reweighted like N (see
             `MBARSurfaceAnalysis`, ``observable='N_ads'``). Default None
             (not recorded).
+        observables : sequence of regc.observables.Observable, optional
+            Structural observables (coordination numbers, RDFs, ...)
+            evaluated on every recorded sample and stored under
+            ``samples[key]['obs:<name>']``, for MBAR reweighting like N.
+            Default None.
+        configurations_dir : str, optional
+            If given, every `configurations_every`-th recorded sample's
+            configuration is appended to
+            ``<configurations_dir>/configs_T{it}_mu{imu}.extxyz``, tagged
+            with its sample index, so structures can be picked out of the
+            phase diagram afterwards
+            (`MBARSurfaceAnalysis.representative_samples`,
+            `regc.analysis.export_phase_configurations`). Default None
+            (off); see also `save_configurations`.
+        configurations_every : int, optional
+            Store every this many samples' configurations. Default 1 (all).
+        skip_empty_swaps : bool, optional
+            In `run_regc`, draw the replica-exchange move only among the
+            (pattern, offset) combinations that have at least one pair on
+            this grid, instead of among all of them (on an n_T x 1 grid,
+            six of the eight draws would otherwise attempt nothing). The
+            choice does not depend on the configurations, so either way the
+            sampling is exact; True wastes no RE steps. Default True; a run
+            resumed from a checkpoint keeps the setting it was started with
+            (False for checkpoints written before this option existed), so
+            it continues bit-identically.
+        records_path : str, optional
+            If given, every recorded sample is appended to this HDF5 file
+            (`regc.records`): grid point, sample index, walker, N, the
+            energy under the sampling potential and (every
+            `records_every`-th sample) the configuration, so the samples
+            can later be re-evaluated with another potential
+            (`regc.records.reevaluate`) and reweighted to it
+            (`MBARSurfaceAnalysis.with_potential`). Needs h5py. Default
+            None (off); see also `save_records`.
+        records_potential : str, optional
+            Name of the sampling potential in the records file. Default
+            ``'sampling'``.
+        records_every : int, optional
+            Store the configuration of every this many samples (the energy
+            and N of all of them). Default 1.
 
         Raises
         ------
@@ -193,6 +244,12 @@ class ReplicaExchangeGCMC:
         self.n_workers = n_workers
         self.lambda_cubed_of_T = lambda_cubed_of_T  # also read by MBARSurfaceAnalysis
         self.adsorbed_cutoff = adsorbed_cutoff
+        self.skip_empty_swaps = bool(skip_empty_swaps)
+        self.observables = check_observables(observables)
+        self.save_configurations(configurations_dir, configurations_every)
+        self._records = None
+        self.save_records(records_path, records_potential, records_every)
+        self.save_status(None)
         self._executor: Optional[ProcessPoolExecutor] = None
 
         # Build the systems first (same seeds, same order as before): they
@@ -234,10 +291,13 @@ class ReplicaExchangeGCMC:
                                        else {'U': [], 'N': [], 'N_ads': []})
             if self.n_species > 1:
                 self.samples[(it, imu)]['N_s'] = []
+            for o in self.observables:
+                self.samples[(it, imu)]['obs:' + o.name] = []
         # drawn after the replicas' seeds, so their streams are unchanged by it
         self.rng = np.random.default_rng(master_rng.integers(0, 2 ** 62))
         self.swap_stats = {t: [0, 0] for t in SWAP_TYPES}  # type -> [attempts, accepts]
         self.convergence_history: List[float] = []
+        self._init_walkers()
     @staticmethod
     def _parse_mus(mus_arr: np.ndarray, n_T: int, n_species: int) -> np.ndarray:
         """
@@ -318,6 +378,9 @@ class ReplicaExchangeGCMC:
         if self._executor is not None:
             self._executor.shutdown(wait=True)
             self._executor = None
+        if self._records is not None:
+            self._records.close()
+            self._records = None
 
     def __enter__(self) -> "ReplicaExchangeGCMC":
         """
@@ -506,8 +569,104 @@ class ReplicaExchangeGCMC:
         """
         stats = self.swap_stats[swap_type]
         for key_a, key_b in self.swap_pairs(swap_type, parity):
+            accepted = self._attempt_exchange(key_a, key_b)
             stats[0] += 1
-            stats[1] += int(self._attempt_exchange(key_a, key_b))
+            stats[1] += int(accepted)
+            pair = self.pair_stats.setdefault((key_a, key_b), [0, 0])
+            pair[0] += 1
+            pair[1] += int(accepted)
+        self._track_walkers()
+
+    # -- replica-exchange mixing diagnostics (bookkeeping only: no random numbers) --------
+    def _init_walkers(self) -> None:
+        """
+        Label every configuration with a walker id and reset the mixing statistics.
+
+        A walker is one configuration followed as replica exchange moves it
+        across the grid (`ParticleSystem` objects travel with accepted swaps).
+        """
+        self.pair_stats: Dict[Tuple[Tuple[int, int], Tuple[int, int]], List[int]] = {}
+        for k, key in enumerate(sorted(self.grid)):
+            self.grid[key].system.walker_id = k
+        n = len(self.grid)
+        self.walker_last_end = {"T": [None] * n, "mu": [None] * n}
+        self.round_trips = {"T": [0] * n, "mu": [0] * n}
+        self._track_walkers()
+
+    def _track_walkers(self) -> None:
+        """
+        Update the round-trip counts after an exchange round.
+
+        A round trip along an axis is a walker going from one end of the
+        ladder (index 0) to the other and back. It is counted when the
+        walker reaches the end opposite to the last one it visited, and a
+        full round trip is two such traversals.
+        """
+        n_axis = {"T": self.mu_grid.shape[0], "mu": self.mu_grid.shape[1]}
+        for key, r in self.grid.items():
+            w = getattr(r.system, "walker_id", None)
+            if w is None:
+                continue
+            for axis, pos in (("T", key[0]), ("mu", key[1])):
+                if n_axis[axis] < 2:
+                    continue
+                end = "low" if pos == 0 else "high" if pos == n_axis[axis] - 1 else None
+                last = self.walker_last_end[axis][w]
+                if end is not None and end != last:
+                    if last is not None:
+                        self.round_trips[axis][w] += 1   # one traversal = half a round trip
+                    self.walker_last_end[axis][w] = end
+
+    def check_energies(self, tol: float = 1e-6) -> Dict[Tuple[int, int], Tuple[float, bool]]:
+        """
+        Check every replica's running energy against a full recomputation.
+
+        See `Replica.check_energy`; runs in the worker processes of a
+        parallel run. `regc.driver.run_with_checkpoints` calls it after
+        every chunk.
+
+        Parameters
+        ----------
+        tol : float, optional
+            Tolerance per atom. Default 1e-6.
+
+        Returns
+        -------
+        dict
+            ``{key: (drift, resynced)}``.
+        """
+        self._local_call("check_energy", tol=tol)
+        return {k: (r.last_energy_drift, r.energy_resynced) for k, r in self.grid.items()}
+
+    def pair_acceptance(self) -> Dict[Tuple[Tuple[int, int], Tuple[int, int]], Tuple[int, float]]:
+        """
+        Swap attempts and acceptance ratio of every neighbouring pair.
+
+        A pattern's average can hide a single pair that never swaps and so
+        cuts the ladder in two; this lists them one by one.
+
+        Returns
+        -------
+        dict
+            ``{(key_a, key_b): (attempts, acceptance)}``.
+        """
+        return {pair: (att, acc / max(1, att)) for pair, (att, acc) in self.pair_stats.items()}
+
+    def round_trip_counts(self) -> Dict[str, np.ndarray]:
+        """
+        Completed round trips of every walker along T and along mu.
+
+        A walker that never completes a round trip along T has not carried
+        a low-temperature configuration through the hot replicas and back:
+        the low-T replicas may still remember their start.
+
+        Returns
+        -------
+        dict
+            ``{'T': array, 'mu': array}``, one entry per walker (completed
+            end-to-end-and-back trips).
+        """
+        return {axis: np.array(v) // 2 for axis, v in self.round_trips.items()}
 
     def run(self, n_cycles: int, sweeps_per_cycle: int = 200, exchange_every: int = 1,
             record_every: int = 1, burn_in_cycles: int = 0, verbose: bool = True,
@@ -600,7 +759,16 @@ class ReplicaExchangeGCMC:
                         self.samples[key]['N_ads'].append(r.system.n_adsorbed(self.adsorbed_cutoff))
                     if self.n_species > 1:
                         self.samples[key]['N_s'].append(r.system.species_counts().tolist())
-
+                    for name, v in evaluate_observables(self.observables, r.system).items():
+                        self.samples[key]['obs:' + name].append(v)
+                    if self.configurations_dir is not None or self.records_path is not None:
+                        sample = len(self.samples[key]['U']) - 1
+                        config = snapshot(r.system)
+                        if self.configurations_dir is not None:
+                            self._store_configuration(key, sample, r.energy, config)
+                        self._record(key, sample, r.energy, r.system.n,
+                                     self.samples[key]['N_s'][-1] if self.n_species > 1 else None,
+                                     config)
             if trajectory_dir is not None and cycle % trajectory_every == 0:
                 for key, r in self.grid.items():
                     self._save_trajectory_frame(trajectory_dir, key, r)
@@ -608,6 +776,8 @@ class ReplicaExchangeGCMC:
             if verbose and (cycle % max(1, n_cycles // 10) == 0 or cycle == n_cycles):
                 mean_n = np.mean([r.system.n for r in self.grid.values()])
                 print(f"cycle {cycle:6d}/{n_cycles} | mean N across grid = {mean_n:6.2f}")
+            self._maybe_write_status(cycle, n_cycles, "sweep", force=cycle == n_cycles)
+        self._flush_records()
     def run_regc(self, n_steps: int, x0: float = 0.99, diffusion: str = 'mc',
                  diffusion_steps: int = 10, record_every: int = 100, burn_in_steps: int = 0,
                  swap_types: Tuple[str, ...] = SWAP_TYPES,
@@ -625,16 +795,19 @@ class ReplicaExchangeGCMC:
            insertion with probability 1/2 each, Eqs. (4)-(5) of
            docs/REGC_algorithm.md). Otherwise make ONE replica-exchange
            move: draw one pattern from `swap_types` and an offset (0/1),
-           each uniformly, and attempt all of that pattern's disjoint swaps
-           (Eq. (8)).
+           each uniformly (with ``skip_empty_swaps``: one uniformly among
+           the combinations that have pairs on this grid), and attempt all
+           of that pattern's disjoint swaps (Eq. (8)).
         2. Diffusion at fixed (N, V, T), in parallel over replicas (see
            `Replica.diffuse`).
         3. Every `record_every` steps after `burn_in_steps`, record (U, N)
            of every replica -- i.e. after the last diffusion move, before
            the next GC/RE step.
         4. Every `convergence_every` steps, test convergence of the
-           reduced-energy densities rho(u) (see `rho_u_change`); stop if
-           converged, otherwise continue up to `n_steps`.
+           reduced-energy densities rho(u): compare the samples recorded
+           since the previous check with those of the interval before it
+           (disjoint blocks, see `rho_u_change`); stop if they agree,
+           otherwise continue up to `n_steps`.
 
         `x0` follows the paper's TEXT: it is the probability of a GC
         attempt ([ZSG]: x0 = 0.99 with "swaps attempted every 100 REGC
@@ -667,9 +840,13 @@ class ReplicaExchangeGCMC:
             Check convergence every this many steps (rounded to a multiple
             of `record_every`). Default is None (no check; run `n_steps`).
         convergence_tol : float, optional
-            Converged when the largest total-variation change of rho(u)
-            over all grid points since the previous check is below this.
-            Default is 0.05.
+            Converged when the largest total-variation distance between the
+            rho(u) of the two latest inter-check blocks, over all grid
+            points, is below this. Default is 0.05. Two blocks of n samples
+            from the same distribution still differ by roughly
+            sqrt(convergence_bins / (pi n)) from sampling noise alone, so the
+            tolerance must lie above that floor (fewer bins or longer blocks).
+            The first verdict needs three checks.
         convergence_bins : int, optional
             Histogram bins for rho(u). Default is 30.
         verbose : bool, optional
@@ -703,7 +880,7 @@ class ReplicaExchangeGCMC:
             trajectory_every = record_every
         if convergence_every is not None:
             convergence_every = max(record_every, (convergence_every // record_every) * record_every)
-        n_at_last_check = None
+        n_at_last_check = n_at_check_before = None
 
         def needs_main_process(step: int) -> bool:
             # steps after which the main process must act on the replicas
@@ -712,7 +889,11 @@ class ReplicaExchangeGCMC:
                     or (convergence_every is not None and step > burn_in_steps
                         and step % convergence_every == 0))
 
+        usable = [(t, par) for t in swap_types for par in (0, 1) if self.swap_pairs(t, par)]
+
         def draw_swap() -> Tuple[str, int]:
+            if self.skip_empty_swaps and usable:  # one draw, configuration-independent
+                return usable[int(self.rng.integers(len(usable)))]
             swap_type = swap_types[int(self.rng.integers(len(swap_types)))]
             return swap_type, int(self.rng.integers(2))
 
@@ -722,6 +903,8 @@ class ReplicaExchangeGCMC:
         # so each runs its whole block in one call; the random draws and their
         # order are exactly those of a step-by-step loop.
         step = 0
+        print_every = max(1, n_steps // 10)
+        next_print = print_every
         pending_swap: Optional[Tuple[str, int]] = None
         while step < n_steps:
             first = step + 1
@@ -743,65 +926,93 @@ class ReplicaExchangeGCMC:
                     break
             self._local_call('regc_local_block', gc_flags=flags, first_step=first,
                              record_every=record_every, burn_in_steps=burn_in_steps,
-                             adsorbed_cutoff=self.adsorbed_cutoff, mode=diffusion, n=diffusion_steps, **diffusion_kwargs)
+                             adsorbed_cutoff=self.adsorbed_cutoff, observables=self.observables,
+                             record_configurations=(self.configurations_dir is not None
+                                                    or self.records_path is not None),
+                             mode=diffusion, n=diffusion_steps, **diffusion_kwargs)
             step = first + len(flags) - 1
             for key, r in self.grid.items():
-                for U, N, N_ads, N_s in r.block_samples:
+                for U, N, N_ads, N_s, obs, config in r.block_samples:
                     self.samples[key]['U'].append(U)
                     self.samples[key]['N'].append(N)
                     if N_ads is not None:
                         self.samples[key]['N_ads'].append(N_ads)
                     if N_s is not None:
                         self.samples[key]['N_s'].append(N_s)
+                    for name, v in obs.items():
+                        self.samples[key]['obs:' + name].append(v)
+                    sample = len(self.samples[key]['U']) - 1
+                    if config is not None and self.configurations_dir is not None:
+                        self._store_configuration(key, sample, U, config)
+                    self._record(key, sample, U, N, N_s, config)
+                r.block_samples = []  # do not ship the configurations back to the workers
 
             if trajectory_dir is not None and step % trajectory_every == 0:
                 for key, r in self.grid.items():
                     self._save_trajectory_frame(trajectory_dir, key, r)
 
-            if verbose and (step % max(1, n_steps // 10) == 0 or step == n_steps):
+            if verbose and (step >= next_print or step == n_steps):  # blocks skip multiples
+                next_print = (step // print_every + 1) * print_every
                 mean_n = np.mean([r.system.n for r in self.grid.values()])
-                print(f"step {step:7d}/{n_steps} | mean N across grid = {mean_n:6.2f}")
+                print(f"step {step:7d}/{n_steps} | mean N across grid = {mean_n:6.2f}", flush=True)
+            self._maybe_write_status(step, n_steps, "regc", force=step == n_steps)
 
             # check if a convergence check is set and terminate run if reached and at least the burn_in steps 
             # have already been performed
             if (convergence_every is not None and step > burn_in_steps
                     and step % convergence_every == 0):
                 n_now = len(next(iter(self.samples.values()))['U'])
-                if n_at_last_check is not None and n_at_last_check >= 2:
-                    change = self.rho_u_change(n_at_last_check, convergence_bins)
+                if (n_at_check_before is not None and n_at_last_check - n_at_check_before >= 2
+                        and n_now - n_at_last_check >= 2):
+                    change = self.rho_u_change(n_at_last_check, convergence_bins,
+                                               n_start=n_at_check_before)
                     self.convergence_history.append(change)
                     if verbose:
                         print(f"step {step:7d} | max change of rho(u) = {change:.4f}")
                     if change < convergence_tol:
+                        self._flush_records()
+                        self._maybe_write_status(step, n_steps, "regc", force=True, converged=True)
                         return True
-                n_at_last_check = n_now
+                n_at_check_before, n_at_last_check = n_at_last_check, n_now
+        self._flush_records()
         return False
 
-    def rho_u_change(self, n_prev: int, bins: int = 30) -> float:
+    def rho_u_change(self, n_prev: int, bins: int = 30, n_start: int = 0) -> float:
         """
-        Largest change of the reduced-energy density rho(u) between checks.
+        Largest change of the reduced-energy density rho(u) between blocks.
 
         For each grid point, u = beta*(U - mu*N) + N*ln(Lambda^3) of its
         recorded samples (Eq. (9) of docs/REGC_algorithm.md; summed over
-        species if several are exchanged) is histogrammed
-        twice on common bins: using the first `n_prev` samples (the state
-        at the previous check) and using all samples. Returns the maximum
-        over grid points of the total-variation distance
-        0.5 * sum |p_all - p_prev| -- [ZSG]'s criterion, "no change in the
-        density of reduced-energy states rho(U) with increasing simulation
-        steps".
+        species if several are exchanged) is histogrammed on common bins
+        for two disjoint blocks: samples ``n_start:n_prev`` (the interval
+        before the previous check) and samples ``n_prev:`` (since it).
+        Returns the maximum over grid points of the total-variation
+        distance 0.5 * sum |p_new - p_old| -- [ZSG]'s criterion, "no change
+        in the density of reduced-energy states rho(U) with increasing
+        simulation steps".
+
+        The blocks are disjoint on purpose: comparing the first `n_prev`
+        samples with all samples (which contain them) shrinks like 1/k
+        after k equal checks whatever the data do, so a drifting run would
+        pass. Two blocks of n samples drawn from one distribution still
+        differ by about sqrt(bins / (pi n)) (sampling noise), so a tolerance
+        must lie above that.
 
         Parameters
         ----------
         n_prev : int
-            Number of samples per grid point at the previous check.
+            Number of samples per grid point at the previous check: the end
+            of the old block, the start of the new one.
         bins : int, optional
             Number of histogram bins. Default 30.
+        n_start : int, optional
+            Start of the old block (the sample count at the check before
+            the previous one). Default 0.
 
         Returns
         -------
         float
-            The maximum total-variation change, in [0, 1].
+            The maximum total-variation distance, in [0, 1].
         """
         worst = 0.0
         for key, r in self.grid.items():
@@ -813,12 +1024,15 @@ class ReplicaExchangeGCMC:
                 N_s = np.asarray(self.samples[key]['N_s'], dtype=float).reshape(-1, self.n_species)
                 u = (r.state.beta * U
                      + N_s @ (np.log(r.state.lambda_cubed_vec) - r.state.beta * r.state.mu_vec))
-            edges = np.histogram_bin_edges(u, bins=bins)
+            old, new = u[n_start:n_prev], u[n_prev:]
+            if len(old) == 0 or len(new) == 0:
+                continue
+            edges = np.histogram_bin_edges(np.concatenate([old, new]), bins=bins)
             if edges[0] == edges[-1]:
                 continue  # a single repeated value: no change measurable
-            p_all, _ = np.histogram(u, bins=edges)
-            p_prev, _ = np.histogram(u[:n_prev], bins=edges)
-            tv = 0.5 * np.abs(p_all / p_all.sum() - p_prev / p_prev.sum()).sum()
+            p_new, _ = np.histogram(new, bins=edges)
+            p_old, _ = np.histogram(old, bins=edges)
+            tv = 0.5 * np.abs(p_new / p_new.sum() - p_old / p_old.sum()).sum()
             worst = max(worst, float(tv))
         return worst
 
@@ -854,8 +1068,14 @@ class ReplicaExchangeGCMC:
             Additional state to store and get back from `load_checkpoint`.
         """
         from .io import atomic_pickle
+        self._flush_records()  # the records hold at least what the checkpoint does
         atomic_pickle({"fingerprint": self.fingerprint(), "grid": self.grid,
+                       "adsorbed_cutoff": self.adsorbed_cutoff,
+                       "observables_meta": self.observables_meta,
                        "samples": self.samples, "swap_stats": self.swap_stats,
+                       "pair_stats": self.pair_stats, "round_trips": self.round_trips,
+                       "walker_last_end": self.walker_last_end,
+                       "skip_empty_swaps": self.skip_empty_swaps,
                        "convergence_history": self.convergence_history,
                        "rng_state": self.rng.bit_generator.state, "extra": extra or {}}, path)
 
@@ -864,8 +1084,13 @@ class ReplicaExchangeGCMC:
         Restore a state saved by `save_checkpoint` into this simulation.
 
         The simulation must have been constructed with the same temperature
-        ladder, mu grid and Lambda^3(T); the system factory is not called
-        again for the restored replicas.
+        ladder, mu grid, Lambda^3(T) and ``adsorbed_cutoff``. The
+        checkpoint supplies the configurations, energies, random streams
+        and samples; the calculators and the move settings (``max_disp``,
+        HMC) are this simulation's, built from the current setup. So a
+        checkpoint survives a moved potential file, and a changed potential
+        setting (e.g. a new hard core) takes effect: each restored energy is
+        recomputed, and resynchronised with a warning if it changed.
 
         Parameters
         ----------
@@ -880,8 +1105,8 @@ class ReplicaExchangeGCMC:
         Raises
         ------
         ValueError
-            If the checkpoint's temperature ladder, mu grid or Lambda^3
-            differ from this simulation's.
+            If the checkpoint's temperature ladder, mu grid, Lambda^3 or
+            ``adsorbed_cutoff`` differ from this simulation's.
         """
         from .io import load_pickle
         st = load_pickle(path)
@@ -889,12 +1114,49 @@ class ReplicaExchangeGCMC:
         for key in mine:
             if not np.allclose(np.asarray(mine[key]), np.asarray(theirs[key]), rtol=1e-12, atol=1e-12):
                 raise ValueError(f"checkpoint {path}: '{key}' differs from this simulation's")
-        if self.adsorbed_cutoff is not None and any('N_ads' not in v for v in st["samples"].values()):
+        has_n_ads = all('N_ads' in v for v in st["samples"].values())
+        if self.adsorbed_cutoff is not None and not has_n_ads:
             raise ValueError(f"checkpoint {path} has no 'N_ads' samples; it was written "
                              f"without adsorbed_cutoff and can't be continued with it")
+        if self.adsorbed_cutoff is None and has_n_ads:
+            raise ValueError(f"checkpoint {path} records 'N_ads' (adsorbed_cutoff was set); "
+                             f"continue it with the same adsorbed_cutoff")
+        saved_cutoff = st.get("adsorbed_cutoff", self.adsorbed_cutoff)  # absent in old files
+        if saved_cutoff != self.adsorbed_cutoff:
+            raise ValueError(f"checkpoint {path}: adsorbed_cutoff was {saved_cutoff}, now "
+                             f"{self.adsorbed_cutoff}; N_ads would mix two definitions")
+        saved_obs = st.get("observables_meta", {})
+        if saved_obs != self.observables_meta:
+            raise ValueError(f"checkpoint {path} recorded observables {sorted(saved_obs)}, this "
+                             f"simulation {sorted(self.observables_meta)} (with the same "
+                             f"definitions); they must match to continue the samples")
+        fresh = self.grid
+        resynced = []
+        for key, r in st["grid"].items():
+            f = fresh[key]
+            r.system.calculator = f.system.calculator
+            r.max_disp, r.hmc_enabled = f.max_disp, f.hmc_enabled
+            r.hmc_leapfrog_steps, r.hmc_dt = f.hmc_leapfrog_steps, f.hmc_dt
+            energy = r.system.total_energy()
+            if not np.isclose(energy, r.energy, rtol=1e-9, atol=1e-8):
+                resynced.append((key, r.energy, energy))
+                r.energy = energy
+        if resynced:
+            key, old, new = resynced[0]
+            warnings.warn(f"checkpoint {path}: the current calculator gives different energies "
+                          f"for {len(resynced)} of {len(fresh)} restored configurations "
+                          f"(e.g. {key}: {old:.6g} -> {new:.6g}); continuing with the current "
+                          f"calculator's energies", stacklevel=2)
         self.grid, self.samples = st["grid"], st["samples"]
         self.swap_stats, self.convergence_history = st["swap_stats"], st["convergence_history"]
         self.rng.bit_generator.state = st["rng_state"]
+        # keep the RE-move draw of the run being continued (bit-identical continuation)
+        self.skip_empty_swaps = bool(st.get("skip_empty_swaps", False))
+        if "round_trips" in st and all(hasattr(r.system, "walker_id") for r in self.grid.values()):
+            self.pair_stats = st["pair_stats"]
+            self.round_trips, self.walker_last_end = st["round_trips"], st["walker_last_end"]
+        else:  # a checkpoint from before walker tracking: start counting now
+            self._init_walkers()
         return st["extra"]
 
     def swap_acceptance(self) -> Dict[str, float]:
@@ -910,6 +1172,276 @@ class ReplicaExchangeGCMC:
             never attempted).
         """
         return {t: acc / max(1, att) for t, (att, acc) in self.swap_stats.items()}
+
+    def save_configurations(self, directory: Optional[str], every: int = 1) -> None:
+        """
+        Store the configurations of recorded samples from now on (or stop).
+
+        Parameters
+        ----------
+        directory : str or None
+            Directory for ``configs_T{it}_mu{imu}.extxyz`` (one per grid
+            point); None stops storing.
+        every : int, optional
+            Store every this many samples (by sample index). Default 1.
+
+        Raises
+        ------
+        ValueError
+            If `every` is not positive.
+        """
+        if int(every) < 1:
+            raise ValueError(f"configurations_every must be >= 1, got {every}")
+        self.configurations_dir = directory
+        self.configurations_every = int(every)
+
+    def _store_configuration(self, key: Tuple[int, int], sample: int, U: float,
+                             config: tuple) -> None:
+        """
+        Append one recorded sample's configuration to its grid point's file.
+
+        Parameters
+        ----------
+        key : tuple of int
+            Grid point.
+        sample : int
+            Index of the sample in ``samples[key]``.
+        U : float
+            Its energy.
+        config : tuple
+            From `regc.trajectory.snapshot`.
+        """
+        if sample % self.configurations_every:
+            return
+        from .trajectory import append_configuration, configuration_path, lattice_of
+        r = self.grid[key]
+        n_mobile = len(config[1]) - config[2] - config[3]
+        info = {"sample": sample, "T_index": key[0], "mu_index": key[1],
+                "T": float(r.state.temperature), "U": float(U), "N": int(n_mobile)}
+        if self.n_species == 1:
+            info["mu"] = float(r.state.mu)
+        append_configuration(configuration_path(self.configurations_dir, key), config,
+                             lattice_of(r.system), r.system.pbc, info)
+
+    def save_records(self, path: Optional[str], potential: str = "sampling", every: int = 1,
+                     positions_dtype: str = "float64") -> None:
+        """
+        Append every recorded sample to an HDF5 records file from now on (or stop).
+
+        See `regc.records`. The file is opened at the first recorded
+        sample and flushed at the end of every `run`/`run_regc` call and
+        at every checkpoint.
+
+        Parameters
+        ----------
+        path : str or None
+            The records file; None stops recording (and closes the file).
+        potential : str, optional
+            Name of the sampling potential. Default ``'sampling'``.
+        every : int, optional
+            Store the configuration of every this many samples (by sample
+            index). Default 1.
+        positions_dtype : str, optional
+            ``'float64'`` (default) or ``'float32'``.
+
+        Raises
+        ------
+        ValueError
+            If `every` is not positive.
+        """
+        if int(every) < 1:
+            raise ValueError(f"records_every must be >= 1, got {every}")
+        if getattr(self, "_records", None) is not None:
+            self._records.close()
+            self._records = None
+        self.records_path = path
+        self.records_potential = str(potential)
+        self.records_every = int(every)
+        self.records_positions_dtype = positions_dtype
+
+    def _record(self, key: Tuple[int, int], sample: int, U: float, N: int,
+                N_s: Optional[Sequence[int]], config: Optional[tuple]) -> None:
+        """
+        Queue one recorded sample for the records file (if recording).
+
+        Parameters
+        ----------
+        key : tuple of int
+            Grid point.
+        sample : int
+            Its index there.
+        U : float
+            Energy under the sampling potential.
+        N : int
+            Mobile atoms.
+        N_s : sequence of int or None
+            Counts per species (several species).
+        config : tuple or None
+            `regc.trajectory.snapshot`.
+        """
+        if self.records_path is None:
+            return
+        if self._records is None:
+            from .records import RecordWriter
+            from .trajectory import lattice_of
+            system = self.grid[key].system
+            labels = set(map(str, system.frozen_species)) | set(map(str, system.substrate_species))
+            species = sorted(labels | set(self.exchange_species))
+            self._records = RecordWriter(self.records_path, self.records_potential, species,
+                                         lattice_of(system), system.pbc,
+                                         system.frozen_positions.shape[0], system.n_substrate,
+                                         self.temperatures, self.mu_grid, self.n_species,
+                                         self.records_positions_dtype)
+        walker = getattr(self.grid[key].system, "walker_id", -1)
+        keep = config is not None and sample % self.records_every == 0
+        self._records.add(key, sample, -1 if walker is None else walker, U, N,
+                          config if keep else None, N_s)
+
+    def save_status(self, path: Optional[str], interval_s: float = 5.0,
+                    extra: Optional[dict] = None) -> None:
+        """
+        Write a JSON heartbeat of the running simulation from now on (or stop).
+
+        At most every `interval_s` seconds (and at the end of every run
+        call) the file is replaced atomically with the progress, the
+        per-replica sample counts and averages, the latest stretch of every
+        replica's N and U, the swap statistics and the convergence history:
+        what `regc.monitor` shows while the run is going.
+
+        Parameters
+        ----------
+        path : str or None
+            The status file (``status.json``); None stops writing it.
+        interval_s : float, optional
+            Minimum time between writes. Default 5 s.
+        extra : dict, optional
+            Copied into the file under ``'labels'`` (e.g. the ladder in
+            kelvin and the pressures, for the monitor's axes). Default None.
+        """
+        self.status_path = path
+        self.status_interval_s = float(interval_s)
+        self.status_extra = dict(extra or {})
+        self._status_last = 0.0
+        self._status_started = time.time()
+        self._status_offset, self._status_total = 0, None  # set by run_with_checkpoints
+
+    TRACE_LENGTH = 400
+
+    def status(self, step: int = 0, n_steps: int = 0, scheme: str = "regc") -> dict:
+        """
+        A JSON-serialisable snapshot of the simulation's progress and data.
+
+        Parameters
+        ----------
+        step, n_steps : int, optional
+            Progress of the current run call (offset by the steps a
+            checkpointed driver already did). Default 0.
+        scheme : str, optional
+            ``'regc'`` or ``'sweep'``. Default ``'regc'``.
+
+        Returns
+        -------
+        dict
+            See `save_status`.
+        """
+        keys = sorted(self.grid)
+        shape = [int(self.shape[0]), int(self.shape[1])]
+
+        def grid_of(values):
+            out = np.full(shape, np.nan)
+            for k, v in zip(keys, values):
+                out[k] = v
+            return [[None if not np.isfinite(x) else float(x) for x in row] for row in out]
+
+        n_samples, mean_N, std_N, mean_U = [], [], [], []
+        traces_N, traces_U = [], []
+        stride = 1
+        for k in keys:
+            v = self.samples[k]
+            N = np.asarray(v["N"], dtype=float)
+            U = np.asarray(v["U"], dtype=float)
+            n_samples.append(N.size)
+            mean_N.append(N.mean() if N.size else np.nan)
+            std_N.append(N.std() if N.size > 1 else np.nan)
+            mean_U.append(U.mean() if U.size else np.nan)
+            stride = max(stride, int(np.ceil(N.size / self.TRACE_LENGTH)))
+        for k in keys:
+            v = self.samples[k]
+            traces_N.append([float(x) for x in np.asarray(v["N"], dtype=float)[::stride]])
+            traces_U.append([float(x) for x in np.asarray(v["U"], dtype=float)[::stride]])
+        total = self._status_total if self._status_total is not None else n_steps
+        trips = self.round_trip_counts()
+        att = {t: int(a) for t, (a, _) in self.swap_stats.items()}
+        return {
+            "schema": 1, "time": time.time(), "started": self._status_started,
+            "scheme": scheme, "step": int(self._status_offset + step), "n_steps": int(total),
+            "shape": shape, "temperatures": [float(T) for T in self.temperatures],
+            "mu_grid": np.asarray(self.mu_grid, dtype=float).tolist(),
+            "exchange_species": list(self.exchange_species), "keys": [list(k) for k in keys],
+            "replicas": {"n_samples": grid_of(n_samples), "mean_N": grid_of(mean_N),
+                         "std_N": grid_of(std_N), "mean_U": grid_of(mean_U),
+                         "current_N": grid_of([self.grid[k].system.n for k in keys]),
+                         "current_U": grid_of([self.grid[k].energy for k in keys])},
+            "traces": {"stride": stride, "N": traces_N, "U": traces_U},
+            "swap_acceptance": self.swap_acceptance(), "swap_attempts": att,
+            "pairs": [{"a": list(a), "b": list(b), "attempts": int(n), "acceptance": float(acc)}
+                      for (a, b), (n, acc) in sorted(self.pair_acceptance().items())],
+            "round_trips_T": trips["T"].tolist(), "round_trips_mu": trips["mu"].tolist(),
+            "convergence_history": [float(c) for c in self.convergence_history],
+            "records": None if self.records_path is None else {
+                "path": os.path.abspath(self.records_path), "potential": self.records_potential,
+                "every": self.records_every},
+            "configurations_dir": self.configurations_dir,
+            "labels": self.status_extra,
+        }
+
+    def _maybe_write_status(self, step: int, n_steps: int, scheme: str, force: bool = False,
+                            **flags) -> None:
+        """
+        Write the status file if it is due (or `force`).
+
+        Parameters
+        ----------
+        step, n_steps : int
+            Progress of the current run call.
+        scheme : str
+            ``'regc'`` or ``'sweep'``.
+        force : bool, optional
+            Write regardless of the interval. Default False.
+        **flags
+            Extra top-level entries (e.g. ``converged=True``).
+        """
+        if self.status_path is None:
+            return
+        now = time.time()
+        if not force and now - self._status_last < self.status_interval_s:
+            return
+        self._status_last = now
+        data = self.status(step, n_steps, scheme)
+        data.update(flags)
+        tmp = self.status_path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.status_path)), exist_ok=True)
+            with open(tmp, "w") as f:
+                json.dump(data, f, allow_nan=False, default=float)
+            os.replace(tmp, self.status_path)
+        except (OSError, ValueError) as err:  # never stop a run for its heartbeat
+            warnings.warn(f"status file {self.status_path} not written: {err}", stacklevel=2)
+
+    def _flush_records(self) -> None:
+        """Write the queued records to disk."""
+        if self._records is not None:
+            self._records.flush()
+
+    @property
+    def n_substrate(self) -> int:
+        """int: Displaceable (non-frozen) substrate atoms per replica (for the kinetic heat capacity)."""
+        return int(next(iter(self.grid.values())).system.n_substrate)
+
+    @property
+    def observables_meta(self) -> dict:
+        """dict: ``{name: metadata}`` of the recorded observables (see `regc.observables`)."""
+        return {o.name: o.metadata() for o in self.observables}
 
     def _save_trajectory_frame(self, trajectory_dir: str, key: Tuple[int, int], replica: Replica) -> None:
         """

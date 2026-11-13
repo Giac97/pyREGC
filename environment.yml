@@ -24,6 +24,7 @@ dependencies:
   - pymbar>=4.0
   - matplotlib>=3.5
   - pyyaml>=6.0
+  - h5py>=3.0                  # per-sample records (regc.records)
   - lammps=*=cpu*nompi*        # serial CPU build with Python bindings
   - pytest>=7.0
   - pip

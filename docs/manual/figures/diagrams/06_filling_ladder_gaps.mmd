@@ -1,0 +1,13 @@
+flowchart LR
+    accTitle: Filling ladder gaps
+    accDescr: The overlap of neighbouring replicas shows the gaps; the ladder advisor proposes new states there; a fill run starts from stored structures; its samples are merged with the original run for one MBAR analysis, and the advisor is asked again.
+
+    run[("run: samples,<br/>configurations")] --> check["neighbour_overlap:<br/>gaps below target"]
+    check --> advise["suggest_ladder:<br/>points per interval"]
+    advise --> fill["fill run, warm-started<br/>from stored structures"]
+    fill --> merge["merge_samples:<br/>one MBAR over both"]
+    run --> merge
+    merge -->|"ask again"| check
+
+    classDef store fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    class run store

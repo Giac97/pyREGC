@@ -353,3 +353,137 @@ def test_lammps_name_reaches_the_calculator(tmp_path):
     assert spec.make(np.eye(3)).lammps_name == "grace"
     default = _CalculatorSpec({"type": "LAMMPS", "potential": str(pot)}, ["Fe", "H"], {})
     assert default.make(np.eye(3)).lammps_name is None   # REGC_LAMMPS_NAME, else liblammps.so
+
+
+def test_gas_mass_keys_must_be_exchanged_species(base_config):
+    base_config["gas"]["mass_amu"] = {"h": 2.014}  # lower case: not the species 'H'
+    with pytest.raises(ValueError, match="gas.mass_amu"):
+        run_from_config(base_config, verbose=False)
+
+
+def test_hmc_enabled_is_refused_under_the_regc_scheme(base_config):
+    re_cfg = base_config["replica_exchange"]
+    for k in ("n_cycles", "sweeps_per_cycle", "burn_in_cycles"):
+        re_cfg.pop(k)
+    re_cfg.update(scheme="regc", n_steps=10, hmc={"enabled": True})
+    with pytest.raises(ValueError, match="diffusion: hmc"):
+        run_from_config(base_config, verbose=False)
+
+
+def test_observables_heat_capacity_and_configurations_from_config(base_config, tmp_path):
+    base_config["observables"] = [
+        {"type": "coordination", "name": "cn_H_Fe", "r_cut": 2.5},
+        {"type": "coordination_histogram", "name": "cnh", "r_cut": 1.5, "max_cn": 4,
+         "center": "mobile", "neighbor": "mobile", "z_range": [0.0, 20.0]},
+        {"type": "rdf", "name": "rdf_HH", "r_max": 2.9, "n_bins": 29, "a": "mobile", "b": "mobile"},
+    ]
+    base_config["configurations"] = {"save": True, "every": 1}
+    base_config["phase_diagram"].update(
+        heat_capacity=True, most_probable=True, min_ess=0.0, rdf_states=[[400, 1.0]],
+        export_configurations={"mode": "grid", "n_T": 2, "n_p": 3, "tile": True})
+    result = run_from_config(base_config, verbose=False)
+    out = tmp_path / "output"
+    for name in ("phase_diagram_heat_capacity.png", "phase_diagram_cn_cn_H_Fe.png",
+                 "phase_diagram_rdf_rdf_HH.png", "configurations_grid.extxyz",
+                 "configurations_grid_tiled.extxyz", "phase_diagram_most_probable.png"):
+        assert (out / name).exists(), name
+    raw = np.load(out / "phase_diagram_data.npz")
+    assert raw["heat_capacity_kB"].shape == raw["theta"].shape == raw["effective_samples"].shape
+    assert raw["cn_hist_cnh"].shape == raw["theta"].shape + (5,)
+    assert raw["rdf_rdf_HH"].shape == (1, 29)
+    assert 1 <= len(result["exported_configurations"]) <= 6
+    base_config["phase_diagram"]["min_ess"] = 1e9  # nothing reliable: warn, don't fail
+    with pytest.warns(UserWarning, match="not exported"):
+        analyze_from_config(base_config, verbose=False)
+    assert sorted(p.name for p in (out / "configurations").glob("*.extxyz"))[0] == \
+        "configs_T0_mu0.extxyz"
+
+
+def test_bad_observable_config_fails_early(base_config):
+    base_config["observables"] = [{"type": "rdf", "name": "g", "r_max": 2.0, "bins": 10}]
+    with pytest.raises(ValueError, match="observable"):
+        run_from_config(base_config, verbose=False)
+
+
+def test_reliability_outputs_and_bootstrap_from_config(base_config, tmp_path):
+    base_config["phase_diagram"].update(heat_capacity=True, most_probable=True,
+                                        bootstrap={"n": 6, "seed": 1})
+    result = run_from_config(base_config, verbose=False)
+    out = tmp_path / "output"
+    raw = np.load(out / "phase_diagram_data.npz")
+    for key in ("statistical_inefficiency", "n_independent", "overlap_min", "theta_ci_low",
+                "theta_ci_high", "most_probable_agreement", "heat_capacity_ci_low",
+                "heat_capacity_ridges_support", "round_trips_T"):
+        assert key in raw, key
+    assert raw["n_independent"].shape == (2, 2)
+    assert np.all(raw["theta_ci_low"] <= raw["theta_ci_high"] + 1e-12)
+    assert np.all((raw["most_probable_agreement"] >= 0) & (raw["most_probable_agreement"] <= 1))
+    assert (out / "phase_diagram_uncertainty.png").exists() and (out / "mixing.json").exists()
+    lo, hi = result["theta_interval"]
+    assert lo.shape == result["theta_grid"].shape
+
+
+def test_bad_bootstrap_key_is_rejected(base_config):
+    base_config["phase_diagram"]["bootstrap"] = {"n_boot": 10}
+    with pytest.raises(ValueError, match="n_boot"):
+        run_from_config(base_config, verbose=False)
+
+
+def test_merge_runs_and_ladder_suggestion_from_config(base_config, tmp_path):
+    import copy
+    other = copy.deepcopy(base_config)
+    other["replica_exchange"]["mu_eV"] = [1.0]
+    other["output"]["directory"] = str(tmp_path / "fill")
+    run_from_config(other, verbose=False)
+    base_config["phase_diagram"].update(merge=[str(tmp_path / "fill")],
+                                        suggest_ladder={"target_overlap": 0.5})
+    result = run_from_config(base_config, verbose=False)
+    assert len(result["analysis"].states) == 6            # 2 x 2 + 2 x 1 replicas
+    raw = np.load(tmp_path / "output" / "phase_diagram_data.npz")
+    assert raw["n_independent"].shape == (6,) and raw["state_keys"].shape == (6, 3)
+    text = (tmp_path / "output" / "ladder_suggestion.yaml").read_text()
+    assert "fill run" in text or "no gaps" in text
+    # a run of another system is refused
+    bad = copy.deepcopy(other)
+    bad["calculator"]["lj_epsilon"] = 0.5
+    bad["output"]["directory"] = str(tmp_path / "bad")
+    run_from_config(bad, verbose=False)
+    base_config["phase_diagram"]["merge"] = [str(tmp_path / "bad")]
+    with pytest.raises(ValueError, match="calculator"):
+        analyze_from_config(base_config, verbose=False)
+
+
+def test_records_reevaluation_and_reweighted_maps_from_config(base_config, tmp_path):
+    pytest.importorskip("h5py")
+    from regc.records import Records
+    from regc.runner import reevaluate_main
+    base_config["records"] = {"save": True, "potential": "LJ0.3"}
+    run_from_config(base_config, verbose=False)
+    out = tmp_path / "output"
+    assert (out / "records.h5").exists()
+    cfg_path = tmp_path / "run.json"
+    cfg_path.write_text(json.dumps(base_config))
+    same = tmp_path / "same.json"
+    same.write_text(json.dumps({"calculator": base_config["calculator"]}))
+    other = tmp_path / "other.json"
+    other.write_text(json.dumps({"calculator": dict(base_config["calculator"], lj_epsilon=0.33)}))
+    assert reevaluate_main([str(cfg_path), str(same), "--name", "same", "-q"]) == 0
+    assert reevaluate_main([str(cfg_path), str(other), "--name", "eps033", "--every", "2",
+                            "-q"]) == 0
+    rec = Records(str(out / "records.h5"))
+    try:
+        a, b = rec.energies("LJ0.3"), rec.energies("same")
+        assert max(abs(a[k] - b[k]) for k in a) < 1e-9
+        assert "reservoirs:eps033" in rec.attrs
+    finally:
+        rec.close()
+    base_config["phase_diagram"]["potentials"] = ["same", "eps033"]
+    analyze_from_config(base_config, verbose=False)
+    raw = np.load(out / "phase_diagram_data.npz")
+    assert np.allclose(raw["theta_same"], raw["theta"], rtol=1e-9, atol=1e-12)
+    assert np.allclose(raw["ess_same"], raw["effective_samples"], rtol=1e-9)
+    assert raw["theta_eps033"].shape == raw["theta"].shape
+    assert np.all(raw["ess_eps033"] <= raw["effective_samples"] + 1e-9)
+    for name in ("phase_diagram_eps033.png", "phase_diagram_eps033_difference.png",
+                 "phase_diagram_eps033_ess.png"):
+        assert (out / name).exists(), name

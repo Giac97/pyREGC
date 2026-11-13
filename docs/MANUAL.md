@@ -1,5 +1,11 @@
 # regc user manual
 
+> For the physics behind the method, diagrams of how the package works, and
+> illustrated worked examples (observables, heat capacity, phase
+> structures), start with the illustrated manual,
+> [`manual/regc_manual.md`](manual/regc_manual.md) (PDF:
+> `manual/regc_manual.pdf`). This document is the complete reference.
+
 `regc` computes surface phase diagrams: the coverage of an adsorbate on
 a slab as a function of temperature T and gas pressure p. It runs
 replica-exchange grand-canonical Monte Carlo (REGC) on a grid of
@@ -86,6 +92,7 @@ pip install -e ".[dev]"       # editable install + pytest
 | `mbar` | pymbar, scipy | `MBARSurfaceAnalysis` (any phase diagram) |
 | `plot` | matplotlib | `plot_phase_diagram` |
 | `yaml` | PyYAML | `.yaml`/`.yml` configs (JSON needs nothing) |
+| `records` | h5py | per-sample records and reweighting to other potentials (§9.6) |
 
 LAMMPS is not a pip extra. Install it from conda-forge (EAM, ACE/`pace`,
 `grace/fs`). For GRACE-1L/2L/3L models (`pair_style grace/runtime`), build
@@ -572,6 +579,33 @@ calc = LammpsCalculator(pair, ["Fe", "H"], min_distance=0.6, lammps_name="grace"
 - **`pace/runtime`:** reads pacemaker ACE `.yaml` files on the same
   runtime.
 
+**Speed.** An energy call has to send the configuration to LAMMPS and run
+it. LAMMPS's setup for a run (neighbour lists, pair initialisation) costs
+far more than the force evaluation itself for a slab of ~100 atoms, so the
+calculator avoids it where it can:
+
+- **Same atoms, new positions** (MC displacement moves, HMC): only the
+  positions are sent, and the energy comes from `run 1 pre no`, one step
+  with no integrator. It skips the setup but still refreshes the periodic
+  images, and LAMMPS rebuilds the neighbour lists itself when an atom
+  has moved more than half the skin. (`run 0 pre no` would skip the image
+  update and give wrong energies.)
+- **The energy before a trial move** is the one computed at the previous
+  move: the last two configurations are cached, by exact match of
+  positions, species and cell.
+- **After an MD segment** the energy of its last step is reused instead of
+  a new evaluation.
+- **Insertions and deletions** change the atom count and still need a full
+  reload and setup.
+
+On a 60-atom Fe(100) + H slab with an EAM (one core), this made an MC
+move 13× faster (3.6 to 0.27 ms), a REGC step with ten MC moves per
+replica 5.6× faster, and one with 40 MD steps 1.7× faster. Every energy
+agrees with a full setup to round-off; `tests/test_lammps_backend.py`
+checks this along a random walk of moves, insertions, deletions,
+boundary crossings and MD segments. `REGC_LAMMPS_FAST=0` turns the fast
+path off (a full reload and setup for every energy), for checks.
+
 ### 3.3 ASE calculators and parallel runs
 
 ```python
@@ -653,8 +687,12 @@ res = DiatomicReservoir(D0_eV, e_atom_eV, mass_molecule_amu, bond_length_angstro
                         vib_wavenumber_cm, symmetry_number=2)
 ```
 
-O2 has a triplet ground state that the reservoir does not include. It
-shifts μ_O by −½ kT ln 3, about −0.02 eV at 500 K.
+O2 has a triplet ground state (³Σg⁻). `from_calculator` sets
+`electronic_degeneracy=3` for O (1 for every other element), which lowers μ_O
+by ½ kT ln 3 (0.024 eV at 500 K) relative to a closed-shell rotor. With it,
+the O2 gas chemical potential is within 2 meV of NIST-JANAF at 300–1000 K;
+H2 (closed shell) is within 7 meV. Constructing a `DiatomicReservoir`
+directly, pass `electronic_degeneracy` yourself.
 
 ### 4.2 Monatomic gases
 
@@ -813,12 +851,17 @@ print(status.steps_done, status.finished, status.converged, status.resumed_from)
 ```
 
 This runs `run_regc` in chunks of `chunk` steps. After each chunk it
-writes:
+compares every replica's running energy with a full recomputation
+(`sim.check_energies()`): a drift above `energy_tol` (default 1e-6 per
+atom) is resynced with a warning, and smaller round-off is left untouched
+so the run stays bit-identical. Then it writes:
 
 - `samples.npz`, all samples so far;
 - `checkpoint.pkl`, the complete simulation state, including every
   random number generator;
-- `run_metadata.json`, your `metadata`.
+- `run_metadata.json`, your `metadata`;
+- `mixing.json`, swap acceptance per pattern and per pair, and round
+  trips per walker.
 
 How restarts behave:
 
@@ -841,6 +884,45 @@ How restarts behave:
 
 For finer control there are `sim.save_checkpoint(path, extra=None)` and
 `sim.load_checkpoint(path)`.
+
+### 7.1 Watching a run: the live monitor
+
+```bash
+regc-monitor output_fe100_h_eam                    # then open http://127.0.0.1:8050
+regc-monitor run1 run2,run2.log --port 8051        # several runs; DIR,LOG names the log
+python -m regc.monitor runs/                       # a directory of runs: one entry each
+```
+
+The monitor is a small local web page that refreshes every 5 s. It only
+reads files and never touches the run. It shows:
+
+- progress, rate and remaining time;
+- the replica grid (mean, current and spread of N, sample counts, mean
+  and current U). Click a cell to see that replica's recent N and U traces;
+- mean N across the grid against step;
+- swap acceptance per pattern, the worst neighbouring pairs, and the round
+  trips of every walker;
+- the ρ(u) convergence checks;
+- the files written so far (samples, checkpoint, records with the
+  potentials evaluated, analysis results) and the plots of a finished
+  analysis;
+- the last lines of the log.
+
+Most of this comes from `status.json`, a heartbeat the run replaces at
+most every 5 s (`ReplicaExchangeGCMC.save_status(path, interval_s=5)`).
+`regc-run` always writes it, and `run_with_checkpoints` makes its step
+count cover the whole run rather than the current chunk. A run started
+without the heartbeat is still followed through its log (progress lines
+and errors), and through `samples.npz` and `mixing.json` once a
+checkpoint or the end of the run writes them. `records.h5` is summarised
+only when the run is idle, so the monitor never reads a file that is
+being written.
+
+The server listens on 127.0.0.1 only. On a cluster, start it on the node
+(or on the login node, if it sees the output directory) and forward the
+port: `ssh -L 8050:localhost:8050 user@node`. The page loads Plotly from
+a CDN, so the browser needs internet access but the node does not. For an
+offline browser, pass `--plotly-js path/to/plotly.min.js`.
 
 ## 8. Saving and loading samples
 
@@ -918,6 +1000,552 @@ The x axis is log10(p). `coexistence` overlays a list of (T, p) points.
 energies and particle numbers overlap with the target state. Inside the
 sampled (T, p) window this is usually true. Beyond it, the map is an
 extrapolation; mark it as such or extend the ladder.
+`effective_sample_size(T_grid, grid, pressure=True)` gives the Kish
+number of samples carrying each cell's average, 1/Σw². It is about the
+sample count of a simulated state inside the ladder, and about 1 where a
+single sample dominates. Grey out cells below a few tens:
+`plot_map(..., valid=ess >= 20)`.
+
+### 9.1 Structural observables
+
+Anything you can compute from a configuration can be recorded with every
+sample and reweighted by MBAR exactly like N. Pass the observables to the
+engine:
+
+```python
+from regc import CoordinationNumber, CoordinationHistogram, RadialDistribution, FunctionObservable
+
+obs = [
+    CoordinationNumber("cn_HFe", r_cut=2.2, center="mobile", neighbor="substrate"),
+    CoordinationHistogram("cn_Si", r_cut=2.6, max_cn=6, center="substrate", neighbor="all",
+                          z_range=(geometry.top_z - 3.0, geometry.top_z + 0.5)),  # top 3 A
+    RadialDistribution("rdf_HH", r_max=4.5, n_bins=90, a="mobile", b="mobile"),
+    FunctionObservable("height", mean_height),          # any module-level f(system)
+]
+sim = ReplicaExchangeGCMC(T, mus, factory, observables=obs, ...)
+```
+
+- **Atom selections:** `'mobile'` (the exchanged atoms), `'substrate'`
+  (frozen and displaceable), `'all'`, a species (`'H'`), or a species
+  within a group (`'substrate:Si'`). `z_range=(z_min, z_max)` keeps
+  only centre atoms in that slab of absolute z. In a built slab the top
+  frozen layer is at z = 0 and `geometry.top_z` is the height of the
+  topmost slab atom, so `(top_z - 3, top_z + 0.5)` is the top 3 Å
+  (`--check` prints `top_z`). [ZSG]'s "surface region" is defined this
+  way.
+- **Ratios are divided after reweighting.** `CoordinationNumber` records
+  (bonds, centres), and the mean coordination is ⟨bonds⟩/⟨centres⟩.
+  Averaging per-configuration ratios would weight a configuration with
+  one centre atom as much as one with fifty.
+- **Cutoffs** must stay below `system.min_image_radius`, half the
+  smallest cell width. A good bond cutoff is the first minimum of the
+  RDF; [ZSG] chose 2.0 Å for D–Si this way.
+- **Parallel runs:** observables are evaluated in the worker processes,
+  so they must be picklable (no lambdas).
+
+| Method | Gives |
+|---|---|
+| `observable_map(name, T_grid, grid, pressure=False)` | every component of a recorded observable on a mesh |
+| `observable_mean(name, T, mu)` | the same at one state |
+| `mean_coordination(name, T_grid, grid, pressure)` | ⟨bonds⟩/⟨centres⟩ on a mesh (NaN without centre atoms) |
+| `coordination_distribution(name, T, mu)` | P(CN = 0, 1, …, max_cn) of a centre atom ([ZSG]'s H_coord) |
+| `radial_distribution(name, T, mu, normalize)` | `'per_center'`: neighbours per centre per Å, whose integral to r_c is the coordination (use this for surfaces and clusters); `'density'`: local density (1/Å³); `'g'`: bulk g(r) |
+| `phase_diagram(..., observable="height")`, `observable="cn_HFe[bonds]"` | a scalar observable, or one component, wherever an `observable` is accepted |
+
+Observables are stored in `samples.npz` together with their definitions,
+so `load_samples` gives them back without the original objects.
+Checkpoints refuse to continue with different observables.
+
+### 9.2 Heat capacity
+
+[ZSG] PRL 128, 246101 (2022), Eq. (1), locates phase boundaries without
+knowing the phases in advance:
+
+C_V(T, p) = (⟨E²⟩ − ⟨E⟩²) / (k_B T²),
+
+where E = U + K is the total energy and the averages are reweighted by MBAR.
+
+```python
+cv = analysis.heat_capacity(T_grid, p_grid, pressure=True)        # C_V / k_B
+ess = analysis.effective_sample_size(T_grid, p_grid, pressure=True)
+ridges = heat_capacity_ridges(T_grid_K, p_grid, cv, valid=ess >= 20)
+plot_map(T_grid_K, p_grid, cv, "cv.png", valid=ess >= 20, points=ridges["points"],
+         log_color=True, cmap="magma", colorbar_label="$C_V/k_B$")
+```
+
+- **Kinetic energy** is added analytically, so MC runs need no momenta.
+  For n moving atoms (mobile atoms plus displaceable substrate),
+  ⟨K⟩ = (3/2) n k_BT and Var(K) = (3/2) n (k_BT)². `kinetic=False`
+  gives the configurational part Var(U)/(k_BT)².
+- **What it is:** in the grand ensemble this fluctuation formula is
+  exactly d⟨E⟩/dT at fixed βμ, not at fixed p or N. A unit test checks
+  this against a finite difference. An ideal gas gives 15/4 ⟨N⟩.
+- **Ridges:** `heat_capacity_ridges` returns the local maxima along p at
+  fixed T (`along_y`), along T at fixed p (`along_T`), and their union
+  (`points`). [ZSG] draw the phase boundaries through these points. A
+  coverage change without a ridge is a smooth crossover. A ridge that
+  fades out ends at a critical point.
+- **Finite size:** in a small cell every N → N+1 step gives some C_V bump.
+  A first-order boundary shows up as a ridge that stays sharp and tall,
+  and grows with the cell, and as a bimodal P(N) across it (`pN`).
+- **Noise:** C_V is a variance, so it converges more slowly than ⟨N⟩.
+  Compare the first and second halves of the run (`SampleSet.discard`).
+  Raise `prominence` (default 0.2, a 20% bump over the deeper flank) for
+  noisy maps.
+
+### 9.3 The structures behind the phase diagram
+
+Store the configuration of every recorded sample, or every k-th one:
+
+```python
+sim = ReplicaExchangeGCMC(..., configurations_dir="run/configurations", configurations_every=1)
+```
+
+Each grid point gets `configs_T{i}_mu{j}.extxyz`. Every frame carries its
+`sample` index, U and N in the comment line, and a per-atom `group`
+column (0 frozen, 1 substrate, 2 mobile). A resumed run rewrites the
+frames written after the last checkpoint; on reading, the last frame of
+each sample wins.
+
+Then export what the diagram shows:
+
+```python
+from regc import export_phase_configurations
+export_phase_configurations(analysis, "run/configurations", T_grid, p_grid, "phases.extxyz",
+                            pressure=True, mode="phases", min_ess=20, temperature_K=True,
+                            tile_path="phases_tiled.extxyz")
+```
+
+- **Picking:** each cell's phase is its most probable N (or `observable`).
+  The exported structure is the stored sample with the largest MBAR
+  weight there among those with that N: a typical configuration of the
+  phase at that (T, p).
+- **`mode="phases"`:** one frame per connected region of the
+  most-probable-N map, taken where that phase is most probable.
+  `min_cells` drops regions smaller than that many mesh cells.
+- **`mode="grid"`:** one frame per cell; use a coarse mesh.
+- **Frame metadata:** the comment line gives T (and `T_K`), p or μ, the
+  phase, its probability there (`P_phase`), the effective sample size,
+  the sample's weight, and where it came from (`source_T_index`,
+  `source_mu_index`, `source_sample`).
+- **`tile_path`:** puts all frames side by side in one frame (rows T,
+  columns p or μ), a visual phase diagram like pySNOW's replica grid.
+  Per-atom `tile_row` and `tile_col` let a viewer colour or label the
+  tiles.
+
+The files are standard extended XYZ: OVITO, ASE (`ase.io.read(path,
+":")`), VMD and pySNOW open them.
+
+`examples/14_observables_heat_capacity.py` does all three on the [ZSG] LJ
+surface.
+
+### 9.4 Reliability
+
+`regc.diagnostics` says how far to trust a map (the illustrated manual,
+§5.4, shows it on a real run):
+
+```python
+from regc.diagnostics import (bootstrap, neighbour_overlap, replica_inefficiencies,
+                              ridge_support)
+
+ineff = replica_inefficiencies(samples)          # {key: {g_N, g_U, g_u, g, n, n_independent}}
+ov = neighbour_overlap(analysis)                 # {'pairs', 'min_map', 'gaps'}
+b = bootstrap(analysis, lambda a: a.heat_capacity(T, p, pressure=True), n_boot=100)
+lo, hi = b.interval(0.95)                        # percentile interval; b.std(), b.agreement()
+ridges = heat_capacity_ridges(T_K, p, b.estimate, ladder=ladder_p)
+support = ridge_support(ridges, b.replicates)    # fraction of resamples keeping each peak
+```
+
+- **Correlation:** $g = 1 + 2\sum_t\rho(t)$ per replica (Sokal window);
+  a replica with $n/g$ below about 20 cannot support averages, let alone
+  $C_V$. `MBARSurfaceAnalysis(samples, subsample="g")` keeps every g-th
+  sample per replica, so that pymbar's analytical errors (`mean_N`) apply
+  to roughly independent samples. The estimates get noisier; for maps,
+  prefer the full data with bootstrap intervals.
+- **Overlap:** the MBAR overlap of grid neighbours; below about 0.03
+  (Klimovich, Shirts & Mobley, J. Comput.-Aided Mol. Des. 29, 397 (2015))
+  the states between them rest on few samples, and variances such as
+  $C_V$ are biased low there.
+- **Bootstrap:** blocks of about $2g$ consecutive samples per replica,
+  MBAR re-solved for each resample (warm-started Newton, about a second
+  for ~10⁴ samples), any statistic of the analysis. `agreement()` gives
+  the fraction of resamples that keep an integer label (the most probable
+  N). The bootstrap measures noise, not the bias of poor overlap: an
+  artefact peak on a sampled state can have support 1. Use it together
+  with the overlap and ladder checks.
+- **Mixing:** `sim.pair_acceptance()` (per neighbouring pair) and
+  `sim.round_trip_counts()` (per walker, along T and μ); the driver writes
+  both to `mixing.json` after every chunk.
+
+#### 9.4.1 What one bootstrap resample does
+
+`bootstrap(analysis, statistic, n_boot)` answers one question: had the run
+produced a different but statistically equivalent set of samples, how
+much would `statistic(analysis)` change? It cannot rerun the simulation,
+so it builds `n_boot` such sets from the samples it has and repeats the
+whole analysis on each. One resample goes through the following steps
+(code: `regc/diagnostics.py`, `bootstrap` and `_block_resample`;
+`MBARSurfaceAnalysis.resampled`).
+
+**0. Once, before the first resample: block lengths.** For every replica
+$k$ the statistical inefficiency $g_k$ is computed
+(`replica_inefficiencies`): the largest of those of N, U and the reduced
+potential u, each $g = 1 + 2\sum_{t\ge1}\rho(t)$ with the
+autocorrelation $\rho$ summed up to Sokal's window ($c = 5$). The block
+length is $b_k = \lceil 2 g_k\rceil$, at least 1 and at most a quarter of
+the replica's samples. Two inefficiencies per block keep almost all of
+the correlation inside blocks, so consecutive correlated samples are not
+treated as independent (which would make the error bars too small).
+
+**1. Redraw every replica's samples.** For a replica with $n_k$ samples,
+$\lceil n_k / b_k\rceil$ block starts are drawn uniformly from
+$0 \dots n_k - b_k$, with replacement; the blocks are concatenated and
+cut to $n_k$ samples. The result is an index array (`indices[key]`):
+some stretches of the run appear twice, others not at all, and the
+sample count per replica is unchanged. Replicas are resampled
+independently of each other. Replica exchange correlates neighbouring
+replicas a little (a configuration that was at state $k$ is later at
+$k\pm1$), and this correlation is ignored. The intervals can therefore
+be slightly too narrow, the more so when walkers mix slowly (few round
+trips, small neighbour overlaps).
+
+**2. Build the resampled data set.** `_subset_samples` copies every
+per-sample column (U, N, N_ads, N_s, `obs:*`, and `E:*` energies under
+other potentials) at those indices into a new `SampleSet` with the same
+ladder, μ grid, Λ³ and metadata.
+
+**3. Re-solve MBAR.** The resampled set gets its own free energies $f_k$:
+the solution of the MBAR equations
+
+$$\sum_n W_{kn} = N_k, \qquad
+W_{kn} = \frac{N_k\,e^{f_k - u_k(x_n)}}{\sum_j N_j\,e^{f_j - u_j(x_n)}},$$
+
+where $u_k(x_n) = \beta_k(U_n - \mu_k N_n) + N_n\ln\Lambda^3(T_k)$ is
+the reduced potential of sample $n$ at sampled state $k$ (a K × N matrix:
+32 × 38 400 in the Fe–H benchmark below). The package solves this by
+Newton's method on the convex function whose gradient is
+$(\sum_n W_{kn} - N_k)/N$, with the K × K Hessian
+$\mathrm{diag}(\sum_n W_{kn}) - W W^{\mathsf T}$ (divided by $N$), $f_0$
+fixed to 0, steps capped at 5 kT and Armijo backtracking (halve the step
+until the objective decreases enough). It starts from the full data's
+$f_k$, which are within a few tenths of kT of the answer, so a resample
+normally takes 4 to 5 Newton steps (about 0.1 s for 32 states and
+38 400 samples). pymbar is not called for resamples: its setup would
+dominate the cost, and its analytical errors are not needed here.
+
+The solve stops when the largest gradient component falls below
+$10^{-10}$, i.e. when every state's weight sum matches its sample count
+to $10^{-10} N$. Since November 2026 it also stops when the line search
+accepts only steps below $10^{-6}$ of the Newton step while the gradient
+is already below $10^{-6}$ (`stall_tol`). That situation is round-off: the
+objective is a sum of N logarithms, and once the remaining decrease
+along the Newton direction is smaller than its floating-point
+resolution, Armijo's test passes only by noise, after about 25
+halvings. Without this exit, about one resample in eight of the Fe–H
+benchmark ran all 500 allowed Newton steps, each with about 25 objective
+evaluations of 32 × 38 400 exponentials, which took 175–185 s instead of
+0.1 s. The answer is the same either way: on such a resample the two
+solutions differ by 2.7 × 10⁻¹³ kT and the coverage maps by 7 × 10⁻¹⁵ H
+per surface atom; the remaining imbalance is 1.7 × 10⁻⁴ of 38 400
+samples. A bootstrap of 40 resamples of that run now takes 58 s instead
+of up to 16 min.
+
+**4. Rebuild the reweighting.** With the new $f_k$, the log of the mixture
+denominator $\ln\sum_k N_k e^{f_k - u_k(x_n)}$ is stored for every
+sample. The weight of sample $n$ at any target state (T, μ) is then one
+vector operation,
+
+$$w_n(T,\mu) \propto \exp\!\big[-u_{T,\mu}(x_n) - \ln\textstyle\sum_k N_k e^{f_k - u_k(x_n)}\big],$$
+
+normalised to sum to 1. An analysis reweighted to another potential
+(`with_potential`, §9.6) is rebuilt the same way: the resample is first
+solved with the sampling potential, then its target energies are
+switched.
+
+**5. Recompute the statistic.** `statistic(resampled_analysis)` is called
+exactly as on the full data. For a (T, p) coverage map this means, for
+each cell: convert p to μ through the reservoir, compute all weights, and
+average N.
+
+**6. Summarise.** The `n_boot` results form `BootstrapResult.replicates`
+(shape `(n_boot, ...)`):
+
+- `std()`: the standard deviation over resamples, an estimate of the
+  standard error of the full-data value;
+- `interval(level)`: the percentile interval, e.g. the 5th and 95th
+  percentiles for `level=0.9`. With 40 resamples the 5th percentile is
+  the 2nd–3rd smallest value, so the interval edges are themselves noisy;
+  quote 95 % intervals only from a few hundred resamples;
+- `agreement()` (integer maps such as the most probable N): the fraction
+  of resamples that give the same label as the full data.
+
+**What the bootstrap does not measure.**
+
+- **Bias.** Anything that is the same in every resample: a poorly
+  overlapping ladder ($C_V$ peaks on sampled states, §9.2), an
+  unequilibrated start (use `discard` and compare halves), or a potential
+  that is simply wrong.
+- **Correlation between replicas** (step 1). It is the main reason to
+  confirm important numbers with a second, independent run (another
+  `seed`): the scatter between independent runs is the honest error.
+
+**Comparing two estimates** (two runs, or a reweighted map and a direct
+one, as in §9.6): divide the difference by the combined standard error,
+$z = (a - b)/\sqrt{\sigma_a^2 + \sigma_b^2}$. Without bias and with
+correct errors, about 95 % of cells have $|z| < 2$. Do not test whether
+$b$ falls inside $a$'s 90 % band: even with perfect estimates of equal
+error, that happens in only about 75 % of cells, because the band ignores
+$b$'s own error.
+
+### 9.5 Filling ladder gaps: merged runs and the ladder advisor
+
+Where neighbouring replicas barely overlap, add states there and analyse
+the old and new samples together, instead of rerunning everything:
+
+```python
+from regc.diagnostics import suggest_ladder, system_factory_from_configurations
+from regc.io import merge_samples
+
+s = suggest_ladder(analysis, target_overlap=0.03)    # pressure=True for pressure ladders
+print(s.to_config())                                 # fill runs as replica_exchange snippets
+run = s.fill_runs[0]                                 # {'T': ..., 'y': ...}: a rectangular grid
+factory = system_factory_from_configurations(make_system, "run/configurations", analysis,
+                                             run["T"], run["y"])
+with ReplicaExchangeGCMC(list(run["T"]), list(run["y"]), factory, ...) as fill:
+    run_with_checkpoints(fill, "fill", ...)
+
+merged = merge_samples(load_samples("run/samples.npz", discard=0.2),
+                       load_samples("fill/samples.npz", discard=0.2), labels=["run", "fill"])
+analysis = MBARSurfaceAnalysis(merged, reservoir=..., pressure_unit=...)
+```
+
+- **Merging.** MBAR needs every sample's energy and particle numbers and
+  every state's (T, μ), not a rectangular grid. `merge_samples` returns a
+  `SampleSet` keyed `(run, it, imu)` with a `state_table`; the analysis,
+  bootstrap, overlap check and structure export work on it, and
+  `export_phase_configurations` takes one configurations directory per
+  run. It refuses runs with different exchanged species, Λ³ convention or
+  substrate, and drops observables not recorded identically. It cannot
+  see the structure or the potential: merge only runs of the same system
+  (`regc-run` checks `run_metadata.json`). A merged set is not saved;
+  save the runs and merge again after loading.
+- **Solving merged sets.** Each run is solved alone first and the runs
+  are then aligned by one constant each, so the merged solve takes
+  seconds, not the many minutes of a cold start. Merged sets often contain
+  identical states (an end of the fill ladder on an old one), which
+  stalls pymbar's solver, so by default they keep the package's Newton
+  solution (equal to pymbar's to round-off on single runs) and give no
+  analytical errors. Use the bootstrap for those.
+- **The advisor.** For each neighbouring pair (along μ or log p at fixed
+  T, along T at fixed μ or p) with overlap $o$ below the target, the
+  interval between them is cut into $\lceil \ln o / \ln o_\text{target}\rceil$
+  pieces. That is exact for overlap decaying like $e^{-ad}$ with the
+  distance, and conservative for faster decay. Each interval gets one set of
+  points shared by every row, so the fill runs are rectangular: new μ (or
+  p) columns at every temperature, and new temperatures at every μ. One
+  round brings the gaps near the target. Ask again after merging.
+- **Warm starts.** `system_factory_from_configurations` gives each new
+  replica the last stored configuration of the nearest sampled state, in
+  (β, βμ). Build exactly one simulation with it, since it hands out the
+  configurations in grid order.
+
+On the [ZSG] LJ surface run of the illustrated manual (6 × 11 replicas,
+μ every 0.15 eV), the advisor proposes 17 new μ columns for a target of
+0.03 (one fill run of 102 replicas), and 25 columns plus 5 temperatures
+for 0.1. Merging that run with the dense run of the same manual (132
+states, solved in 17 s) cuts the neighbouring pairs below 0.03 from
+118 of 215 to 36 of 231. Inside the dense window, the merged ⟨N⟩ and C_V
+at 290 K stay within the dense run's own 90 % bootstrap band at 81 % and
+87 % of the points.
+
+### 9.6 Other potentials: records, re-evaluation and reweighting
+
+A run samples with one potential A. To learn what another potential B
+(a refitted EAM, a fine-tuned MLIP, a DFT check) would give, without a new
+run, record the samples' configurations, compute their energies under B,
+and reweight:
+
+```python
+from regc.records import attach_energies, reevaluate
+
+with ReplicaExchangeGCMC(..., records_path="run/records.h5", records_potential="EAM") as sim:
+    sim.run_regc(...)                                  # or run_with_checkpoints(sim, "run", ...)
+save_samples(sim, "run/samples.npz")
+
+reevaluate("run/records.h5", make_system_B, "EAMprime", n_workers=8)    # resumable
+samples = attach_energies(load_samples("run/samples.npz", discard=0.2), "run/records.h5")
+A = MBARSurfaceAnalysis(samples, reservoir=res, pressure_unit="bar")
+B = A.with_potential("EAMprime")                       # reservoir=res_B if B binds H2 differently
+theta_B = B.phase_diagram_Tp(T_grid, p_grid, area=n_surf, observable="N")
+ess_B = B.effective_sample_size(T_grid, p_grid, pressure=True)
+dOmega, ess = B.grand_potential_shift(T, mu)           # Omega_B - Omega_A at one state
+```
+
+- **The records file** (`regc.records`, HDF5) holds one row per recorded
+  sample: grid point, sample index, walker, N (and per-species counts),
+  the energy under the sampling potential, and every `records_every`-th
+  configuration (positions as one array with an offset and a length per
+  sample, since N varies). It is flushed at every checkpoint and at the
+  end of every run call. Samples recorded after the last checkpoint of an
+  interrupted run are written again when it resumes, and readers keep the
+  last record of each (state, sample), so a resumed run's records match
+  its samples. In float64, a sample of 60 atoms takes about 1.5 kB.
+- **Re-evaluation.** `reevaluate(path, make_system, name)` rebuilds every
+  stored configuration in a system from `make_system` (same geometry, new
+  calculator) and stores `total_energy()` as `E/<name>`. It writes after
+  every chunk and skips what is done, so an interrupted call can simply be
+  repeated, and calls after a run was extended evaluate only the new
+  samples. Evaluate a subset with `subset=lambda key, s: s % k == 0`.
+  The subset must not depend on the configurations, or the reweighting is
+  biased.
+- **Reweighting.** With $U_B$ known for the samples drawn under A, the
+  weight of sample $n$ at any $(T, \mu)$ under B is
+
+  $$w_n^B \propto \frac{\exp[-\beta U_B(x_n) + \beta\mu N_n - N_n\ln\Lambda^3]}
+  {\sum_k N_k \exp[f_k - u_k^A(x_n)]},$$
+
+  with A's MBAR mixture as the denominator (Shirts and Chodera 2008).
+  `with_potential` returns an analysis whose every map (coverage, most
+  probable N, C_V, observables, effective sample size, structure export)
+  is B's. Samples without a B energy get zero weight. The bootstrap
+  (`regc.diagnostics.bootstrap`) resamples and reweights again, so B's
+  maps get error bars the same way A's do.
+- **Where it works.** The Kish effective sample size of B's weights
+  measures how well A's samples cover B's distribution. Where it is small,
+  B favours configurations that A rarely visited, and only a run with B
+  can say what happens there. Shifts that are linear in N are harmless: a
+  potential $U_B = U_A + cN$ is A at $\mu - c$, and the reweighting
+  reproduces that exactly (a test checks it to round-off). Changes in site
+  preference or in the H–H interaction are what limit the overlap.
+- **Chemical potentials.** μ keeps its meaning only if both potentials
+  put the reservoir's reference (the isolated H2 molecule, $D_0$, $e_\text{atom}$)
+  at the same energy. If B binds H2 differently, pass B's reservoir
+  (`with_potential(name, reservoir=res_B, pressure_unit=...)`) so the
+  pressure axis is B's. `regc-reevaluate` stores B's reservoir in the
+  records file, and the runner uses it.
+- **Grand-potential shift.** `grand_potential_shift(T, mu)` is
+  $\Omega_B - \Omega_A = -k_BT \ln\langle e^{-\beta(U_B - U_A)}\rangle_A$
+  (Zwanzig's free-energy perturbation in the grand ensemble). It is
+  reliable only where the effective sample size is large.
+- **LAMMPS and h5py.** A conda-forge LAMMPS can link a different HDF5
+  than h5py's, and h5py then fails to import once LAMMPS is loaded. regc
+  imports h5py before it loads LAMMPS, so this matters only if your own
+  script starts LAMMPS before importing regc.
+
+#### 9.6.1 Benchmark: Fe(100)–H, EAM → EAM′
+
+Does reweighting to another potential give what a run with that
+potential gives? The benchmark is H on Fe(100), sampled with an EAM and
+reweighted to a modified EAM′, compared with a run made directly with
+EAM′.
+
+**The two potentials.**
+
+- **EAM (A, sampling):** the Fe–H embedded-atom potential of Wen,
+  Comput. Mater. Sci. 197, 110640 (2021) (`examples/FeH_Wen.eam.fs`),
+  in LAMMPS.
+- **EAM′ (B):** the same potential plus a weak Fe–H Morse attraction,
+  $V(r) = D[(1 - e^{-\alpha(r - r_0)})^2 - 1]$ with $D = 0.01$ eV,
+  $\alpha = 1.5$ Å⁻¹, $r_0 = 2.0$ Å, cut at 3 Å
+  (`pair_style hybrid/overlay eam/fs morse 3.0`). It binds an adsorbed H
+  a few hundredths of an eV more strongly, depending on its site.
+  Fe–Fe and H–H are untouched, so the lattice constant (2.8549 Å from
+  the potential), the slab, the H2 reservoir ($D_0$ = 4.4577 eV, computed
+  with the potential) and the μ ladder are identical for both
+  (`regc-run --check` prints the same setup).
+
+**The runs.** The setup is the same for both, only the calculator differs:
+
+| Setting | Value |
+|---|---|
+| Slab | Fe(100), 3 × 3 × 4 cell (8.565 × 8.565 Å), 2 frozen + 2 displaceable layers (18 + 18 atoms), 9 surface atoms |
+| Gas | H from H2, insertions in z ∈ (0, 7.85] Å (subsurface included) |
+| Grid | T = 400, 500, 625, 780 K × $p_{H_2}$ = 10⁻⁶ … 100 bar (8 values, factor 13.9) = 32 replicas |
+| Sampling | REGC, $x_0$ = 0.9, MC diffusion (20 moves), 15 000 steps, a sample every 10 steps |
+| Samples | 1500 per replica, the first 20 % discarded: 1200 per replica, 38 400 in all |
+| Records | `records: {save: true}`: 48 000 records with configurations, 52.7 MB (float64) |
+| Cost | 2 h 10 min (EAM) and 2 h 25 min (EAM′ direct), 6 workers each, on a shared 14-core workstation |
+
+**The workflow.**
+
+```bash
+regc-run base.yaml                                           # EAM, with records
+regc-reevaluate base.yaml eam_prime.yaml --name EAMprime --workers 6
+# phase_diagram: {potentials: [EAMprime], ...}, then:
+regc-run base.yaml --analyze-only
+```
+
+Re-evaluating all 48 000 stored configurations with EAM′ took **77 s**
+on 6 workers (1.6 ms per configuration), against 2 h 25 min for the
+direct EAM′ run.
+
+**Energy check.** Every 25th stored configuration of each run (1920 per
+run) was evaluated again from scratch with its own potential. The
+energies recorded during sampling, computed by the LAMMPS fast path, agree
+to 7.6 × 10⁻¹² eV in both runs. The direct EAM′ run therefore samples
+exactly the model that the re-evaluation computes, including the
+`hybrid/overlay` pair style.
+
+**Results** (coverage = H per surface Fe on a 20 T × 33 p mesh; error bars
+from 40 block-bootstrap resamples of each run; data and figure from
+`docs/manual/make_figures.py --reweight-npz`):
+
+![EAM reweighted to EAM′ vs a direct EAM′ run](manual/figures/feh_reweighting.png)
+
+*(a) Coverage at 400 and 780 K: EAM as sampled (dotted), reweighted to
+EAM′ (dashed, with its 90 % bootstrap band) and the direct EAM′ run
+(solid). (b) Reweighted minus direct, in units of the combined bootstrap
+standard error; hatched cells would have fewer than 20 effective samples
+(there are none). (c) Effective sample size of the EAM samples under
+EAM′, relative to EAM's own.*
+
+| Quantity | Value |
+|---|---|
+| Coverage, EAM / EAM′ direct | 0.002–1.80 / 0.003–1.83 H per surface Fe |
+| Effect of EAM′ (direct EAM′ − EAM) | up to 0.17, mean 0.09 H per surface Fe |
+| Reweighted − direct | mean \|d\| 0.010, max 0.074 H per surface Fe |
+| Bootstrap standard error (median over cells) | 0.005 reweighted, 0.006 direct |
+| \|z\| < 2 / < 3 | 94 % / 99 % of the 660 cells; max \|z\| = 3.3 |
+| Mean z | +1.0 (spread 0.67): reweighted systematically slightly higher |
+| Fraction of the EAM→EAM′ shift recovered | median 1.07, 5–95 %: 0.98–1.26 (527 cells where the shift exceeds 0.05) |
+| Effective samples under EAM′ | min 759, median 7713 (EAM: min 2081, median 8294); ratio median 0.91, min 0.37 |
+| Ω_EAM′ − Ω_EAM on the sampled states | −0.001 eV (780 K, 10⁻⁶ bar) to −0.54 eV (400 K, 100 bar) |
+
+What this shows:
+
+- **Reweighting reproduces the change.** Where EAM′ raises the coverage
+  by 0.05–0.17 H per surface Fe, the reweighted map recovers that shift
+  to within about 10 % of the shift, everywhere within 3.3 combined
+  standard errors. It costs 77 s instead of a 2.4 h run.
+- **The overlap is good everywhere.** The EAM samples keep at least 37 %
+  (median 91 %) of their effective sample size under EAM′. Overlap is
+  lowest at 400 K and high pressure, where the most H is adsorbed and the
+  per-atom change adds up (the grand potential differs by up to 0.54 eV
+  there, panel c and the last table row).
+- **A small systematic offset remains.** The reweighted coverage is
+  higher than the direct one by about 0.01 H per surface Fe (about one
+  combined standard error, panel b). Part of it is not resolved by this
+  benchmark:
+  - It is not a code error: the energy check above rules out any
+    difference between the model sampled and the model re-evaluated.
+  - It is not overlap: with at least 759 effective samples per cell, the
+    bias of the reweighting ratio is far smaller.
+  - It is the same in both halves of the runs (+0.011 from samples
+    20–60 %, +0.009 from 60–100 %). Both runs creep upwards between
+    halves (EAM by 0.003, the direct EAM′ run by 0.005), so slow
+    equilibration of the direct run accounts for part of it.
+  - The rest is within what one pair of runs can show: the bootstrap
+    treats replicas as independent (§9.4.1), and this ladder is coarse
+    (26 of 94 neighbouring pairs overlap less than 0.03; the
+    `cross_left` diagonal swaps are accepted in 6.5 % of attempts, and
+    never for several pairs). A second
+    pair of runs with another `seed` would measure the run-to-run
+    scatter directly.
+- **For a real comparison** (EAM vs an MLIP, an MLIP vs DFT): use the
+  effective-sample-size map to see where the reweighted answer can be
+  trusted. Treat differences of about one bootstrap standard error as
+  unresolved, and confirm the important region with a short direct run
+  of the other potential.
 
 ## 10. Several gas species
 
@@ -1616,7 +2244,13 @@ directory then holds `checkpoint.pkl`, `samples.npz`,
 ```
 regc-run CONFIG [--check | --analyze-only] [--resume] [--overwrite]
                    [--time-limit SECONDS] [--workers N] [-q]
+regc-reevaluate CONFIG POTENTIAL --name NAME [--every K] [--workers N] [-q]
+regc-monitor DIR[,LOG] [DIR[,LOG] ...] [--port 8050] [--host 127.0.0.1] [--open]
+                   [--plotly-js FILE]
 ```
+
+`regc-monitor` serves the live web monitor of one or more runs
+([§7.1](#71-watching-a-run-the-live-monitor)).
 
 | Option | Effect |
 |---|---|
@@ -1628,6 +2262,17 @@ regc-run CONFIG [--check | --analyze-only] [--resume] [--overwrite]
 | `--time-limit S` | Stop cleanly before a chunk that would end after S seconds. Overrides `checkpoint.time_limit_s`. |
 | `--workers N` | Override `replica_exchange.n_workers`. |
 | `-q`, `--quiet` | No progress output. |
+
+`regc-reevaluate` computes the energies of the configurations a run
+recorded (`records: {save: true}`) under another potential. `POTENTIAL`
+is a YAML/JSON file with a `calculator` section (and optionally any
+other top-level section to replace, e.g. `reservoir`). The run's config
+with those sections replaced must build the same cell. If the lattice
+constant comes from the potential (`a: auto`), fix it in `structure`.
+The energies go to `records.h5`, and B's reservoir is stored with them.
+Then list the name under `phase_diagram.potentials` and run
+`regc-run CONFIG --analyze-only`. `--every K` evaluates every K-th stored
+sample. The command can be interrupted and run again.
 
 **Exit codes:** 0 when finished. 75 (`EXIT_RESUBMIT`) when a
 checkpointed run stopped for the time limit: resubmit with `--resume`.
@@ -1760,6 +2405,7 @@ species, key the section by species: `reservoir: {O: {...}, Cl: {...}}`.
 | `e_atom_eV` | from the calculator | Isolated-atom energy, the zero of μ. |
 | `bond_length_angstrom`, `vibrational_wavenumber_cm` | H2 values for H | Required for other elements. |
 | `symmetry_number` | 2 | Rotational symmetry number. |
+| `electronic_degeneracy` | 3 for O, else 1 | Degeneracy of the molecule's electronic ground state. |
 | `mass_molecule_amu` | 2 × atomic mass | Molecular mass. |
 | `mass_amu` | gas mass | Monatomic: the atom's mass. |
 
@@ -1828,6 +2474,42 @@ With this section the run goes through `run_with_checkpoints`
 | `directory` | `trajectories` | Under `output.directory`. |
 | `every` | `record_every` | Steps (regc) or cycles (sweep) between frames. |
 
+### 14.7b `observables` and `configurations`
+
+`observables` is a list; each entry is one structural observable
+([§9.1](#91-structural-observables)):
+
+```yaml
+observables:
+  - {type: coordination, name: cn_HFe, r_cut: 2.2}                   # center mobile, neighbor substrate
+  - {type: coordination_histogram, name: cn_top, r_cut: 2.6, max_cn: 6,
+     center: substrate, neighbor: all, z_range: [2.0, 5.5]}         # absolute z; top_z from --check
+  - {type: rdf, name: rdf_HH, r_max: 4.5, n_bins: 90, a: mobile, b: mobile}
+configurations: {save: true, every: 1}        # -> output/configurations/configs_T*_mu*.extxyz
+```
+
+| `configurations` key | Default | Meaning |
+|---|---|---|
+| `save` | false | Store the configuration of recorded samples. |
+| `every` | 1 | Every this many samples. |
+| `directory` | `configurations` | Under `output.directory`. |
+
+Every coordination-number observable is mapped automatically
+(`<plot>_cn_<name>.png`); histograms are saved to
+`phase_diagram_data.npz`.
+
+### 14.7c `records`
+
+Per-sample records for re-evaluation with other potentials ([§9.6](#96-other-potentials-records-re-evaluation-and-reweighting)). Needs h5py.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `save` | false | Write `records.h5` (a fresh run replaces an old file; `--resume` appends). |
+| `file` | `records.h5` | Under `output.directory`. |
+| `potential` | `sampling` | Name of the sampling potential in the file. |
+| `every` | 1 | Store the configuration of every this many samples (energies and N of all). |
+| `positions` | `float64` | `float32` halves the file; energies then change by about 1e-6 relative. |
+
 ### 14.8 `phase_diagram`
 
 | Key | Default | Meaning |
@@ -1838,7 +2520,15 @@ With this section the run goes through `run_with_checkpoints`
 | `observable` | `N` | `N`, `N_ads` (needs `adsorbed_cutoff`) or `N_<species>`. |
 | `coverage_per` | `area` (slab), `surface_atom` (cluster) | `area` (per Å², slab only), `surface_atom` (per top-layer or cluster-surface atom), `atom` (per slab or cluster atom) or `none` (absolute count). |
 | `most_probable` | false | Also compute and plot the most probable N (`<plot>_most_probable.png`). |
-| `discard` | 0.0 | Fraction of each replica's samples dropped as equilibration. |
+| `discard` | 0.2 | Fraction of each replica's samples dropped as equilibration (0 keeps all; check that the result does not change when you raise it). |
+| `min_ess` | 0 | Cells with fewer effective samples (Kish, [§9](#9-analysis-with-mbar)) are drawn grey and skipped by the ridge search and the export. 20–50 is a sensible value. |
+| `heat_capacity` | false | Compute C_V/k_B ([§9.2](#92-heat-capacity)) and its ridges; writes `<plot>_heat_capacity.png`. |
+| `rdf_states` | – | `[[T_K, p], ...]`: plot every `rdf` observable at these states (`<plot>_rdf_<name>.png`). |
+| `export_configurations` | – | `phases` or `grid`, or `{mode, n_T, n_p, min_cells, tile}` (grid defaults 5 × 6, `tile: true`): write `configurations_<mode>.extxyz` (+ `_tiled`) from the stored configurations ([§9.3](#93-the-structures-behind-the-phase-diagram)). Needs `configurations: {save: true}`. |
+| `merge` | – | Output directories of other runs of the same system (same structure, calculator, species, reservoirs, checked from `run_metadata.json`): their samples are analysed together with this run's ([§9.5](#95-filling-ladder-gaps-merged-runs-and-the-ladder-advisor)), and the structure export reads every run's configurations. |
+| `suggest_ladder` | – | `true`, or `{target_overlap: 0.1, max_insert: 4}`: write `ladder_suggestion.yaml`, the fill runs (temperatures and pressures or μ) that would lift every neighbouring pair to the target overlap. |
+| `potentials` | – | Names of potentials evaluated with `regc-reevaluate`: for each, the coverage map reweighted to it (`<plot>_<name>.png`), its difference from the sampling potential's (`_difference`), and its effective sample size (`_ess`); `theta_<name>` and `ess_<name>` in `phase_diagram_data.npz`. Cells with fewer than `max(min_ess, 1)` effective samples are greyed. |
+| `bootstrap` | – | `true`, or `{n: 100, seed: 0, level: 0.95, min_agreement: 0.8, min_support: 0.95}`: block-bootstrap the coverage, most-probable-N and (with `heat_capacity`) C_V maps ([§9.4](#94-reliability)). Writes the intervals and `<plot>_uncertainty.png`; hatches most-probable cells whose label is kept in fewer than `min_agreement` of the resamples; shows only C_V peaks with support ≥ `min_support` that are not on the sampled pressures. |
 
 This section is checked before sampling starts, so a typo here does not
 cost you the run.
@@ -1881,8 +2571,17 @@ Everything goes to `output.directory`:
 | `checkpoint.pkl` | With a `checkpoint` section: the full simulation state. |
 | `phase_diagram.png` | The coverage map. |
 | `phase_diagram_most_probable.png` | With `most_probable: true`. |
-| `phase_diagram_data.npz` | `T_K`, `p`, `pressure_unit`, `p_atm`, `theta` (n_T × n_p), `observable`, `coverage_per`, and `most_probable_N` if computed. |
+| `phase_diagram_data.npz` | `T_K`, `p`, `pressure_unit`, `p_atm`, `theta` (n_T × n_p), `observable`, `coverage_per`, `effective_samples`, and if computed `most_probable_N`, `heat_capacity_kB`, `heat_capacity_ridges_T_K_p`, `cn_<name>`, `cn_hist_<name>` (n_T × n_p × bins), `rdf_<name>` (+ `_r`, `_states`). |
+| `phase_diagram_heat_capacity.png`, `_cn_<name>.png`, `_rdf_<name>.png` | With `heat_capacity`, coordination observables, `rdf_states`. |
 | `trajectories/replica_T*_mu*.xyz` | With `trajectory.save`. |
+| `configurations/configs_T*_mu*.extxyz` | With `configurations.save`: sample-tagged structures. |
+| `configurations_<mode>.extxyz`, `configurations_<mode>_tiled.extxyz` | With `export_configurations`. |
+| `status.json` | Always: the live heartbeat read by `regc-monitor` (progress, per-replica counts and averages, recent N and U traces, swap statistics, convergence checks), replaced every 5 s. |
+| `records.h5` | With `records.save`: per-sample records and energies under re-evaluated potentials ([§9.6](#96-other-potentials-records-re-evaluation-and-reweighting)). |
+| `phase_diagram_<name>.png`, `_<name>_difference.png`, `_<name>_ess.png` | With `phase_diagram.potentials`. |
+| `mixing.json` | Swap acceptance per pattern and per neighbouring pair (with the worst pair), and round trips per walker along T and μ; rewritten after every chunk. |
+| `phase_diagram_uncertainty.png` | With `bootstrap`: half-width of the coverage interval. |
+| reliability keys of `phase_diagram_data.npz` | Always: `statistical_inefficiency`, `n_independent`, `overlap_min` (replica grid), `round_trips_T` (with `mixing.json`); C_V: `heat_capacity_ridges_kept` (and `heat_capacity_ridges_on_ladder` with a pressure ladder). With `bootstrap`: `theta_ci_low`/`theta_ci_high`, `most_probable_agreement`, `heat_capacity_ci_low`/`heat_capacity_ci_high`, `heat_capacity_ridges_support`, `bootstrap_level`, `bootstrap_n`. |
 
 To replot or post-process:
 

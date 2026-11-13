@@ -59,3 +59,6 @@ venv.bak/
 
 # Written by setuptools-scm at install time
 regc/_version.py
+
+# manual build intermediates
+docs/manual/_build/

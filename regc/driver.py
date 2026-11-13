@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import warnings
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
@@ -30,6 +31,43 @@ EXIT_RESUBMIT = 75
 CHECKPOINT_FILE = "checkpoint.pkl"
 SAMPLES_FILE = "samples.npz"
 METADATA_FILE = "run_metadata.json"
+MIXING_FILE = "mixing.json"
+
+
+def write_mixing(sim, path: str) -> dict:
+    """
+    Write the replica-exchange mixing statistics of a simulation as JSON.
+
+    Parameters
+    ----------
+    sim : ReplicaExchangeGCMC
+        The simulation.
+    path : str
+        Output file.
+
+    Returns
+    -------
+    dict
+        What was written: acceptance per pattern, per pair (with the worst
+        pair), and the round trips of every walker along T and mu.
+    """
+    pairs = sim.pair_acceptance()
+    worst = min(pairs.items(), key=lambda kv: kv[1][1]) if pairs else None
+    trips = sim.round_trip_counts()
+    data = {
+        "swap_acceptance": sim.swap_acceptance(),
+        "pairs": [{"a": list(a), "b": list(b), "attempts": n, "acceptance": acc}
+                  for (a, b), (n, acc) in sorted(pairs.items())],
+        "worst_pair": None if worst is None else {"a": list(worst[0][0]), "b": list(worst[0][1]),
+                                                  "attempts": worst[1][0],
+                                                  "acceptance": worst[1][1]},
+        "round_trips_T": trips["T"].tolist(), "round_trips_mu": trips["mu"].tolist(),
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+    return data
 
 
 @dataclass
@@ -73,13 +111,18 @@ def _check_metadata(path: str, metadata: dict) -> None:
     Raises
     ------
     ValueError
-        If a key's value differs (after a JSON round trip).
+        If a key's value differs (after a JSON round trip), or a key is
+        present on only one side.
     """
     with open(path) as f:
         saved = json.load(f)
     current = json.loads(json.dumps(metadata, default=float))
+    only = sorted(set(saved) ^ set(current))
+    if only:
+        raise ValueError(f"cannot resume: metadata keys {only} are in only one of the current "
+                         f"run and {path}")
     for key, value in current.items():
-        if key in saved and saved[key] != value:
+        if saved[key] != value:
             raise ValueError(f"cannot resume: '{key}' is {value!r} now but {saved[key]!r} in {path}")
 
 
@@ -90,6 +133,7 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
                          resume: bool = True, overwrite: bool = False,
                          metadata: Optional[dict] = None,
                          progress: Optional[Callable[[str], None]] = print,
+                         energy_tol: float = 1e-6,
                          **diffusion_kwargs) -> RunStatus:
     """
     Run `sim.run_regc` in checkpointed chunks.
@@ -105,15 +149,18 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
     n_steps : int
         Total REGC steps of the run (over all resumptions).
     chunk : int, optional
-        Steps between checkpoints. Default 1000.
+        Steps between checkpoints; a multiple of `record_every` (and of
+        ``trajectory_every`` if given). Default 1000.
     x0, diffusion, diffusion_steps, record_every
         Passed to `ReplicaExchangeGCMC.run_regc`.
     convergence_every : int, optional
         Check rho(u) convergence every this many steps (rounded up to a
         multiple of `chunk`); also at the end. Default None: no checks.
     convergence_tol : float, optional
-        Converged when the largest change of rho(u) between checks is below
-        this. Default 0.05.
+        Converged when rho(u) of the samples since the last check and of
+        the interval before it differ (largest total-variation distance) by
+        less than this; see `ReplicaExchangeGCMC.rho_u_change` for the
+        noise floor. Default 0.05.
     time_limit : float, optional
         Seconds: stop (``finished=False``) before starting a chunk that is
         expected to end later than this, measured from the call. Default
@@ -130,6 +177,10 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
     progress : callable, optional
         Called with a one-line status after every chunk. Default `print`;
         None for silence.
+    energy_tol : float, optional
+        After every chunk each replica's running energy is compared with a
+        full recomputation (`ReplicaExchangeGCMC.check_energies`); a drift
+        above this, per atom, is resynced with a warning. Default 1e-6.
     **diffusion_kwargs
         Passed to `run_regc` (e.g. ``timestep_fs``, ``taut_fs``).
 
@@ -143,19 +194,28 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
     FileExistsError
         If `out_dir` holds a run and neither `resume` nor `overwrite` is set.
     ValueError
-        On resume, if the checkpoint or `metadata` do not match `sim`.
+        If `chunk` is not a multiple of `record_every`; on resume, if the
+        checkpoint or `metadata` do not match `sim`.
     """
+    if chunk % record_every:
+        raise ValueError(f"chunk ({chunk}) must be a multiple of record_every ({record_every}): "
+                         f"each chunk counts steps from 1, so other chunks drop samples and "
+                         f"space them unevenly")
+    traj_every = diffusion_kwargs.get("trajectory_every")
+    if traj_every and chunk % traj_every:
+        raise ValueError(f"chunk ({chunk}) must be a multiple of trajectory_every ({traj_every})")
     os.makedirs(out_dir, exist_ok=True)
     ckpt = os.path.join(out_dir, CHECKPOINT_FILE)
     meta_path = os.path.join(out_dir, METADATA_FILE)
     metadata = dict(metadata or {})
-    done, n_at_last_check, changes, converged = 0, None, [], False
+    done, n_at_last_check, n_at_check_before, changes, converged = 0, None, None, [], False
 
     if os.path.isfile(ckpt) and resume:
         if os.path.isfile(meta_path):
             _check_metadata(meta_path, metadata)
         extra = sim.load_checkpoint(ckpt)
         done, n_at_last_check = extra["steps_done"], extra["n_at_last_check"]
+        n_at_check_before = extra.get("n_at_check_before")
         changes, converged = list(extra["rho_u_changes"]), extra["converged"]
         if progress:
             progress(f"resumed from {ckpt} at step {done}")
@@ -176,17 +236,30 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
             return RunStatus(done, False, False, changes, resumed_from)
         t_chunk = time.time()
         n = min(chunk, n_steps - done)
+        sim._status_offset, sim._status_total = done, n_steps  # whole-run progress in status.json
         sim.run_regc(n_steps=n, x0=x0, diffusion=diffusion, diffusion_steps=diffusion_steps,
                      record_every=record_every, verbose=False, **diffusion_kwargs)
         done += n
+        drifts = sim.check_energies(energy_tol)
+        bad = {k: d for k, (d, resynced) in drifts.items() if resynced}
+        if bad:
+            k, d = max(bad.items(), key=lambda kv: abs(kv[1]))
+            warnings.warn(f"step {done}: the running energy of {len(bad)} replica(s) drifted from a "
+                          f"full recomputation (largest {d:.3g} at {k}); resynced. Persistent "
+                          f"drift means the calculator's incremental and full energies disagree",
+                          stacklevel=2)
         if convergence_every is not None and (done % convergence_every == 0 or done >= n_steps):
             n_now = len(next(iter(sim.samples.values()))['U'])
-            if n_at_last_check is not None and n_at_last_check >= 2:
-                changes.append(sim.rho_u_change(n_at_last_check))
+            if (n_at_check_before is not None and n_at_last_check - n_at_check_before >= 2
+                    and n_now - n_at_last_check >= 2):
+                # disjoint blocks: since the last check vs the interval before it
+                changes.append(sim.rho_u_change(n_at_last_check, n_start=n_at_check_before))
                 converged = changes[-1] < convergence_tol
-            n_at_last_check = n_now
+            n_at_check_before, n_at_last_check = n_at_last_check, n_now
         save_samples(sim, os.path.join(out_dir, SAMPLES_FILE))
+        write_mixing(sim, os.path.join(out_dir, MIXING_FILE))
         sim.save_checkpoint(ckpt, extra={"steps_done": done, "n_at_last_check": n_at_last_check,
+                                         "n_at_check_before": n_at_check_before,
                                          "rho_u_changes": changes, "converged": converged})
         last_chunk = time.time() - t_chunk
         if progress:

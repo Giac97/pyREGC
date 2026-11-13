@@ -154,3 +154,54 @@ def test_lowest_energy_map():
     assert list(Ns) == [0, 1, 2, 3] and list(E) == [0.0, -1.0, -1.5, -2.9]
     # E - mu*N: at mu = -2: N=0 wins; at mu = 0: N=3 wins
     assert list(a.lowest_energy_N([-2.0, 0.0])) == [0, 3]
+
+
+def test_driver_rejects_chunk_not_a_multiple_of_record_every(tmp_path):
+    with pytest.raises(ValueError, match="record_every"):
+        run_with_checkpoints(_sim(), str(tmp_path), n_steps=300, chunk=25, record_every=10,
+                             diffusion='mc_moves', progress=None)
+
+
+def test_driver_metadata_keys_must_match_both_ways(tmp_path):
+    kw = dict(n_steps=40, chunk=20, x0=0.8, diffusion='mc_moves', diffusion_steps=2,
+              record_every=10, progress=None)
+    run_with_checkpoints(_sim(), str(tmp_path), metadata={"potential": "LJ"}, **dict(kw, n_steps=20))
+    with pytest.raises(ValueError, match="only one"):
+        run_with_checkpoints(_sim(), str(tmp_path), metadata={"potential": "LJ", "facet": "100"},
+                             **kw)
+
+
+def test_resume_uses_the_current_calculator(tmp_path):
+    """The checkpoint supplies configurations; the calculator is the current
+    setup's (a moved potential file, a new setting): energies are resynced."""
+    sim = _sim()
+    sim.run_regc(n_steps=50, x0=0.8, diffusion='mc_moves', diffusion_steps=3, record_every=10,
+                 verbose=False)
+    path = str(tmp_path / "c.pkl")
+    sim.save_checkpoint(path)
+
+    same = _sim()
+    same.load_checkpoint(path)
+    for key, r in same.grid.items():
+        assert r.energy == sim.grid[key].energy  # unchanged when the calculator agrees
+
+    def deeper(rng):
+        return BulkSystem(5.0, LJCalculator(1.0, 2.0, 2.5))
+    other = ReplicaExchangeGCMC([0.9, 1.2], [[-3.5, -3.0], [-3.5, -3.0]], deeper, seed=4,
+                                lambda_cubed_of_T=ThermalWavelengthCubed(20.0))
+    with pytest.warns(UserWarning, match="different energies"):
+        other.load_checkpoint(path)
+    for key, r in other.grid.items():
+        assert r.system.calculator.epsilon == 2.0
+        assert r.energy == pytest.approx(r.system.total_energy())
+
+
+def test_single_species_rejects_foreign_mobile_labels():
+    with pytest.raises(ValueError, match="not the exchanged species"):
+        SlabSystem(5.0, 5.0, 8.0, LJCalculator(1.0, 1.0, 2.5), exchange_species="H",
+                   positions=[[1.0, 1.0, 1.0]], species=["O"])
+
+
+def test_unequal_insert_delete_probabilities_are_refused():
+    with pytest.raises(ValueError, match="p_insert"):
+        _sim().run(n_cycles=1, sweeps_per_cycle=5, p_insert=0.4, p_delete=0.1, verbose=False)

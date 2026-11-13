@@ -29,9 +29,11 @@
 #   model's D0. Experiment gives 5.12 eV. A D0 far from that with a sensible
 #   O2 bond length usually just reflects a bad e_atom, which cancels here.
 #   Setting D0_eV: 5.116 instead would bring that bad e_atom back into mu_O.
-# - Spin. The reservoir treats O2 as a closed-shell rotor. The triplet ground
-#   state's degeneracy would lower mu_O by (kT/2) ln 3: 0.014 eV at 300 K,
-#   0.047 eV at 1000 K.
+# - Spin. The reservoir includes O2's triplet ground state
+#   (electronic_degeneracy: 3, the default for O), which lowers mu_O by
+#   (kT/2) ln 3: 0.014 eV at 300 K, 0.047 eV at 1000 K. Runs made before this
+#   was added (and before the rotational reduced mass was fixed) have mu_O
+#   too high by (kT/2) ln 1.5, i.e. O2 pressures labelled 1.5x too low.
 #
 # Cost: 64 Pd + O atoms. A GRACE-2L energy call takes roughly 30-60 ms on one
 # core, and there are 48 replicas. Use as many workers as replicas, on a

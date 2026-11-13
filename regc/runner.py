@@ -70,6 +70,7 @@ import functools
 import importlib
 import json
 import os
+import warnings
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -77,21 +78,44 @@ import numpy as np
 #: One time unit of (Angstrom, amu, eV), in fs: HMC timesteps given in fs are divided by it.
 FS_PER_INTERNAL_TIME = 10.1805
 
+
+def _available_cpus() -> int:
+    """
+    CPUs this process may run on (respects Slurm/cgroup affinity, unlike os.cpu_count).
+
+    Returns
+    -------
+    int
+        The number of usable CPUs, at least 1.
+    """
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:  # not on Linux
+        return os.cpu_count() or 1
+
 _SECTIONS = {
     "structure": {"file", "build", "cluster", "geometry", "n_frozen_layers", "headroom_angstrom",
                   "layer_tol", "frozen", "full_coordination"},
     "gas": {"species", "mass_amu", "insertion_z_range_above_surface",
             "insertion_shell_around_cluster", "composition"},
     "reservoir": {"type", "d0", "D0_eV", "e_atom_eV", "bond_length_angstrom",
-                  "vibrational_wavenumber_cm", "symmetry_number", "mass_molecule_amu", "mass_amu"},
+                  "vibrational_wavenumber_cm", "symmetry_number", "electronic_degeneracy",
+                  "mass_molecule_amu", "mass_amu"},
     "trajectory": {"save", "directory", "every"},
+    "configurations": {"save", "directory", "every"},
+    "records": {"save", "file", "every", "potential", "positions"},
     "checkpoint": {"chunk", "time_limit_s"},
     "phase_diagram": {"T_min_K", "T_max_K", "n_T", "p_min", "p_max", "n_p", "pressure_unit",
                       "p_min_atm", "p_max_atm", "observable", "coverage_per", "most_probable",
-                      "discard"},
+                      "discard", "min_ess", "heat_capacity", "rdf_states",
+                      "export_configurations", "bootstrap", "merge", "suggest_ladder",
+                      "potentials"},
     "output": {"directory", "plot_filename", "save_raw_data"},
 }
-_TOP_LEVEL = set(_SECTIONS) | {"calculator", "replica_exchange", "diatomic_reservoir"}
+_TOP_LEVEL = set(_SECTIONS) | {"calculator", "replica_exchange", "diatomic_reservoir",
+                                "observables"}
+_EXPORT_KEYS = {"mode", "n_T", "n_p", "min_cells", "tile"}
+_BOOTSTRAP_KEYS = {"n", "seed", "level", "min_agreement", "min_support"}
 _CALCULATOR_KEYS = {
     "EMT": set(),
     "LJ": {"lj_sigma", "lj_epsilon", "lj_r_cut"},
@@ -301,6 +325,39 @@ def _scheme(re_cfg: Dict[str, Any]) -> str:
     return scheme
 
 
+def _observables_from_config(config: Dict[str, Any]) -> list:
+    """
+    The structural observables of the ``observables`` section.
+
+    Parameters
+    ----------
+    config : dict
+        The parsed config; ``observables`` is a list of
+        ``{type: coordination | coordination_histogram | rdf, name: ..., ...}``.
+
+    Returns
+    -------
+    list of regc.observables.Observable
+        The observables (empty without the section).
+
+    Raises
+    ------
+    ValueError
+        If the section is not a list, or an entry is invalid.
+    """
+    from .observables import check_observables, observable_from_config
+    entries = config.get("observables") or []
+    if not isinstance(entries, list):
+        raise ValueError("observables must be a list of {type: ..., name: ..., ...} entries")
+    out = []
+    for e in entries:
+        e = dict(e)
+        if "z_range" in e and e["z_range"] is not None:
+            e["z_range"] = tuple(_floats(e["z_range"], f"observables.{e.get('name')}.z_range"))
+        out.append(observable_from_config(e))
+    return check_observables(out)
+
+
 def validate_config(config: Dict[str, Any]) -> None:
     """
     Check a config's sections and keys before anything expensive runs.
@@ -338,8 +395,31 @@ def validate_config(config: Dict[str, Any]) -> None:
     _check_keys(re_cfg, _RE_COMMON | _RE_SCHEME[scheme], f"replica_exchange (scheme {scheme})")
     if "hmc" in re_cfg:
         _check_keys(re_cfg["hmc"], _HMC_KEYS, "replica_exchange.hmc")
+    if "observables" in config:
+        _observables_from_config(config)
+    export = (config.get("phase_diagram") or {}).get("export_configurations")
+    if isinstance(export, dict):
+        _check_keys(export, _EXPORT_KEYS, "phase_diagram.export_configurations")
+    boot = (config.get("phase_diagram") or {}).get("bootstrap")
+    if isinstance(boot, dict):
+        _check_keys(boot, _BOOTSTRAP_KEYS, "phase_diagram.bootstrap")
     if "md" in re_cfg:
         _check_keys(re_cfg["md"], _MD_KEYS, "replica_exchange.md")
+        if scheme != "regc" or re_cfg.get("diffusion", "mc") != "md":
+            raise ValueError("replica_exchange.md is used only with scheme: regc and "
+                             "diffusion: md; remove it or set diffusion: md")
+    if scheme == "regc" and (re_cfg.get("hmc") or {}).get("enabled"):
+        raise ValueError("replica_exchange.hmc.enabled applies to scheme: sweep; with "
+                         "scheme: regc use diffusion: hmc (the hmc block still sets "
+                         "leapfrog_steps and the time step)")
+    gas = config.get("gas") or {}
+    species = set(_species_list(config)) if "species" in gas else set()
+    for key in ("mass_amu", "composition"):
+        if isinstance(gas.get(key), dict):
+            foreign = sorted(set(map(str, gas[key])) - species)
+            if foreign:
+                raise ValueError(f"gas.{key} has entries {foreign} that are not exchanged "
+                                 f"species {sorted(species)}")
     if ("mu_eV" in re_cfg) == ("pressures" in re_cfg):
         raise ValueError("replica_exchange needs exactly one of 'mu_eV' (explicit chemical "
                          "potentials) or 'pressures' (gas-pressure ladder via the reservoir)")
@@ -844,7 +924,7 @@ def _build_reservoir(sp: str, cfg: Dict[str, Any], mass_amu: float, calc_spec: _
     """
     from .reservoir import (H2_BOND_LENGTH_ANGSTROM, H2_D0_EXPERIMENTAL_EV,
                             H2_VIBRATIONAL_WAVENUMBER_CM, DiatomicReservoir,
-                            MonatomicIdealGasReservoir)
+                            MonatomicIdealGasReservoir, default_electronic_degeneracy)
     rtype = str(cfg.get("type", "diatomic")).lower()
     e_atom = cfg.get("e_atom_eV")
     e_atom = None if e_atom is None else _as_float(e_atom, f"reservoir.{sp}.e_atom_eV")
@@ -867,6 +947,8 @@ def _build_reservoir(sp: str, cfg: Dict[str, Any], mass_amu: float, calc_spec: _
     m_mol = cfg.get("mass_molecule_amu")
     m_mol = 2.0 * mass_amu if m_mol is None else _as_float(m_mol, f"reservoir.{sp}.mass_molecule_amu")
     sym = int(cfg.get("symmetry_number", 2))
+    g_el = cfg.get("electronic_degeneracy")
+    g_el = default_electronic_degeneracy(sp) if g_el is None else int(g_el)
 
     ase_calc = ase_calc_getter() if (d0 == "self" or e_atom is None) else None
     if d0 == "self" and ase_calc is None:
@@ -877,7 +959,7 @@ def _build_reservoir(sp: str, cfg: Dict[str, Any], mass_amu: float, calc_spec: _
     if ase_calc is not None:
         res = DiatomicReservoir.from_calculator(ase_calc, sp, d0=d0, bond_length_angstrom=bond,
                                                 vib_wavenumber_cm=vib, mass_molecule_amu=m_mol,
-                                                symmetry_number=sym)
+                                                symmetry_number=sym, electronic_degeneracy=g_el)
         return res if e_atom is None else dataclasses.replace(res, e_atom_eV=e_atom)
     if d0 == "experimental":
         if sp != "H":
@@ -891,7 +973,7 @@ def _build_reservoir(sp: str, cfg: Dict[str, Any], mass_amu: float, calc_spec: _
                          f"vibrational_wavenumber_cm for {sp}2")
     if e_atom is None:
         e_atom = calc_spec.isolated_atom_energy(sp)
-    return DiatomicReservoir(float(d0), e_atom, m_mol, bond, vib, sym)
+    return DiatomicReservoir(float(d0), e_atom, m_mol, bond, vib, sym, g_el)
 
 
 def _reservoir_to_dict(res) -> Dict[str, Any]:
@@ -1158,10 +1240,11 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
         region = {"insertion_z_range": insertion_z_range}
 
     if calc_spec.type == "LJ" and (len(geometry.frozen_positions) or len(geometry.substrate_positions)):
-        print("WARNING: calculator.type is 'LJ' (the native LJCalculator), which only evaluates "
-              "interactions between MOBILE particles: the slab atoms are ignored, so gas atoms "
-              "feel nothing from them. Use it to test the pipeline's mechanics only; PairLJ "
-              "(which sees the slab), EMT, LAMMPS or ASE for meaningful results.")
+        warnings.warn("calculator.type is 'LJ' (the native LJCalculator), which only evaluates "
+                      "interactions between MOBILE particles: the slab atoms are ignored, so gas "
+                      "atoms feel nothing from them. Use it to test the pipeline's mechanics "
+                      "only; PairLJ (which sees the slab), EMT, LAMMPS or ASE for meaningful "
+                      "results.", stacklevel=2)
 
     # ---- reservoir(s) and the replica ladder ------------------------------------
     re_cfg = config["replica_exchange"]
@@ -1222,6 +1305,8 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
         "insertion_z_range": insertion_z_range, "insertion_shell": insertion_shell,
         "sampling": sampling,
     }
+    if config.get("observables"):
+        metadata["observables"] = config["observables"]
 
     if verbose:
         if a is not None:
@@ -1348,7 +1433,8 @@ def run_from_config(config: Dict[str, Any], verbose: bool = True, resume: bool =
         With a ``checkpoint`` section, if the output directory holds a run
         and neither `resume` nor `overwrite` is set.
     """
-    from .driver import METADATA_FILE, SAMPLES_FILE, run_with_checkpoints
+    from .driver import (METADATA_FILE, MIXING_FILE, SAMPLES_FILE, run_with_checkpoints,
+                         write_mixing)
     from .engine import ReplicaExchangeGCMC
     from .io import save_samples
     from .units import kelvin_to_eV
@@ -1363,9 +1449,20 @@ def run_from_config(config: Dict[str, Any], verbose: bool = True, resume: bool =
     traj_dir = (os.path.join(out_dir, traj_cfg.get("directory", "trajectories"))
                 if traj_cfg.get("save") else None)
     traj_every = traj_cfg.get("every")
+    conf_cfg = config.get("configurations") or {}
+    conf_dir = (os.path.join(out_dir, conf_cfg.get("directory", "configurations"))
+                if conf_cfg.get("save") else None)
+    rec_cfg = config.get("records") or {}
+    rec_path = _records_path(config, out_dir) if rec_cfg.get("save") else None
+    if rec_path is not None and not resume and os.path.exists(rec_path):
+        from .driver import CHECKPOINT_FILE
+        guarded = ("checkpoint" in config and not overwrite
+                   and os.path.isfile(os.path.join(out_dir, CHECKPOINT_FILE)))
+        if not guarded:  # (a guarded run stops below: resume or overwrite it)
+            os.remove(rec_path)  # a fresh run: do not append to an old run's records
 
     workers = n_workers if n_workers is not None else re_cfg.get("n_workers", 1)
-    workers = (os.cpu_count() or 1) if workers == "auto" else int(workers)
+    workers = _available_cpus() if workers == "auto" else int(workers)
     hmc_enabled, leapfrog, hmc_dt = _hmc_settings(re_cfg)
     cutoff = re_cfg.get("adsorbed_cutoff")
     status, finished = None, True
@@ -1377,7 +1474,20 @@ def run_from_config(config: Dict[str, Any], verbose: bool = True, resume: bool =
                              hmc_enabled=hmc_enabled and scheme == "sweep",
                              hmc_leapfrog_steps=leapfrog, hmc_dt=hmc_dt,
                              adsorbed_cutoff=None if cutoff is None else _as_float(
-                                 cutoff, "replica_exchange.adsorbed_cutoff")) as sim:
+                                 cutoff, "replica_exchange.adsorbed_cutoff"),
+                             observables=_observables_from_config(config),
+                             configurations_dir=conf_dir,
+                             configurations_every=int(conf_cfg.get("every", 1)),
+                             records_path=rec_path,
+                             records_potential=str(rec_cfg.get("potential", "sampling")),
+                             records_every=int(rec_cfg.get("every", 1))) as sim:
+        sim.save_status(os.path.join(out_dir, STATUS_FILE), extra={
+            "temperatures_K": [float(T) for T in setup["temperatures_K"]],
+            "pressures": None if setup["pressures"] is None else [float(p) for p in setup["pressures"]],
+            "pressure_unit": setup["pressure_unit"], "species": list(setup["species"])})
+        if rec_path is not None and rec_cfg.get("positions"):
+            sim.save_records(rec_path, str(rec_cfg.get("potential", "sampling")),
+                             int(rec_cfg.get("every", 1)), str(rec_cfg["positions"]))
         if scheme == "regc":
             diffusion = re_cfg.get("diffusion", "mc")
             kwargs = dict(re_cfg.get("md") or {}) if diffusion == "md" else {}
@@ -1415,6 +1525,7 @@ def run_from_config(config: Dict[str, Any], verbose: bool = True, resume: bool =
                 sim.run_regc(**common, burn_in_steps=burn_in, verbose=verbose,
                              trajectory_dir=traj_dir, trajectory_every=traj_every, **kwargs)
                 _write_json(os.path.join(out_dir, METADATA_FILE), setup["metadata"])
+                write_mixing(sim, os.path.join(out_dir, MIXING_FILE))
         else:
             sim.run(n_cycles=int(re_cfg["n_cycles"]),
                     sweeps_per_cycle=int(re_cfg.get("sweeps_per_cycle", 100)),
@@ -1429,6 +1540,7 @@ def run_from_config(config: Dict[str, Any], verbose: bool = True, resume: bool =
                                                    "replica_exchange.p_displace_substrate"),
                     diagonal_swaps=bool(re_cfg.get("diagonal_swaps", True)))
             _write_json(os.path.join(out_dir, METADATA_FILE), setup["metadata"])
+            write_mixing(sim, os.path.join(out_dir, MIXING_FILE))
         if status is None:
             save_samples(sim, os.path.join(out_dir, SAMPLES_FILE))
 
@@ -1453,9 +1565,196 @@ def run_from_config(config: Dict[str, Any], verbose: bool = True, resume: bool =
     return result
 
 
+def _records_path(config: Dict[str, Any], out_dir: Optional[str] = None) -> str:
+    """
+    Path of a run's per-sample records file.
+
+    Parameters
+    ----------
+    config : dict
+        The parsed config (``records.file``, default ``records.h5``).
+    out_dir : str, optional
+        Output directory. Default None: ``output.directory``.
+
+    Returns
+    -------
+    str
+        The path.
+    """
+    if out_dir is None:
+        out_dir = (config.get("output") or {}).get("directory", "output")
+    return os.path.join(out_dir, (config.get("records") or {}).get("file", "records.h5"))
+
+
+def reevaluate_from_config(config: Dict[str, Any], potential: Dict[str, Any], name: str,
+                           every: int = 1, n_workers: int = 1, verbose: bool = True) -> int:
+    """
+    Re-evaluate a run's recorded configurations with another potential.
+
+    The run's config with its ``calculator`` section (and any other
+    top-level section given in `potential`, e.g. ``reservoir``) replaced
+    builds the same geometry with the new potential; its energies go to
+    ``E/<name>`` in the records file, and its gas reservoirs (whose
+    reference energies depend on the potential) to the file's attribute
+    ``reservoirs:<name>``, for the pressure axes of the reweighted phase
+    diagram (``phase_diagram.potentials``).
+
+    Parameters
+    ----------
+    config : dict
+        The run's parsed config (``records: {save: true}`` must have been on).
+    potential : dict
+        Top-level sections to replace, at least ``calculator``.
+    name : str
+        Name of the new potential.
+    every : int, optional
+        Evaluate every this many stored samples (by sample index). Default 1.
+    n_workers : int, optional
+        Worker processes. Default 1.
+    verbose : bool, optional
+        Print progress. Default True.
+
+    Returns
+    -------
+    int
+        Configurations evaluated.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the run has no records file.
+    ValueError
+        If `potential` has no calculator, or the new setup's cell differs
+        from the recorded one (fix the lattice constant in ``structure``).
+    """
+    import copy
+
+    from .records import Records, reevaluate
+    from .trajectory import lattice_of
+    path = _records_path(config)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"{path} not found: run with records: {{save: true}}")
+    if "calculator" not in potential:
+        raise ValueError("the potential file needs a calculator section")
+    cfg = copy.deepcopy(config)
+    cfg.update(copy.deepcopy(potential))
+    cfg.pop("phase_diagram", None)
+    setup = setup_from_config(cfg, verbose=False)
+    system = setup["system_factory"](np.random.default_rng(0))
+    rec = Records(path)
+    try:
+        cell = np.asarray(rec.attrs["cell"], dtype=float)
+    finally:
+        rec.close()
+    if not np.allclose(lattice_of(system), cell, atol=1e-8):
+        raise ValueError(f"the cell built with potential {name!r} differs from the recorded one "
+                         f"({np.diag(lattice_of(system))} vs {np.diag(cell)} A): set "
+                         f"structure.lattice_constant explicitly so both use the same geometry")
+    every = max(1, int(every))
+    progress = ((lambda d, t: print(f"{name}: {d}/{t} configurations", flush=True))
+                if verbose else None)
+    n = reevaluate(path, setup["system_factory"], name,
+                   subset=None if every == 1 else (lambda key, s: s % every == 0),
+                   n_workers=n_workers, progress=progress)
+    feed = setup["feed"]
+    if feed is not None:
+        import h5py
+        with h5py.File(path, "a") as f:
+            f.attrs["reservoirs:" + name] = json.dumps(
+                {s: _reservoir_to_dict(r) for s, r in zip(feed.species, feed.reservoirs)})
+    if verbose:
+        print(f"{n} configurations evaluated with {name!r} in {path}")
+    return n
+
+
+def _potential_maps(analysis, samples, config: Dict[str, Any], meta: Dict[str, Any], names,
+                    T_grid_K: np.ndarray, T_grid_eV: np.ndarray, p_grid: np.ndarray, unit: str,
+                    norm: float, per: str, observable: str, theta_A: np.ndarray, min_ess: float,
+                    out_dir: str,
+                    root: str, ext: str, verbose: bool) -> Dict[str, Any]:
+    """
+    Phase diagrams reweighted to other potentials (``phase_diagram.potentials``).
+
+    Parameters
+    ----------
+    analysis : MBARSurfaceAnalysis
+        The sampling potential's analysis.
+    samples : SampleSet
+        Its samples (energies under the other potentials are attached).
+    config, meta : dict
+        The config and the run metadata.
+    names : sequence of str
+        Potentials (re-evaluated with ``regc-reevaluate``).
+    T_grid_K, T_grid_eV, p_grid : numpy.ndarray
+        The mesh.
+    unit : str
+        Pressure unit.
+    norm : float
+        Coverage normalisation.
+    per : str
+        Its name (``coverage_per``).
+    observable : str
+        Mapped observable.
+    theta_A : numpy.ndarray
+        The sampling potential's map.
+    min_ess : float
+        Mask threshold.
+    out_dir, root, ext : str
+        Output location and file name parts.
+    verbose : bool
+        Print a summary.
+
+    Returns
+    -------
+    dict
+        Raw arrays ``theta_<name>``, ``ess_<name>``.
+    """
+    from .records import Records, attach_energies
+    from .plotting import plot_map
+    path = _records_path(config, out_dir)
+    attach_energies(samples, path, names)
+    rec = Records(path)
+    try:
+        stored = {n: rec.attrs.get("reservoirs:" + n) for n in names}
+    finally:
+        rec.close()
+    raw = {}
+    xlabel, ylabel = f"pressure ({unit})", "temperature (K)"
+    for name in names:
+        kw = {}
+        if stored[name] is not None:
+            res = json.loads(stored[name])
+            feed = GasFeed(meta["species"], [_reservoir_from_dict(res[s]) for s in meta["species"]],
+                           [meta["composition"][s] for s in meta["species"]])
+            kw["mu_of_Tp"] = functools.partial(feed.mu_at_T_eV, unit=unit)
+        B = analysis.with_potential(name, **kw)
+        theta = B.phase_diagram_Tp(T_grid_eV, p_grid, area=norm, observable=observable)
+        ess = B.effective_sample_size(T_grid_eV, p_grid, pressure=True)
+        valid = ess >= max(min_ess, 1.0)
+        raw[f"theta_{name}"], raw[f"ess_{name}"] = theta, ess
+        tag = f"{root}_{name}{ext}"
+        plot_map(T_grid_K, p_grid, theta, os.path.join(out_dir, tag), valid=valid,
+                 colorbar_label=f"<{observable}> (per {per})", xlabel=xlabel, ylabel=ylabel,
+                 title=f"Coverage reweighted to {name}", invalid_label=f"effective samples < {min_ess:g}")
+        plot_map(T_grid_K, p_grid, theta - theta_A,
+                 os.path.join(out_dir, f"{root}_{name}_difference{ext}"), valid=valid,
+                 cmap="RdBu_r", colorbar_label=f"<{observable}> ({name}) - <{observable}> (sampling)",
+                 xlabel=xlabel, ylabel=ylabel, title=f"{name} minus sampling potential",
+                 invalid_label=f"effective samples < {min_ess:g}")
+        plot_map(T_grid_K, p_grid, ess, os.path.join(out_dir, f"{root}_{name}_ess{ext}"),
+                 log_color=True, cmap="viridis", colorbar_label="Kish effective samples",
+                 xlabel=xlabel, ylabel=ylabel, title=f"Overlap of the samples with {name}")
+        if verbose:
+            print(f"{name}: effective samples {np.nanmin(ess):.3g} to {np.nanmax(ess):.3g} "
+                  f"({100 * valid.mean():.0f} % of cells >= {max(min_ess, 1.0):g})")
+    return raw
+
+
 # =============================================================================
 # Analysis
 # =============================================================================
+STATUS_FILE = "status.json"  # heartbeat for regc.monitor
+
 _COVERAGE_LABEL = {"area": "particles / A$^2$", "surface_atom": "particles per surface atom",
                    "atom": "particles per slab/cluster atom", "none": "particles per cell"}
 
@@ -1508,6 +1807,233 @@ def _phase_diagram_grid(pd_cfg: Dict[str, Any], ladder_unit: Optional[str]
     return T_grid_K, np.geomspace(bounds[0], bounds[1], int(pd_cfg.get("n_p", 40))), unit
 
 
+def _reliability(analysis, samples, meta: Dict[str, Any], out_dir: str,
+                 verbose: bool) -> Dict[str, Any]:
+    """
+    Correlation, overlap and mixing diagnostics of a run (no resampling).
+
+    Parameters
+    ----------
+    analysis : MBARSurfaceAnalysis
+        The analysis.
+    samples : SampleSet
+        Its samples.
+    meta : dict
+        The run metadata.
+    out_dir : str
+        Output directory (``mixing.json`` is read from it if present).
+    verbose : bool
+        Print warnings and a summary.
+
+    Returns
+    -------
+    dict
+        Arrays for ``phase_diagram_data.npz``: ``n_independent`` and
+        ``statistical_inefficiency`` (replica grid), ``overlap_min``
+        (replica grid, smallest MBAR overlap with a neighbour).
+    """
+    from .diagnostics import OVERLAP_THRESHOLD, neighbour_overlap, replica_inefficiencies
+    from .driver import MIXING_FILE
+    ineff = replica_inefficiencies(samples, analysis.lambda_cubed_of_T)
+    merged = any(len(k) != 2 for k in ineff)
+    ov = neighbour_overlap(analysis, pressure=merged and bool(meta.get("pressures")))
+    if merged:   # several runs: one value per state, in the analysis's state order
+        keys = analysis.states
+        g_map = np.array([ineff[k]["g"] for k in keys])
+        n_ind = np.array([ineff[k]["n_independent"] for k in keys])
+        ov_min = np.array([ov["min_map"].get(k, np.nan) for k in keys])
+        out = {"state_keys": np.array(keys), "statistical_inefficiency": g_map,
+               "n_independent": n_ind, "overlap_min": ov_min}
+    else:
+        n_T = 1 + max(k[0] for k in ineff)
+        n_mu = 1 + max(k[1] for k in ineff)
+        g_map, n_ind = np.full((n_T, n_mu), np.nan), np.full((n_T, n_mu), np.nan)
+        for k, v in ineff.items():
+            g_map[k], n_ind[k] = v["g"], v["n_independent"]
+        ov_min = ov["min_map"]
+        out = {"statistical_inefficiency": g_map, "n_independent": n_ind, "overlap_min": ov_min}
+    if verbose:
+        print(f"correlation: statistical inefficiency median {np.nanmedian(g_map):.1f}, "
+              f"independent samples per replica min {np.nanmin(n_ind):.0f}, "
+              f"median {np.nanmedian(n_ind):.0f}")
+        if np.nanmin(n_ind) < 20:
+            print("  WARNING: some replicas hold fewer than 20 independent samples; averages "
+                  "and especially C_V are unreliable there, and bootstrap intervals too narrow")
+        print(f"overlap: {len(ov['gaps'])} of {len(ov['pairs'])} neighbouring replica pairs below "
+              f"{OVERLAP_THRESHOLD} (smallest {np.nanmin(ov_min):.2g})")
+        if ov["gaps"]:
+            print("  WARNING: between poorly overlapping replicas MBAR rests on few samples; "
+                  "C_V is underestimated there and peaks appear on the sampled states. "
+                  "Add replicas in the gaps: phase_diagram.suggest_ladder writes the fill "
+                  "runs, phase_diagram.merge analyses them together with this one")
+    mix_path = os.path.join(out_dir, MIXING_FILE)
+    if os.path.isfile(mix_path):
+        with open(mix_path) as f:
+            mix = json.load(f)
+        trips = np.asarray(mix.get("round_trips_T", []))
+        out["round_trips_T"] = trips
+        if verbose:
+            w = mix.get("worst_pair")
+            if w:
+                print(f"mixing: worst swap pair {tuple(w['a'])}-{tuple(w['b'])} accepted "
+                      f"{w['acceptance']:.2f} of {w['attempts']} attempts; T round trips per "
+                      f"walker: median {np.median(trips) if trips.size else 0:.0f}, "
+                      f"{int(np.sum(trips == 0))} walkers with none")
+    return out
+
+
+def _merge_runs(config: Dict[str, Any], out_dir: str, meta: Dict[str, Any], samples, others,
+                discard: float, verbose: bool):
+    """
+    Merge the samples of other runs of the same system into the analysis.
+
+    Parameters
+    ----------
+    config : dict
+        The parsed config (for the configurations directory name).
+    out_dir : str
+        This run's output directory.
+    meta : dict
+        This run's metadata.
+    samples : SampleSet
+        This run's samples (equilibration discarded).
+    others : str or list of str
+        Output directories of the other runs.
+    discard : float
+        Fraction of each run's samples dropped as equilibration.
+    verbose : bool
+        Print a summary.
+
+    Returns
+    -------
+    tuple
+        ``(merged SampleSet, configuration directory of every run)``.
+
+    Raises
+    ------
+    FileNotFoundError
+        If another run has no samples or metadata.
+    ValueError
+        If another run is not the same system (structure, calculator,
+        species, reservoirs).
+    """
+    from .driver import METADATA_FILE, SAMPLES_FILE
+    from .io import load_samples, merge_samples
+    others = [others] if isinstance(others, str) else list(others)
+    conf_name = (config.get("configurations") or {}).get("directory", "configurations")
+    sets, dirs, labels = [samples], [os.path.join(out_dir, conf_name)], [out_dir]
+    for other in others:
+        mpath, spath = os.path.join(other, METADATA_FILE), os.path.join(other, SAMPLES_FILE)
+        for path in (mpath, spath):
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"phase_diagram.merge: {path} not found")
+        with open(mpath) as f:
+            om = json.load(f)
+        for key in ("species", "structure", "calculator", "reservoirs", "lattice_constant_angstrom",
+                    "masses_amu", "geometry"):
+            if om.get(key) != meta.get(key):
+                raise ValueError(f"phase_diagram.merge: {other} differs in '{key}'; only runs of "
+                                 f"the same system and potential can be merged")
+        sets.append(load_samples(spath, discard=discard))
+        dirs.append(os.path.join(other, conf_name))
+        labels.append(other)
+    merged = merge_samples(*sets, labels=labels)
+    if verbose:
+        print(f"merged {len(sets)} runs: {len(merged.samples)} states")
+    return merged, dirs
+
+
+def _write_ladder_suggestion(analysis, meta: Dict[str, Any], cfg, out_dir: str, unit: str,
+                             verbose: bool) -> None:
+    """
+    Write the fill runs proposed by `suggest_ladder` as config snippets.
+
+    Parameters
+    ----------
+    analysis : MBARSurfaceAnalysis
+        The analysis.
+    meta : dict
+        Run metadata (pressure ladder or mu ladder, pressure unit).
+    cfg : bool or dict
+        ``true``, or ``{target_overlap: 0.1, max_insert: 4}``.
+    out_dir : str
+        Output directory (writes ``ladder_suggestion.yaml``).
+    unit : str
+        The analysis's pressure unit (that of ``phase_diagram``): the
+        proposed pressures are written in it.
+    verbose : bool
+        Print a summary.
+    """
+    from .diagnostics import suggest_ladder
+    cfg = {} if cfg is True else dict(cfg)
+    pressure = bool(meta.get("pressures"))
+    sug = suggest_ladder(analysis, target_overlap=float(cfg.get("target_overlap", 0.1)),
+                         pressure=pressure, max_insert=int(cfg.get("max_insert", 4)))
+    text = sug.to_config(kelvin=True, pressure_unit=unit)
+    path = os.path.join(out_dir, "ladder_suggestion.yaml")
+    with open(path, "w") as f:
+        f.write("# Fill runs proposed by regc.diagnostics.suggest_ladder: run each with this "
+                "config's other sections\n# (configurations: save), then add their output "
+                "directories to phase_diagram.merge.\n" + (text or "# no gaps: nothing to fill")
+                + "\n")
+    if verbose:
+        print(f"ladder: {len(sug.gaps)} gaps below {cfg.get('target_overlap', 0.1)}; "
+              f"{sum(len(r['T']) * len(r['y']) for r in sug.fill_runs)} new replicas proposed "
+              f"in {path}")
+
+
+def _bootstrap_maps(analysis, T_grid_eV: np.ndarray, p_grid: np.ndarray, norm: float,
+                    observable: str, with_cv: bool, cfg: Dict[str, Any],
+                    verbose: bool) -> Dict[str, Any]:
+    """
+    Block-bootstrap the coverage, most-probable and C_V maps in one pass.
+
+    Parameters
+    ----------
+    analysis : MBARSurfaceAnalysis
+        The analysis.
+    T_grid_eV, p_grid : numpy.ndarray
+        The mesh.
+    norm : float
+        Coverage normalisation.
+    observable : str
+        The phase-diagram observable.
+    with_cv : bool
+        Also resample C_V.
+    cfg : dict
+        ``n`` (default 100), ``seed`` (0), ``level`` (0.95),
+        ``min_agreement`` (0.8), ``min_support`` (0.95).
+    verbose : bool
+        Print progress.
+
+    Returns
+    -------
+    dict
+        BootstrapResults ``'theta'``, ``'most'``, (``'cv'``), plus the
+        settings.
+    """
+    from .diagnostics import BootstrapResult, bootstrap
+    n = int(cfg.get("n", 100))
+
+    def stat(a):
+        maps = [a.phase_diagram_Tp(T_grid_eV, p_grid, area=norm, observable=observable),
+                a.most_probable_N_Tp(T_grid_eV, p_grid, observable=observable).astype(float)]
+        if with_cv:
+            maps.append(a.heat_capacity(T_grid_eV, p_grid, pressure=True))
+        return np.stack(maps)
+
+    if verbose:
+        print(f"bootstrap: {n} block resamples (MBAR re-solved for each) ...", flush=True)
+    b = bootstrap(analysis, stat, n_boot=n, seed=int(cfg.get("seed", 0)))
+    parts = {"theta": 0, "most": 1, "cv": 2}
+    out = {name: BootstrapResult(b.estimate[i], b.replicates[:, i], b.block_lengths)
+           for name, i in parts.items() if i < b.estimate.shape[0]}
+    out.update(n=n, level=float(cfg.get("level", 0.95)),
+               min_agreement=float(cfg.get("min_agreement", 0.8)),
+               min_support=float(cfg.get("min_support", 0.95)))
+    return out
+
+
 def analyze_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str, Any]:
     """
     MBAR (T, p) phase diagram from the samples a run saved.
@@ -1544,7 +2070,9 @@ def analyze_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[st
     from .analysis import MBARSurfaceAnalysis
     from .driver import METADATA_FILE, SAMPLES_FILE
     from .io import load_samples
-    from .plotting import plot_phase_diagram
+    from .analysis import export_phase_configurations, heat_capacity_ridges
+    from .diagnostics import ridge_support
+    from .plotting import plot_map, plot_radial_distribution
     from .units import kelvin_to_eV, pascal_per
 
     if "phase_diagram" not in config:
@@ -1578,31 +2106,160 @@ def analyze_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[st
                          + ("(a cluster has no area; use surface_atom, atom or none)"
                             if per == "area" else "(run_metadata.json predates it; rerun setup)"))
 
-    samples = load_samples(samples_path, discard=_as_float(pd_cfg.get("discard", 0.0),
-                                                           "phase_diagram.discard"))
+    discard = _as_float(pd_cfg.get("discard", 0.2), "phase_diagram.discard")
+    samples = load_samples(samples_path, discard=discard)
+    conf_dirs = None
+    if pd_cfg.get("merge"):
+        samples, conf_dirs = _merge_runs(config, out_dir, meta, samples, pd_cfg["merge"],
+                                         discard, verbose)
     analysis = MBARSurfaceAnalysis(samples, mu_of_Tp=functools.partial(feed.mu_at_T_eV, unit=unit))
     T_grid_eV = np.array([kelvin_to_eV(T) for T in T_grid_K])
     theta = analysis.phase_diagram_Tp(T_grid_eV, p_grid, area=norm, observable=observable)
 
     plot_name = out_cfg.get("plot_filename", "phase_diagram.png")
+    root, ext = os.path.splitext(plot_name)
     xlabel, ylabel = f"pressure ({unit})", "temperature (K)"
-    plot_phase_diagram(T_grid_K, p_grid, theta, save_path=os.path.join(out_dir, plot_name),
-                       colorbar_label=f"<{observable}>: {_COVERAGE_LABEL[per]}",
-                       xlabel=xlabel, ylabel=ylabel)
+    ess = analysis.effective_sample_size(T_grid_eV, p_grid, pressure=True)
+    min_ess = _as_float(pd_cfg.get("min_ess", 0.0), "phase_diagram.min_ess")
+    valid = ess >= min_ess
+    invalid = f"effective samples < {min_ess:g}"
+    # -- reliability: correlation, overlap, mixing (always), bootstrap (on request) --------
+    diag = _reliability(analysis, samples, meta, out_dir, verbose)
+    if pd_cfg.get("suggest_ladder"):
+        _write_ladder_suggestion(analysis, meta, pd_cfg["suggest_ladder"], out_dir, unit, verbose)
+    boot_cfg = pd_cfg.get("bootstrap")
+    boot = None
+    if boot_cfg:
+        boot_cfg = {} if boot_cfg is True else dict(boot_cfg)
+        boot = _bootstrap_maps(analysis, T_grid_eV, p_grid, norm, observable,
+                               bool(pd_cfg.get("heat_capacity")), boot_cfg, verbose)
+    plot_map(T_grid_K, p_grid, theta, os.path.join(out_dir, plot_name), valid=valid,
+             colorbar_label=f"<{observable}>: {_COVERAGE_LABEL[per]}", xlabel=xlabel,
+             ylabel=ylabel, title="Reweighted coverage (MBAR)", invalid_label=invalid)
     result = {"analysis": analysis, "theta_grid": theta, "T_grid_K": T_grid_K, "p_grid": p_grid,
               "pressure_unit": unit, "p_grid_atm": p_grid * pascal_per(unit) / pascal_per("atm"),
-              "coverage_per": per, "observable": observable}
+              "coverage_per": per, "observable": observable, "effective_samples": ess}
     raw = dict(T_K=T_grid_K, p=p_grid, pressure_unit=unit, p_atm=result["p_grid_atm"],
-               theta=theta, observable=observable, coverage_per=per)
+               theta=theta, observable=observable, coverage_per=per, effective_samples=ess,
+               min_ess=min_ess)
+    raw.update(diag)
+    if boot is not None:
+        lo, hi = boot["theta"].interval(boot["level"])
+        raw.update(theta_ci_low=lo, theta_ci_high=hi, bootstrap_level=boot["level"],
+                   bootstrap_n=boot["n"])
+        result["theta_interval"] = (lo, hi)
+        plot_map(T_grid_K, p_grid, 0.5 * (hi - lo), os.path.join(out_dir, f"{root}_uncertainty{ext}"),
+                 valid=valid, cmap="viridis", xlabel=xlabel, ylabel=ylabel,
+                 colorbar_label=f"half-width of the {100 * boot['level']:.0f} % interval of <{observable}>",
+                 title=f"Bootstrap uncertainty ({boot['n']} block resamples)", invalid_label=invalid)
     if pd_cfg.get("most_probable"):
         most = analysis.most_probable_N_Tp(T_grid_eV, p_grid, observable=observable)
         result["most_probable_N"] = most
         raw["most_probable_N"] = most
-        root, ext = os.path.splitext(plot_name)
-        plot_phase_diagram(T_grid_K, p_grid, most,
-                           save_path=os.path.join(out_dir, f"{root}_most_probable{ext}"),
-                           colorbar_label=f"most probable {observable}", xlabel=xlabel,
-                           ylabel=ylabel, title="Most stable phase (MBAR)")
+        robust, label_note = valid, invalid
+        if boot is not None:
+            agree = boot["most"].agreement()
+            raw["most_probable_agreement"] = agree
+            robust = valid & (agree >= boot["min_agreement"])
+            label_note = (f"{invalid}, or label kept in < {100 * boot['min_agreement']:.0f} % "
+                          f"of resamples")
+        plot_map(T_grid_K, p_grid, most, os.path.join(out_dir, f"{root}_most_probable{ext}"),
+                 valid=robust, discrete=True, colorbar_label=f"most probable {observable}",
+                 xlabel=xlabel, ylabel=ylabel, title="Most stable phase (MBAR)",
+                 invalid_label=label_note)
+    if pd_cfg.get("heat_capacity"):
+        cv = analysis.heat_capacity(T_grid_eV, p_grid, pressure=True)
+        ladder_p = meta.get("pressures")
+        ladder_p = (np.asarray(ladder_p, dtype=float) * pascal_per(meta.get("pressure_unit") or unit)
+                    / pascal_per(unit)) if ladder_p else None
+        ridges = heat_capacity_ridges(T_grid_K, p_grid, cv, valid=valid, ladder=ladder_p)
+        keep = np.ones(len(ridges["points"]), bool)
+        if "on_ladder" in ridges:
+            keep &= ~ridges["on_ladder"]
+            raw["heat_capacity_ridges_on_ladder"] = ridges["on_ladder"]
+        if boot is not None and "cv" in boot:
+            support = ridge_support(ridges, boot["cv"].replicates)
+            keep &= support >= boot["min_support"]
+            raw["heat_capacity_ridges_support"] = support
+            lo, hi = boot["cv"].interval(boot["level"])
+            raw.update(heat_capacity_ci_low=lo, heat_capacity_ci_high=hi)
+        result.update(heat_capacity=cv, heat_capacity_ridges=ridges["points"],
+                      heat_capacity_ridges_kept=ridges["points"][keep])
+        raw.update(heat_capacity_kB=cv, heat_capacity_ridges_T_K_p=ridges["points"],
+                   heat_capacity_ridges_kept=keep)
+        kept_label = "$C_V$ peak" + (" (bootstrap-supported" if boot is not None else "") + (
+            ", off the ladder" if "on_ladder" in ridges else "") + (")" if boot is not None else "")
+        plot_map(T_grid_K, p_grid, cv, os.path.join(out_dir, f"{root}_heat_capacity{ext}"),
+                 valid=valid, points=ridges["points"][keep], points_label=kept_label,
+                 log_color=True, cmap="magma", colorbar_label="$C_V/k_B$", xlabel=xlabel,
+                 ylabel=ylabel, title="Heat capacity (MBAR, [ZSG] Eq. 1)", invalid_label=invalid)
+        if verbose:
+            print(f"C_V: {len(ridges['points'])} peaks, {int(keep.sum())} kept"
+                  + (f" ({int(ridges['on_ladder'].sum())} on the sampled pressures)"
+                     if "on_ladder" in ridges else ""))
+    for name, m in analysis.observables_meta.items():
+        kind = m.get("type")
+        if kind == "CoordinationNumber":
+            cn = analysis.mean_coordination(name, T_grid_eV, p_grid, pressure=True)
+            result[f"cn_{name}"] = raw[f"cn_{name}"] = cn
+            plot_map(T_grid_K, p_grid, cn, os.path.join(out_dir, f"{root}_cn_{name}{ext}"),
+                     valid=valid & np.isfinite(cn), cmap="cividis",
+                     colorbar_label=f"mean coordination ({m['center']} - {m['neighbor']}, "
+                                    f"r < {m['r_cut']:g} A)", xlabel=xlabel, ylabel=ylabel,
+                     title=f"<CN> {name}", invalid_label=invalid + " or no centre atoms")
+        elif kind == "CoordinationHistogram":
+            h = analysis.observable_map(name, T_grid_eV, p_grid, pressure=True)
+            total = h.sum(axis=-1, keepdims=True)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                raw[f"cn_hist_{name}"] = np.where(total > 0, h / total, np.nan)
+        elif kind == "RadialDistribution" and pd_cfg.get("rdf_states"):
+            curves = {}
+            for T_K, p in pd_cfg["rdf_states"]:
+                T_eV = kelvin_to_eV(_as_float(T_K, "phase_diagram.rdf_states"))
+                p = _as_float(p, "phase_diagram.rdf_states")
+                r, g = analysis.radial_distribution(name, T_eV, analysis.mu_from_p(T_eV, p))
+                curves[f"{float(T_K):.0f} K, {p:.3g} {unit}"] = (r, g)
+            raw[f"rdf_{name}_r"] = next(iter(curves.values()))[0]
+            raw[f"rdf_{name}"] = np.array([g for _, g in curves.values()])
+            raw[f"rdf_{name}_states"] = np.array(pd_cfg["rdf_states"], dtype=float)
+            plot_radial_distribution(curves, os.path.join(out_dir, f"{root}_rdf_{name}{ext}"),
+                                     ylabel=f"n(r) per {m['a']} atom (1/A)",
+                                     title=f"{m['a']} - {m['b']} (MBAR)")
+    export = pd_cfg.get("export_configurations")
+    if export:
+        export = {"mode": export} if isinstance(export, str) else dict(export)
+        conf_cfg = config.get("configurations") or {}
+        conf_dir = conf_dirs or os.path.join(out_dir, conf_cfg.get("directory", "configurations"))
+        mode = export.get("mode", "phases")
+        if mode == "grid":
+            Tg = np.linspace(T_grid_K[0], T_grid_K[-1], int(export.get("n_T", 5)))
+            pg = np.logspace(np.log10(p_grid[0]), np.log10(p_grid[-1]), int(export.get("n_p", 6)))
+        else:
+            Tg, pg = T_grid_K, p_grid
+        tile = os.path.join(out_dir, f"configurations_{mode}_tiled.extxyz") \
+            if export.get("tile", True) else None
+        try:
+            entries = export_phase_configurations(
+                analysis, conf_dir, np.array([kelvin_to_eV(T) for T in Tg]), pg,
+                os.path.join(out_dir, f"configurations_{mode}.extxyz"), pressure=True, mode=mode,
+                observable=observable, min_ess=min_ess, temperature_K=True, area=norm,
+                tile_path=tile, min_cells=int(export.get("min_cells", 1)))
+        except (FileNotFoundError, ValueError) as err:
+            warnings.warn(f"configurations not exported: {err}", stacklevel=2)
+            entries = []
+        result["exported_configurations"] = entries
+        if verbose and entries:
+            print(f"wrote {len(entries)} configurations ({mode}) to "
+                  f"{out_dir}/configurations_{mode}.extxyz")
+    potentials = pd_cfg.get("potentials")
+    if potentials:
+        if pd_cfg.get("merge"):
+            raise ValueError("phase_diagram.potentials with merge is not supported yet: "
+                             "reweight each run on its own")
+        names = [potentials] if isinstance(potentials, str) else list(potentials)
+        raw.update(_potential_maps(analysis, samples, config, meta, names, T_grid_K, T_grid_eV,
+                                   p_grid, unit, norm, per, observable, theta, min_ess, out_dir, root,
+                                   ext, verbose))
     if out_cfg.get("save_raw_data", True):
         np.savez(os.path.join(out_dir, "phase_diagram_data.npz"), **raw)
     if verbose:
@@ -1700,3 +2357,41 @@ def main(argv: Optional[list] = None) -> int:
                              overwrite=args.overwrite, time_limit=args.time_limit,
                              n_workers=args.workers)
     return 0 if result["finished"] else EXIT_RESUBMIT
+
+
+def reevaluate_main(argv: Optional[list] = None) -> int:
+    """
+    Command-line entry point: ``regc-reevaluate config.yaml potential.yaml --name B``.
+
+    Re-evaluates the configurations a run recorded (``records: {save:
+    true}``) with the potential described in ``potential.yaml`` (a
+    ``calculator`` section, plus any other top-level section to replace);
+    then list ``B`` under ``phase_diagram.potentials`` and run
+    ``regc-run --analyze-only`` for the reweighted phase diagram.
+
+    Parameters
+    ----------
+    argv : list of str, optional
+        Arguments. Default None: ``sys.argv[1:]``.
+
+    Returns
+    -------
+    int
+        0.
+    """
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="regc-reevaluate",
+        description="Energies of a run's recorded configurations under another potential, "
+                    "for MBAR reweighting to it (phase_diagram.potentials).")
+    parser.add_argument("config", help="the run's config file")
+    parser.add_argument("potential", help="YAML/JSON with the new calculator section")
+    parser.add_argument("--name", required=True, help="name of the new potential")
+    parser.add_argument("--every", type=int, default=1,
+                        help="evaluate every k-th stored sample (default 1: all)")
+    parser.add_argument("--workers", type=int, default=1, help="worker processes")
+    parser.add_argument("-q", "--quiet", action="store_true", help="no progress output")
+    args = parser.parse_args(argv)
+    reevaluate_from_config(load_config(args.config), load_config(args.potential), args.name,
+                           every=args.every, n_workers=args.workers, verbose=not args.quiet)
+    return 0

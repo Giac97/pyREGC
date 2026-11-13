@@ -88,16 +88,24 @@ def test_run_regc_x0_controls_gc_vs_exchange():
     n_gc = sum(r.n_attempts['insert'] + r.n_attempts['delete'] for r in sim.grid.values())
     n_re_rounds_with_pairs = sim.swap_stats['T'][0]  # only 'T' has pairs on a 2x1 grid
     assert n_gc / len(sim.grid) == pytest.approx(0.9 * 2000, rel=0.05)
-    # each RE step draws 'T' w.p. 1/4 and offset 0 (the only one with a pair) w.p. 1/2
-    assert n_re_rounds_with_pairs == pytest.approx(0.1 * 2000 / 8, rel=0.35)
+    # skip_empty_swaps (default): every RE step attempts the only usable pattern
+    assert n_re_rounds_with_pairs == pytest.approx(0.1 * 2000, rel=0.2)
+    old = _ideal_sim([1.0, 1.5], [[-1.0], [-1.5]])
+    old.skip_empty_swaps = False
+    old.run_regc(n_steps=2000, x0=0.9, diffusion='mc', diffusion_steps=0, record_every=10,
+                 verbose=False)
+    # all patterns: 'T' w.p. 1/4 and offset 0 (the only one with a pair) w.p. 1/2
+    assert old.swap_stats['T'][0] == pytest.approx(0.1 * 2000 / 8, rel=0.35)
 
 
 def test_run_regc_stops_on_rho_u_convergence():
     sim = _ideal_sim([1.0, 1.5], [[-1.0], [-1.5]])
-    converged = sim.run_regc(n_steps=200000, x0=0.9, diffusion='mc', diffusion_steps=0,
-                             record_every=5, convergence_every=2000, convergence_tol=0.05,
-                             verbose=False)
+    # blocks of 4000 samples on 10 bins: noise floor ~ sqrt(10/(pi 4000)) = 0.028 < tol
+    converged = sim.run_regc(n_steps=400000, x0=0.9, diffusion='mc', diffusion_steps=0,
+                             record_every=5, convergence_every=20000, convergence_tol=0.05,
+                             convergence_bins=10, verbose=False)
     assert converged
+    assert len(sim.convergence_history) < 18  # stopped before the cap
     assert sim.convergence_history and sim.convergence_history[-1] < 0.05
     assert len(sim.samples[(0, 0)]["U"]) < 200000 // 5
 
@@ -187,3 +195,23 @@ def test_run_regc_parallel_matches_serial_bit_for_bit():
                          record_every=5, verbose=False)
         return sim.samples, sim.swap_stats
     assert run(1) == run(2)
+
+
+def test_rho_u_change_detects_drift():
+    """Disjoint blocks: a stationary series reads as converged, a drifting one
+    does not. (Comparing the first n_prev samples with all samples shrinks like
+    1/k for any data, and passed the drifting series at check 7.)"""
+    sim = _ideal_sim([1.0], [[-1.0]])
+    key = next(iter(sim.samples))
+    rng = np.random.default_rng(0)
+    n_block, n_checks = 4000, 20
+
+    def worst_late_change(drift):
+        t = np.arange(n_block * n_checks)
+        U = rng.normal(size=t.size) + drift * t / t.size  # u = U at beta = 1, N = 0
+        sim.samples[key] = {'U': list(U), 'N': [0] * t.size}
+        return max(sim.rho_u_change(k * n_block, bins=10, n_start=(k - 1) * n_block)
+                   for k in range(n_checks // 2, n_checks))
+
+    assert worst_late_change(0.0) < 0.05
+    assert worst_late_change(10.0) > 0.15

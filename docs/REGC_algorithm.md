@@ -100,7 +100,10 @@ over replicas. Three modes are available:
 * **`'md'`**: $n$ steps of NVT molecular dynamics with ASE (`Replica._diffuse_md`), as in the
   paper's ab initio REGCMD:
   * The thermostat is Bussi stochastic velocity rescaling (default; [ZSG] use $\tau = 20$ fs and
-    a 1 fs time step) or Langevin.
+    a 1 fs time step) or Langevin (friction `friction_per_fs`, default 0.01/fs). Its target
+    kinetic energy counts $3N$ degrees of freedom of the moving atoms: frozen atoms and the walls
+    break momentum conservation, so no centre-of-mass degrees of freedom are removed. The native
+    LAMMPS path (`LammpsCalculator.run_md`) does the same (`compute_modify extra/dof 0`).
   * Velocities are redrawn from Maxwell–Boltzmann at $T_l$ at the start of each segment. This is
     exact because $\mathbf p$ and $\mathbf R$ are independent in the canonical ensemble, and it
     handles freshly inserted atoms and configurations just swapped in from another $T$.
@@ -110,8 +113,10 @@ over replicas. Three modes are available:
     [ZSG] impose with PLUMED.
   * After the segment, $E$ is recomputed with the system's calculator.
   * With `LammpsCalculator` (`regc/lammps_backend.py`) the whole segment runs natively in
-    LAMMPS: `velocity create`, `fix nve` + `fix temp/csvr` (Bussi), `fix wall/reflect`, with
-    frozen atoms excluded. Any LAMMPS pair style works this way (EAM, GRACE-FS `grace/fs`,
+    LAMMPS: Maxwell–Boltzmann velocities drawn in Python and scattered into LAMMPS (not
+    `velocity create`, which rescales the draw to exactly $T$ and fails for one atom), `fix nve`
+    + `fix temp/csvr` (Bussi, with `extra/dof 0`), `fix wall/reflect`, with frozen atoms
+    excluded. Any LAMMPS pair style works this way (EAM, GRACE-FS `grace/fs`,
     ACE, ...). It is about $10^3\times$ faster than ASE for an EAM slab.
   * MD has no accept/reject step, so it carries the integrator's time-step bias. The
     requirements are an `ASECalculatorAdapter` and $T$ given as $k_BT$ in eV.
@@ -237,6 +242,14 @@ as well.
 configurations. The pairs in a pattern are disjoint, and each pair's swap satisfies (7). So
 every RE move satisfies detailed balance in the extended ensemble (2).
 
+**Patterns without pairs.** On a grid with a single row or column, most (pattern, offset)
+combinations have no pairs (on an $n_T\times 1$ grid, six of eight). With
+`skip_empty_swaps=True`, the default for new runs, `run_regc` draws one combination uniformly
+among those that have pairs, so no RE step is wasted. The draw still ignores the
+configurations, so detailed balance is unchanged. A run resumed from a checkpoint keeps the
+draw it started with (the previous behaviour for checkpoints written before this option), so
+its continuation is bit-identical.
+
 ---
 
 ## 4. Simulation loop
@@ -279,16 +292,23 @@ convention, pass `x0 = 1 - x0_fig`.
 
 **Convergence** ([ZSG] §III A: "no change in the density of reduced-energy states $\rho(U)$
 with increasing simulation steps"). Every `convergence_every` steps, for each grid point $k$, the
-reduced energies $u$ of Eq. (9) of all samples recorded so far are histogrammed on common bins.
-The same is done for the samples that existed at the previous check. The run stops when
+reduced energies $u$ of Eq. (9) are histogrammed on common bins for two disjoint blocks: the
+samples recorded since the previous check ("new") and those recorded in the interval before it
+("old"). The run stops when
 
 $$
-\max_k\; \tfrac12 \sum_{\text{bins } b} \left|\rho_k^\text{now}(b) - \rho_k^\text{prev}(b)\right|
+\max_k\; \tfrac12 \sum_{\text{bins } b} \left|\rho_k^\text{new}(b) - \rho_k^\text{old}(b)\right|
 \;<\; \texttt{convergence\_tol},
 \qquad (15)
 $$
 
-that is, when the total-variation change of every $\rho_k(u)$ is small. `n_steps` is a cap.
+that is, when the total-variation distance between consecutive blocks is small for every
+$\rho_k(u)$. The first verdict needs three checks. The blocks must be disjoint: comparing the
+samples at the previous check with *all* samples (which contain them) gives a distance that
+shrinks like $1/k$ after $k$ equal checks whatever the data do, so a drifting run would pass.
+Two blocks of $n$ samples from one distribution still differ by roughly
+$\sqrt{\text{bins}/\pi n}$ from sampling noise, so `convergence_tol` must lie above that
+floor (fewer bins, or longer blocks). `n_steps` is a cap.
 `run_regc` returns whether the criterion was met, and `convergence_history` stores the values.
 `swap_acceptance()` reports the acceptance per pattern. [ZSG] tune the $(T,\mu)$ spacing to
 reach about 25%.
@@ -307,7 +327,8 @@ for cycle = 1 … n_cycles:
 
 This scheme mixes GC moves into the sweep and visits the swap patterns in a fixed order.
 Each move satisfies detailed balance, and a fixed-order composition of such moves still leaves
-(2) invariant (global balance). Both loops therefore sample the same ensemble. §4.1 reproduces
+(2) invariant (global balance). Both loops therefore sample the same ensemble with MC or HMC
+diffusion; with `'md'` both carry the finite-time-step bias of §2.2. §4.1 reproduces
 the paper's protocol; §4.2 is usually more efficient for cheap force fields.
 
 The YAML runner selects between them with `replica_exchange.scheme: sweep | regc`. The
@@ -373,6 +394,57 @@ f_i(\mu,T) = -k_BT\,\ln p_i(\mu,T),
 $$
 
 with the stable phase at $(\mu,T)$ being $\arg\min_i f_i = \arg\max_i p_i$.
+
+### 5.3 Structural observables (`regc.observables`)
+
+Eq. (10) holds for any function $A(\mathbf R)$ of the configuration, so an
+observable recorded with every sample (`observables=` of the engine)
+needs no change to the MBAR machinery. Where it is a ratio whose
+denominator fluctuates, the numerator and denominator are recorded
+separately and divided after reweighting. The mean coordination is
+$\langle n_\text{bonds}\rangle/\langle n_\text{centres}\rangle$. The
+per-centre radial distribution is
+$n(r)=\langle H(r)\rangle/(\langle n_a\rangle\,\Delta r)$, with
+$\int_0^{r_c}n(r)\,dr$ the mean coordination. Distances use the system's
+minimum-image convention.
+
+### 5.4 Heat capacity ([ZSG] PRL 128, 246101 (2022), Eq. 1; `heat_capacity`)
+
+$$
+C_V(T,\mu)=\frac{\langle E^2\rangle-\langle E\rangle^2}{k_BT^2},\qquad E=U+K,
+\qquad (20)
+$$
+
+with both averages from Eq. (10). The momenta are not sampled by MC, and
+they need not be. For $n$ moving atoms (the mobile ones plus any
+displaceable substrate) the kinetic energy is independent of the
+configuration given $n$, with $\langle K\,|\,n\rangle=\tfrac32 nk_BT$ and
+$\mathrm{Var}(K\,|\,n)=\tfrac32 n(k_BT)^2$. So, with
+$x=U+\tfrac32k_BT\,n$,
+
+$$
+\mathrm{Var}(E)=\mathrm{Var}(x)+\tfrac32(k_BT)^2\langle n\rangle .
+\qquad (21)
+$$
+
+The phase-space weight of the grand ensemble with momenta integrated out
+is $e^{\beta\mu N}\Lambda^{-3N}e^{-\beta U}/N!$, with
+$\Lambda^{-3}\propto T^{3/2}$. Differentiating $\langle E\rangle$ with
+respect to $T$ at fixed $\beta\mu$ gives exactly Eq. (20)–(21):
+
+$$
+\left.\frac{\partial\langle E\rangle}{\partial T}\right|_{\beta\mu}
+=\frac{\mathrm{Var}(U)}{k_BT^2}+\frac{3\,\mathrm{Cov}(U,n)}{T}+\tfrac94 k_B\,\mathrm{Var}(n)
++\tfrac32 k_B\langle n\rangle .
+$$
+
+It is therefore not the heat capacity at fixed $p$ or fixed $N$. Its
+ridges, the local maxima along $p$ at fixed $T$ and along $T$ at fixed
+$p$ (`heat_capacity_ridges`), are what [ZSG] use to draw phase
+boundaries. Two checks of the implementation:
+- The MBAR estimator satisfies this identity exactly; a test compares it
+  with a finite difference of the reweighted $\langle E\rangle$.
+- An ideal gas gives $C_V/k_B=\tfrac{15}{4}\langle N\rangle$.
 
 ---
 

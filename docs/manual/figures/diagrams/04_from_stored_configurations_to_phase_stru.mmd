@@ -1,0 +1,12 @@
+flowchart LR
+    accTitle: From stored configurations to phase structures
+    accDescr: Stored configurations are tagged with their sample index; MBAR weights at each mesh cell pick the most probable sample with the phase's N, which is read back from its file and written to an extxyz file, optionally tiled into one visual phase diagram.
+
+    configs[("configs_T*_mu*.extxyz<br/>tagged with sample index")] --> label["Most probable N<br/>at every mesh cell"]
+    label --> regions["Connected regions<br/>(mode=phases) or cells (mode=grid)"]
+    regions --> pick["At each: the stored sample<br/>with the largest MBAR weight and that N"]
+    pick --> out_frames[("phases.extxyz<br/>one frame per phase")]
+    pick --> out_tiled[("phases_tiled.extxyz<br/>all side by side")]
+
+    classDef store fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
+    class configs,out_frames,out_tiled store

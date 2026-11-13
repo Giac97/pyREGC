@@ -18,9 +18,10 @@ Everything below is importable as `from regc import <name>`, except the runner f
 - [Units (`regc.units`)](#units-regcunits): `kelvin_to_eV`, `eV_to_kelvin`, `pascal_per`, `PRESSURE_UNITS`, `ThermalWavelengthCubed`, `SpeciesLambdaCubed`, `thermal_wavelength_angstrom`, `thermal_wavelength_cubed_angstrom3`, `default_mass_amu`
 - [Reduced-unit pressure conventions (`regc.pressure`)](#reduced-unit-pressure-conventions-regcpressure): `p0_reduced_units`, `p0_ideal_gas_wavelength`, `mu_from_pressure`, `pressure_from_mu`, `mu_grid_from_pressures`, `invert_mu_of_Tp`
 - [Gas reservoirs (`regc.reservoir`)](#gas-reservoirs-regcreservoir): `Reservoir`, `MonatomicIdealGasReservoir`, `DiatomicReservoir`, `diatomic_dissociation_energy_eV`, `diatomic_gas_mu_eV`, `mu_atomic_from_diatomic_reservoir_eV`, `pressure_from_atomic_mu_reservoir_pascal`, `H2_BOND_LENGTH_ANGSTROM`, `H2_VIBRATIONAL_WAVENUMBER_CM`, `H_MASS_AMU`, `H2_MASS_AMU`, `H2_D0_EXPERIMENTAL_EV`
-- [MBAR analysis (`regc.analysis`)](#mbar-analysis-regcanalysis): `MBARSurfaceAnalysis`
-- [Plotting (`regc.plotting`)](#plotting-regcplotting): `plot_phase_diagram`
-- [Config runner (`regc.runner`)](#config-runner-regcrunner): `load_config`, `validate_config`, `setup_from_config`, `run_from_config`, `analyze_from_config`, `check_config`, `main`
+- [MBAR analysis (`regc.analysis`)](#mbar-analysis-regcanalysis): `MBARSurfaceAnalysis`, `heat_capacity_ridges`, `export_phase_configurations`
+- [Plotting (`regc.plotting`)](#plotting-regcplotting): `plot_phase_diagram`, `plot_map`, `plot_radial_distribution`
+- [Per-sample records and other potentials (`regc.records`)](#per-sample-records-and-other-potentials-regcrecords): `RecordWriter`, `Records`, `attach_energies`, `reevaluate`
+- [Config runner (`regc.runner`)](#config-runner-regcrunner): `load_config`, `validate_config`, `setup_from_config`, `run_from_config`, `analyze_from_config`, `check_config`, `reevaluate_from_config`, `main`, `reevaluate_main`
 
 ## Calculators (`regc.calculators`)
 
@@ -408,6 +409,11 @@ LammpsCalculator.total_energy(system) -> float
 
 Potential energy of the full configuration (`run 0`).
 
+The energies of the last two configurations are cached (exact
+match of positions, species and cell), so the energy before a
+trial move -- the configuration evaluated at the previous move --
+costs nothing; see also `_load` for the cheap re-evaluation.
+
 **Parameters**
 
 - `system` (*ParticleSystem*): The configuration (frozen + substrate + mobile atoms).
@@ -432,29 +438,50 @@ Forces on substrate + mobile atoms (frozen rows dropped).
 
 - *numpy.ndarray*: Shape (n_substrate + n_mobile, 3), in eV/A.
 
+#### `LammpsCalculator.energy_after_md`
+
+```python
+LammpsCalculator.energy_after_md(system) -> float
+```
+
+Potential energy of the configuration `run_md` just produced.
+
+**Parameters**
+
+- `system` (*ParticleSystem*): The system after its positions were updated from `run_md`.
+
+**Returns**
+
+- *float*: The LAMMPS potential energy of the segment's last step (no re-evaluation), +inf if the optional hard core is violated.
+
 #### `LammpsCalculator.run_md`
 
 ```python
-LammpsCalculator.run_md(system, n_steps: int, temperature_eV: float, timestep_fs: float, taut_fs: float, seed: int, thermostat: str = 'bussi') -> np.ndarray
+LammpsCalculator.run_md(system, n_steps: int, temperature_eV: float, timestep_fs: float, taut_fs: float, seed: int, thermostat: str = 'bussi', friction_per_fs: Optional[float] = None) -> np.ndarray
 ```
 
 One NVT MD segment inside LAMMPS.
 
-Fresh Maxwell-Boltzmann velocities at T for the moving atoms
-(exact: momenta and positions are independent in the canonical
-ensemble), `fix nve` + `fix temp/csvr` (Bussi; or `langevin`),
-`fix wall/reflect` at the system's hard walls (`md_wall_bounds`:
-the z-walls of a slab, the six faces of a cluster box), frozen
-atoms excluded from integration.
+Fresh Maxwell-Boltzmann velocities at T for the moving atoms, drawn
+here (not with `velocity create`, which rescales the draw to
+exactly T and fails for a single atom), so the start is an exact
+canonical momentum sample; `fix nve` + `fix temp/csvr` (Bussi;
+or `langevin`), `fix wall/reflect` at the system's hard walls
+(`md_wall_bounds`: the z-walls of a slab, the six faces of a
+cluster box), frozen atoms excluded from integration. The Bussi
+thermostat's temperature counts 3N degrees of freedom (`extra/dof
+0`): frozen atoms and walls break momentum conservation, and the
+ASE path (`Replica._diffuse_md`) counts the same.
 
 **Parameters**
 
 - `system` (*ParticleSystem*): The system to propagate (not modified here).
 - `n_steps` (*int*): Number of MD steps.
 - `temperature_eV` (*float*): k_B T in eV.
-- `timestep_fs, taut_fs` (*float*): Time step and thermostat time constant, in fs.
+- `timestep_fs, taut_fs` (*float*): Time step and Bussi thermostat time constant, in fs.
 - `seed` (*int*): Random seed (velocities and thermostat).
 - `thermostat` (*str, optional*): `'bussi'` (default) or `'langevin'`.
+- `friction_per_fs` (*float, optional*): Langevin friction in 1/fs (damping time 1/friction), as in the ASE path. Default None: damping time `taut_fs`.
 
 **Returns**
 
@@ -585,7 +612,7 @@ Construct a particle system.
 
 **Raises**
 
-- *ValueError*: If `exchange_species` is an empty or repeated sequence, or names several species while `positions` is given without `species`.
+- *ValueError*: If `exchange_species` is an empty or repeated sequence, names several species while `positions` is given without `species`, or is a single species while `species` contains other labels.
 
 #### `ParticleSystem.n` (property)
 
@@ -929,6 +956,18 @@ Compute the total energy of the current configuration.
 **Returns**
 
 - *float*: The calculator's total energy for the full configuration, plus the sum of `external_energy` over every mobile and substrate particle (frozen atoms don't call `external_energy`, since they never move and so can never enter a forbidden region).
+
+#### `ParticleSystem.external_energy_total`
+
+```python
+ParticleSystem.external_energy_total() -> float
+```
+
+Sum of `external_energy` over every mobile and substrate particle.
+
+**Returns**
+
+- *float*: The external-field part of `total_energy` (frozen atoms excluded).
 
 #### `ParticleSystem.generic_displace_dU`
 
@@ -1950,7 +1989,7 @@ diffusion.
 #### `Replica.regc_local_block`
 
 ```python
-Replica.regc_local_block(gc_flags, first_step: int, record_every: int, burn_in_steps: int, mode: str, n: int, adsorbed_cutoff: Optional[float] = None, **kwargs) -> Replica
+Replica.regc_local_block(gc_flags, first_step: int, record_every: int, burn_in_steps: int, mode: str, n: int, adsorbed_cutoff: Optional[float] = None, observables=None, record_configurations: bool = False, **kwargs) -> Replica
 ```
 
 Several consecutive REGC steps with no replica exchange in between.
@@ -1966,11 +2005,13 @@ calling `regc_local_step` once per step.
 - `first_step` (*int*): 1-based index of the block's first step in the whole run.
 - `record_every, burn_in_steps` (*int*): Record (energy, N) after step k if `k > burn_in_steps` and `k % record_every == 0`, as `ReplicaExchangeGCMC.run_regc` does.
 - `adsorbed_cutoff` (*float, optional*): If given, each sample also carries `system.n_adsorbed(adsorbed_cutoff)`; else None. Default None.
+- `observables` (*sequence of regc.observables.Observable, optional*): Evaluated on the configuration of every recorded sample. Default None.
+- `record_configurations` (*bool, optional*): If True, each sample also carries a copy of the configuration (`ParticleSystem.full_configuration` plus the group sizes). Default False.
 - `mode, n, **kwargs`: Passed to `diffuse`.
 
 **Returns**
 
-- *Replica*: `self`, with the samples of this block in `self.block_samples` as a list of `(energy, N, N_ads, N_s)`; `N_s` is `system.species_counts()` with several exchanged species, else None.
+- *Replica*: `self`, with the samples of this block in `self.block_samples` as a list of `(energy, N, N_ads, N_s, obs, config)`; `N_s` is `system.species_counts()` with several exchanged species, else None; `obs` is `{name: values}` (empty without observables); `config` is `(positions, species, n_frozen, n_substrate)` or None.
 
 #### `Replica.diffuse`
 
@@ -2015,12 +2056,39 @@ probability given (see `_move_displace_substrate`).
 - `n_steps` (*int*): Number of moves to attempt in this sweep.
 - `p_displace` (*float, optional*): Relative probability of a displacement move (single-particle MC, or the joint HMC trajectory if `self.hmc_enabled` is True). Default is 0.5.
 - `p_insert` (*float, optional*): Relative probability of a GCMC insertion move. Default is 0.25.
-- `p_delete` (*float, optional*): Relative probability of a GCMC deletion move. Default is 0.25.
+- `p_delete` (*float, optional*): Relative probability of a GCMC deletion move; must equal `p_insert`. Default is 0.25.
 - `p_displace_substrate` (*float, optional*): Relative probability of an independent substrate displacement move. Default is 0.0 (off).
 
 **Returns**
 
 - *Replica*: `self`, returned so a process-pool worker can send the mutated replica back to the main process.
+
+**Raises**
+
+- *ValueError*: If `p_insert` differs from `p_delete` (the acceptance rules assume equal attempt probabilities).
+
+#### `Replica.check_energy`
+
+```python
+Replica.check_energy(tol: float = 1e-06) -> Replica
+```
+
+Compare the running energy with a full recomputation, and resync it.
+
+MC moves update the energy incrementally (`energy += dU`); this
+catches any drift (round-off, or a calculator whose incremental and
+full energies disagree). A drift larger than `tol` per atom is
+stored in `last_energy_drift` and the energy is reset to the
+recomputed value; a smaller one is only recorded, so runs whose
+energies agree to round-off stay bit-identical.
+
+**Parameters**
+
+- `tol` (*float, optional*): Tolerance per atom (substrate + mobile), in energy units. Default 1e-6.
+
+**Returns**
+
+- *Replica*: `self` (for process-pool workers), with `last_energy_drift` (running minus recomputed energy) and `energy_resynced`.
 
 #### `Replica.acceptance_rates`
 
@@ -2039,7 +2107,7 @@ Compute the acceptance rate of each move type attempted so far.
 ### `ReplicaExchangeGCMC`
 
 ```python
-ReplicaExchangeGCMC(temperatures: List[float], mus, system_factory: Callable[[np.random.Generator], ParticleSystem], seed: int = 0, max_disp: float = 0.2, n_workers: int = 1, lambda_cubed_of_T: Callable[[float], float] = <function ReplicaExchangeGCMC.<lambda>>, hmc_enabled: bool = False, hmc_leapfrog_steps: int = 10, hmc_dt: float = 0.005, adsorbed_cutoff: Optional[float] = None)
+ReplicaExchangeGCMC(temperatures: List[float], mus, system_factory: Callable[[np.random.Generator], ParticleSystem], seed: int = 0, max_disp: float = 0.2, n_workers: int = 1, lambda_cubed_of_T: Callable[[float], float] = <function ReplicaExchangeGCMC.<lambda>>, hmc_enabled: bool = False, hmc_leapfrog_steps: int = 10, hmc_dt: float = 0.005, adsorbed_cutoff: Optional[float] = None, observables: Optional[Sequence[Observable]] = None, configurations_dir: Optional[str] = None, configurations_every: int = 1, skip_empty_swaps: bool = True, records_path: Optional[str] = None, records_potential: str = 'sampling', records_every: int = 1)
 ```
 
 Manages a 2D ladder of replicas over (temperature, chemical potential).
@@ -2101,6 +2169,13 @@ Construct the replica-exchange ladder.
 - `hmc_leapfrog_steps` (*int, optional*): Number of leapfrog integration steps per HMC trial, passed to every `Replica`. Default is 10.
 - `hmc_dt` (*float, optional*): Leapfrog integration timestep for HMC, passed to every `Replica`. Default is 0.005.
 - `adsorbed_cutoff` (*float, optional*): If given, every sample also records `system.n_adsorbed(adsorbed_cutoff)` under `'N_ads'`, so the adsorbed count can be reweighted like N (see `MBARSurfaceAnalysis`, `observable='N_ads'`). Default None (not recorded).
+- `observables` (*sequence of regc.observables.Observable, optional*): Structural observables (coordination numbers, RDFs, ...) evaluated on every recorded sample and stored under `samples[key]['obs:<name>']`, for MBAR reweighting like N. Default None.
+- `configurations_dir` (*str, optional*): If given, every `configurations_every`-th recorded sample's configuration is appended to `<configurations_dir>/configs_T{it}_mu{imu}.extxyz`, tagged with its sample index, so structures can be picked out of the phase diagram afterwards (`MBARSurfaceAnalysis.representative_samples`, `regc.analysis.export_phase_configurations`). Default None (off); see also `save_configurations`.
+- `configurations_every` (*int, optional*): Store every this many samples' configurations. Default 1 (all).
+- `skip_empty_swaps` (*bool, optional*): In `run_regc`, draw the replica-exchange move only among the (pattern, offset) combinations that have at least one pair on this grid, instead of among all of them (on an n_T x 1 grid, six of the eight draws would otherwise attempt nothing). The choice does not depend on the configurations, so either way the sampling is exact; True wastes no RE steps. Default True; a run resumed from a checkpoint keeps the setting it was started with (False for checkpoints written before this option existed), so it continues bit-identically.
+- `records_path` (*str, optional*): If given, every recorded sample is appended to this HDF5 file (`regc.records`): grid point, sample index, walker, N, the energy under the sampling potential and (every `records_every`-th sample) the configuration, so the samples can later be re-evaluated with another potential (`regc.records.reevaluate`) and reweighted to it (`MBARSurfaceAnalysis.with_potential`). Needs h5py. Default None (off); see also `save_records`.
+- `records_potential` (*str, optional*): Name of the sampling potential in the records file. Default `'sampling'`.
+- `records_every` (*int, optional*): Store the configuration of every this many samples (the energy and N of all of them). Default 1.
 
 **Raises**
 
@@ -2138,6 +2213,57 @@ List the disjoint replica pairs of one swap pattern ([ZSG] Fig. 2).
 **Raises**
 
 - *ValueError*: If `swap_type` is not one of `SWAP_TYPES`.
+
+#### `ReplicaExchangeGCMC.check_energies`
+
+```python
+ReplicaExchangeGCMC.check_energies(tol: float = 1e-06) -> Dict[Tuple[int, int], Tuple[float, bool]]
+```
+
+Check every replica's running energy against a full recomputation.
+
+See `Replica.check_energy`; runs in the worker processes of a
+parallel run. `regc.driver.run_with_checkpoints` calls it after
+every chunk.
+
+**Parameters**
+
+- `tol` (*float, optional*): Tolerance per atom. Default 1e-6.
+
+**Returns**
+
+- *dict*: `{key: (drift, resynced)}`.
+
+#### `ReplicaExchangeGCMC.pair_acceptance`
+
+```python
+ReplicaExchangeGCMC.pair_acceptance() -> Dict[Tuple[Tuple[int, int], Tuple[int, int]], Tuple[int, float]]
+```
+
+Swap attempts and acceptance ratio of every neighbouring pair.
+
+A pattern's average can hide a single pair that never swaps and so
+cuts the ladder in two; this lists them one by one.
+
+**Returns**
+
+- *dict*: `{(key_a, key_b): (attempts, acceptance)}`.
+
+#### `ReplicaExchangeGCMC.round_trip_counts`
+
+```python
+ReplicaExchangeGCMC.round_trip_counts() -> Dict[str, np.ndarray]
+```
+
+Completed round trips of every walker along T and along mu.
+
+A walker that never completes a round trip along T has not carried
+a low-temperature configuration through the hot replicas and back:
+the low-T replicas may still remember their start.
+
+**Returns**
+
+- *dict*: `{'T': array, 'mu': array}`, one entry per walker (completed end-to-end-and-back trips).
 
 #### `ReplicaExchangeGCMC.run`
 
@@ -2199,16 +2325,19 @@ One REGC step is:
    insertion with probability 1/2 each, Eqs. (4)-(5) of
    docs/REGC_algorithm.md). Otherwise make ONE replica-exchange
    move: draw one pattern from `swap_types` and an offset (0/1),
-   each uniformly, and attempt all of that pattern's disjoint swaps
-   (Eq. (8)).
+   each uniformly (with `skip_empty_swaps`: one uniformly among
+   the combinations that have pairs on this grid), and attempt all
+   of that pattern's disjoint swaps (Eq. (8)).
 2. Diffusion at fixed (N, V, T), in parallel over replicas (see
    `Replica.diffuse`).
 3. Every `record_every` steps after `burn_in_steps`, record (U, N)
    of every replica -- i.e. after the last diffusion move, before
    the next GC/RE step.
 4. Every `convergence_every` steps, test convergence of the
-   reduced-energy densities rho(u) (see `rho_u_change`); stop if
-   converged, otherwise continue up to `n_steps`.
+   reduced-energy densities rho(u): compare the samples recorded
+   since the previous check with those of the interval before it
+   (disjoint blocks, see `rho_u_change`); stop if they agree,
+   otherwise continue up to `n_steps`.
 
 `x0` follows the paper's TEXT: it is the probability of a GC
 attempt ([ZSG]: x0 = 0.99 with "swaps attempted every 100 REGC
@@ -2226,7 +2355,7 @@ that convention pass `1 - x0`.
 - `burn_in_steps` (*int, optional*): Steps before recording starts. Default is 0.
 - `swap_types` (*tuple of str, optional*): Swap patterns to draw from. Default is all four of `SWAP_TYPES` (including the diagonals).
 - `convergence_every` (*int, optional*): Check convergence every this many steps (rounded to a multiple of `record_every`). Default is None (no check; run `n_steps`).
-- `convergence_tol` (*float, optional*): Converged when the largest total-variation change of rho(u) over all grid points since the previous check is below this. Default is 0.05.
+- `convergence_tol` (*float, optional*): Converged when the largest total-variation distance between the rho(u) of the two latest inter-check blocks, over all grid points, is below this. Default is 0.05. Two blocks of n samples from the same distribution still differ by roughly sqrt(convergence_bins / (pi n)) from sampling noise alone, so the tolerance must lie above that floor (fewer bins or longer blocks). The first verdict needs three checks.
 - `convergence_bins` (*int, optional*): Histogram bins for rho(u). Default is 30.
 - `verbose` (*bool, optional*): Print progress about ten times over the run. Default is True.
 - `trajectory_dir` (*str, optional*): As in `run`. Default is None.
@@ -2244,29 +2373,37 @@ that convention pass `1 - x0`.
 #### `ReplicaExchangeGCMC.rho_u_change`
 
 ```python
-ReplicaExchangeGCMC.rho_u_change(n_prev: int, bins: int = 30) -> float
+ReplicaExchangeGCMC.rho_u_change(n_prev: int, bins: int = 30, n_start: int = 0) -> float
 ```
 
-Largest change of the reduced-energy density rho(u) between checks.
+Largest change of the reduced-energy density rho(u) between blocks.
 
 For each grid point, u = beta*(U - mu*N) + N*ln(Lambda^3) of its
 recorded samples (Eq. (9) of docs/REGC_algorithm.md; summed over
-species if several are exchanged) is histogrammed
-twice on common bins: using the first `n_prev` samples (the state
-at the previous check) and using all samples. Returns the maximum
-over grid points of the total-variation distance
-0.5 * sum |p_all - p_prev| -- [ZSG]'s criterion, "no change in the
-density of reduced-energy states rho(U) with increasing simulation
-steps".
+species if several are exchanged) is histogrammed on common bins
+for two disjoint blocks: samples `n_start:n_prev` (the interval
+before the previous check) and samples `n_prev:` (since it).
+Returns the maximum over grid points of the total-variation
+distance 0.5 * sum |p_new - p_old| -- [ZSG]'s criterion, "no change
+in the density of reduced-energy states rho(U) with increasing
+simulation steps".
+
+The blocks are disjoint on purpose: comparing the first `n_prev`
+samples with all samples (which contain them) shrinks like 1/k
+after k equal checks whatever the data do, so a drifting run would
+pass. Two blocks of n samples drawn from one distribution still
+differ by about sqrt(bins / (pi n)) (sampling noise), so a tolerance
+must lie above that.
 
 **Parameters**
 
-- `n_prev` (*int*): Number of samples per grid point at the previous check.
+- `n_prev` (*int*): Number of samples per grid point at the previous check: the end of the old block, the start of the new one.
 - `bins` (*int, optional*): Number of histogram bins. Default 30.
+- `n_start` (*int, optional*): Start of the old block (the sample count at the check before the previous one). Default 0.
 
 **Returns**
 
-- *float*: The maximum total-variation change, in [0, 1].
+- *float*: The maximum total-variation distance, in [0, 1].
 
 #### `ReplicaExchangeGCMC.fingerprint`
 
@@ -2308,8 +2445,13 @@ ReplicaExchangeGCMC.load_checkpoint(path: str) -> dict
 Restore a state saved by `save_checkpoint` into this simulation.
 
 The simulation must have been constructed with the same temperature
-ladder, mu grid and Lambda^3(T); the system factory is not called
-again for the restored replicas.
+ladder, mu grid, Lambda^3(T) and `adsorbed_cutoff`. The
+checkpoint supplies the configurations, energies, random streams
+and samples; the calculators and the move settings (`max_disp`,
+HMC) are this simulation's, built from the current setup. So a
+checkpoint survives a moved potential file, and a changed potential
+setting (e.g. a new hard core) takes effect: each restored energy is
+recomputed, and resynchronised with a warning if it changed.
 
 **Parameters**
 
@@ -2321,7 +2463,7 @@ again for the restored replicas.
 
 **Raises**
 
-- *ValueError*: If the checkpoint's temperature ladder, mu grid or Lambda^3 differ from this simulation's.
+- *ValueError*: If the checkpoint's temperature ladder, mu grid, Lambda^3 or `adsorbed_cutoff` differ from this simulation's.
 
 #### `ReplicaExchangeGCMC.swap_acceptance`
 
@@ -2336,6 +2478,54 @@ Replica-exchange acceptance ratio per swap pattern.
 **Returns**
 
 - *dict of str to float*: Accepted / attempted swaps for each of `SWAP_TYPES` (0.0 if never attempted).
+
+#### `ReplicaExchangeGCMC.save_configurations`
+
+```python
+ReplicaExchangeGCMC.save_configurations(directory: Optional[str], every: int = 1) -> None
+```
+
+Store the configurations of recorded samples from now on (or stop).
+
+**Parameters**
+
+- `directory` (*str or None*): Directory for `configs_T{it}_mu{imu}.extxyz` (one per grid point); None stops storing.
+- `every` (*int, optional*): Store every this many samples (by sample index). Default 1.
+
+**Raises**
+
+- *ValueError*: If `every` is not positive.
+
+#### `ReplicaExchangeGCMC.save_records`
+
+```python
+ReplicaExchangeGCMC.save_records(path: Optional[str], potential: str = 'sampling', every: int = 1, positions_dtype: str = 'float64') -> None
+```
+
+Append every recorded sample to an HDF5 records file from now on (or stop).
+
+See `regc.records`. The file is opened at the first recorded
+sample and flushed at the end of every `run`/`run_regc` call and
+at every checkpoint.
+
+**Parameters**
+
+- `path` (*str or None*): The records file; None stops recording (and closes the file).
+- `potential` (*str, optional*): Name of the sampling potential. Default `'sampling'`.
+- `every` (*int, optional*): Store the configuration of every this many samples (by sample index). Default 1.
+- `positions_dtype` (*str, optional*): `'float64'` (default) or `'float32'`.
+
+**Raises**
+
+- *ValueError*: If `every` is not positive.
+
+#### `ReplicaExchangeGCMC.n_substrate` (property)
+
+int: Displaceable (non-frozen) substrate atoms per replica (for the kinetic heat capacity).
+
+#### `ReplicaExchangeGCMC.observables_meta` (property)
+
+dict: `{name: metadata}` of the recorded observables (see `regc.observables`).
 
 #### `ReplicaExchangeGCMC.summary`
 
@@ -2362,7 +2552,7 @@ SWAP_TYPES = ('T', 'mu', 'cross_left', 'cross_right')
 ### `run_with_checkpoints`
 
 ```python
-run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000, x0: float = 0.99, diffusion: str = 'mc', diffusion_steps: int = 10, record_every: int = 100, convergence_every: Optional[int] = None, convergence_tol: float = 0.05, time_limit: Optional[float] = None, resume: bool = True, overwrite: bool = False, metadata: Optional[dict] = None, progress: Optional[Callable[[str], None]] = <built-in function print>, **diffusion_kwargs) -> RunStatus
+run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000, x0: float = 0.99, diffusion: str = 'mc', diffusion_steps: int = 10, record_every: int = 100, convergence_every: Optional[int] = None, convergence_tol: float = 0.05, time_limit: Optional[float] = None, resume: bool = True, overwrite: bool = False, metadata: Optional[dict] = None, progress: Optional[Callable[[str], None]] = <built-in function print>, energy_tol: float = 1e-06, **diffusion_kwargs) -> RunStatus
 ```
 
 Run `sim.run_regc` in checkpointed chunks.
@@ -2372,15 +2562,16 @@ Run `sim.run_regc` in checkpointed chunks.
 - `sim` (*ReplicaExchangeGCMC*): The simulation (freshly constructed; on resume its state is replaced by the checkpoint's).
 - `out_dir` (*str*): Directory for `samples.npz`, `checkpoint.pkl` and `run_metadata.json`.
 - `n_steps` (*int*): Total REGC steps of the run (over all resumptions).
-- `chunk` (*int, optional*): Steps between checkpoints. Default 1000.
+- `chunk` (*int, optional*): Steps between checkpoints; a multiple of `record_every` (and of `trajectory_every` if given). Default 1000.
 - `x0, diffusion, diffusion_steps, record_every`: Passed to `ReplicaExchangeGCMC.run_regc`.
 - `convergence_every` (*int, optional*): Check rho(u) convergence every this many steps (rounded up to a multiple of `chunk`); also at the end. Default None: no checks.
-- `convergence_tol` (*float, optional*): Converged when the largest change of rho(u) between checks is below this. Default 0.05.
+- `convergence_tol` (*float, optional*): Converged when rho(u) of the samples since the last check and of the interval before it differ (largest total-variation distance) by less than this; see `ReplicaExchangeGCMC.rho_u_change` for the noise floor. Default 0.05.
 - `time_limit` (*float, optional*): Seconds: stop (`finished=False`) before starting a chunk that is expected to end later than this, measured from the call. Default None (no limit).
 - `resume` (*bool, optional*): Continue the run saved in `out_dir` if there is one. Default True.
 - `overwrite` (*bool, optional*): Start afresh even if `out_dir` holds a run (with `resume=False`). Default False.
 - `metadata` (*dict, optional*): JSON-serialisable description of the run (potential, lattice constant, protocol, ...). Saved on a fresh start; on resume every key must match the saved value.
 - `progress` (*callable, optional*): Called with a one-line status after every chunk. Default `print`; None for silence.
+- `energy_tol` (*float, optional*): After every chunk each replica's running energy is compared with a full recomputation (`ReplicaExchangeGCMC.check_energies`); a drift above this, per atom, is resynced with a warning. Default 1e-6.
 - `**diffusion_kwargs`: Passed to `run_regc` (e.g. `timestep_fs`, `taut_fs`).
 
 **Returns**
@@ -2390,7 +2581,7 @@ Run `sim.run_regc` in checkpointed chunks.
 **Raises**
 
 - *FileExistsError*: If `out_dir` holds a run and neither `resume` nor `overwrite` is set.
-- *ValueError*: On resume, if the checkpoint or `metadata` do not match `sim`.
+- *ValueError*: If `chunk` is not a multiple of `record_every`; on resume, if the checkpoint or `metadata` do not match `sim`.
 
 ---
 
@@ -2439,6 +2630,10 @@ and must be passed again to `load_samples`.
 - `sim` (*ReplicaExchangeGCMC or SampleSet*): Anything with `temperatures`, `mu_grid`, `samples` and `lambda_cubed_of_T`.
 - `path` (*str*): Output file (`.npz`).
 
+**Raises**
+
+- *ValueError*: For a merged set (`merge_samples`): save the runs separately.
+
 ---
 
 ### `load_samples`
@@ -2470,7 +2665,7 @@ Read samples written by `save_samples`.
 ### `SampleSet`
 
 ```python
-SampleSet(temperatures: List[float], mu_grid: np.ndarray, samples: Dict[Tuple[int, int], Dict[str, list]], lambda_cubed_of_T: Callable[[float], float] = <function _unit_lambda_cubed>, exchange_species: Optional[Tuple[str, ...]] = None) -> None
+SampleSet(temperatures: List[float], mu_grid: np.ndarray, samples: Dict[Tuple[int, int], Dict[str, list]], lambda_cubed_of_T: Callable[[float], float] = <function _unit_lambda_cubed>, exchange_species: Optional[Tuple[str, ...]] = None, observables_meta: Optional[dict] = None, n_substrate: Optional[int] = None, first_index: Union[int, Dict] = 0, state_table: Optional[Dict] = None, run_labels: Optional[List[str]] = None) -> None
 ```
 
 Recorded REGC samples, detached from the simulation that produced them.
@@ -2485,6 +2680,11 @@ Has exactly the attributes `MBARSurfaceAnalysis` reads from a
 - `samples` (*dict*): `{(it, imu): {'U': [...], 'N': [...]}}`, plus `'N_ads'` if the run recorded it (`adsorbed_cutoff`) and `'N_s'` (counts per species) with several exchanged species.
 - `lambda_cubed_of_T` (*callable*): Lambda^3 as a function of temperature (see `ThermalWavelengthCubed`, `SpeciesLambdaCubed`).
 - `exchange_species` (*tuple of str, optional*): The exchanged species, in the order of the last axis of `mu_grid` and of `'N_s'`. None if unknown (files from older versions).
+- `observables_meta` (*dict, optional*): `{name: metadata}` of the observables recorded under `samples[key]['obs:<name>']` (see `regc.observables`).
+- `n_substrate` (*int, optional*): Displaceable substrate atoms per replica (kinetic part of the heat capacity). None if unknown (files from older versions).
+- `first_index` (*int or dict*): Index, in the run's own numbering, of the first sample kept per grid point (`discard` drops the earlier ones); maps samples to the stored configurations. A dict `{key: index}` when it differs between states (merged runs). Default 0.
+- `state_table` (*dict, optional*): `{key: (T, mu)}`: the thermodynamic state of every key, for sets that are not one rectangular (temperature x mu) grid -- the union of several runs (`merge_samples`), whose keys are `(run, it, imu)`. Default None: `temperatures[key[0]]` and `mu_grid[key]`.
+- `run_labels` (*list of str, optional*): With `state_table` from `merge_samples`: a label per run (e.g. its output directory), indexed by `key[0]`. Default None.
 
 #### `SampleSet.lambda_cubed_of_T`
 
@@ -2504,7 +2704,7 @@ Lambda^3 = 1 at every temperature (the reduced-units convention).
 
 #### `SampleSet.n_samples` (property)
 
-int: Samples per grid point.
+int: Samples per grid point (the smallest, if they differ).
 
 #### `SampleSet.discard`
 
@@ -2964,7 +3164,7 @@ Reservoir pressure giving chemical potential `mu_eV` at T.
 #### `Reservoir.mu_grid`
 
 ```python
-Reservoir.mu_grid(temperatures_K: Sequence[float], pressures: Sequence[float], unit: str = 'Pa') -> np.ndarray
+Reservoir.mu_grid(temperatures_K: Sequence[float], pressures: Sequence[float], unit: Optional[str] = None) -> np.ndarray
 ```
 
 Chemical potentials of a (temperature x pressure) replica ladder.
@@ -2973,7 +3173,7 @@ Chemical potentials of a (temperature x pressure) replica ladder.
 
 - `temperatures_K` (*sequence of float*): Temperatures, in Kelvin.
 - `pressures` (*sequence of float*): Pressures, in `unit`.
-- `unit` (*str, optional*): Pressure unit (see `regc.units.PRESSURE_UNITS`). Default `'Pa'`.
+- `unit` (*str, optional*): Pressure unit (see `regc.units.PRESSURE_UNITS`). Give it explicitly: the default None means Pa, with a FutureWarning (bar is the runner's default, so values in bar would otherwise be read as Pa, a factor 1e5).
 
 **Returns**
 
@@ -2994,7 +3194,7 @@ Lambda^3(T) of the exchanged particle, as a function of k_B*T in eV.
 #### `Reservoir.mu_at_T_eV`
 
 ```python
-Reservoir.mu_at_T_eV(T_eV: float, p: float, unit: str = 'Pa') -> float
+Reservoir.mu_at_T_eV(T_eV: float, p: float, unit: Optional[str] = None) -> float
 ```
 
 `mu_eV` with the engine's temperature unit (k_B*T in eV).
@@ -3003,7 +3203,7 @@ Reservoir.mu_at_T_eV(T_eV: float, p: float, unit: str = 'Pa') -> float
 
 - `T_eV` (*float*): k_B * T, in eV.
 - `p` (*float*): Pressure, in `unit`.
-- `unit` (*str, optional*): Pressure unit. Default `'Pa'`.
+- `unit` (*str, optional*): Pressure unit. Default None: Pa, with a FutureWarning.
 
 **Returns**
 
@@ -3012,7 +3212,7 @@ Reservoir.mu_at_T_eV(T_eV: float, p: float, unit: str = 'Pa') -> float
 #### `Reservoir.pressure_at_T_eV`
 
 ```python
-Reservoir.pressure_at_T_eV(T_eV: float, mu_eV: float, unit: str = 'Pa') -> float
+Reservoir.pressure_at_T_eV(T_eV: float, mu_eV: float, unit: Optional[str] = None) -> float
 ```
 
 `pressure_pascal` with the engine's temperature unit, in `unit`.
@@ -3021,7 +3221,7 @@ Reservoir.pressure_at_T_eV(T_eV: float, mu_eV: float, unit: str = 'Pa') -> float
 
 - `T_eV` (*float*): k_B * T, in eV.
 - `mu_eV` (*float*): Chemical potential, in eV.
-- `unit` (*str, optional*): Pressure unit of the result. Default `'Pa'`.
+- `unit` (*str, optional*): Pressure unit of the result. Default None: Pa, with a FutureWarning.
 
 **Returns**
 
@@ -3030,14 +3230,14 @@ Reservoir.pressure_at_T_eV(T_eV: float, mu_eV: float, unit: str = 'Pa') -> float
 #### `Reservoir.analysis_functions`
 
 ```python
-Reservoir.analysis_functions(unit: str = 'Pa') -> Tuple[Callable, Callable]
+Reservoir.analysis_functions(unit: Optional[str] = None) -> Tuple[Callable, Callable]
 ```
 
 The `(mu_of_Tp, p_of_Tmu)` pair for `MBARSurfaceAnalysis`.
 
 **Parameters**
 
-- `unit` (*str, optional*): Pressure unit the analysis will be given/return. Default `'Pa'`.
+- `unit` (*str, optional*): Pressure unit the analysis will be given/return. Default None: Pa, with a FutureWarning.
 
 **Returns**
 
@@ -3106,7 +3306,7 @@ Pressure giving chemical potential `mu_eV` at T.
 ### `DiatomicReservoir`
 
 ```python
-DiatomicReservoir(D0_eV: float, e_atom_eV: float, mass_molecule_amu: float, bond_length_angstrom: float, vib_wavenumber_cm: float, symmetry_number: int = 2, calculator_info: Optional[dict] = None) -> None
+DiatomicReservoir(D0_eV: float, e_atom_eV: float, mass_molecule_amu: float, bond_length_angstrom: float, vib_wavenumber_cm: float, symmetry_number: int = 2, electronic_degeneracy: int = 1, calculator_info: Optional[dict] = None) -> None
 ```
 
 A homonuclear diatomic gas (e.g. H2) exchanging single atoms.
@@ -3124,6 +3324,7 @@ consistent with the calculator (see this module's docstring and
 - `bond_length_angstrom` (*float*): Equilibrium bond length (rotational partition function), in A.
 - `vib_wavenumber_cm` (*float*): Vibrational wavenumber, in cm^-1.
 - `symmetry_number` (*int, optional*): Rotational symmetry number. Default 2 (homonuclear).
+- `electronic_degeneracy` (*int, optional*): Degeneracy of the molecule's electronic ground state (3 for O2). Default 1; `from_calculator` picks it from the element.
 - `calculator_info` (*dict, optional*): Diagnostics of the potential's own molecule (r0, De, D0, ZPE, e_atom), as filled in by `from_calculator`. Default None.
 
 #### `DiatomicReservoir.mass_exchanged_amu` (property)
@@ -3184,7 +3385,7 @@ An H2 reservoir with experimental spectroscopic constants.
 #### `DiatomicReservoir.from_calculator` (classmethod)
 
 ```python
-DiatomicReservoir.from_calculator(ase_calculator, symbol: str = 'H', d0: Union[str, float] = 'self', bond_length_angstrom: Optional[float] = None, vib_wavenumber_cm: Optional[float] = None, mass_molecule_amu: Optional[float] = None, symmetry_number: int = 2, r_scan: Optional[np.ndarray] = None) -> DiatomicReservoir
+DiatomicReservoir.from_calculator(ase_calculator, symbol: str = 'H', d0: Union[str, float] = 'self', bond_length_angstrom: Optional[float] = None, vib_wavenumber_cm: Optional[float] = None, mass_molecule_amu: Optional[float] = None, symmetry_number: int = 2, r_scan: Optional[np.ndarray] = None, electronic_degeneracy: Optional[int] = None) -> DiatomicReservoir
 ```
 
 A reservoir consistent with a given potential.
@@ -3202,6 +3403,7 @@ calculator; D0 does too unless `d0` says otherwise.
 - `mass_molecule_amu` (*float, optional*): Molecular mass; default twice the atomic mass from ASE's tables.
 - `symmetry_number` (*int, optional*): Rotational symmetry number. Default 2.
 - `r_scan` (*numpy.ndarray, optional*): Bond lengths (A) for the coarse scan; default 0.4-3.0 A.
+- `electronic_degeneracy` (*int, optional*): Electronic ground-state degeneracy of the molecule. Default None: `default_electronic_degeneracy` (3 for O2, 1 otherwise).
 
 **Returns**
 
@@ -3245,7 +3447,7 @@ zero-point energy).
 ### `diatomic_gas_mu_eV`
 
 ```python
-diatomic_gas_mu_eV(T_kelvin: float, p_pascal: float, mass_amu: float, bond_length_angstrom: float, vib_wavenumber_cm: float, symmetry_number: int = 2) -> float
+diatomic_gas_mu_eV(T_kelvin: float, p_pascal: float, mass_amu: float, bond_length_angstrom: float, vib_wavenumber_cm: float, symmetry_number: int = 2, electronic_degeneracy: int = 1) -> float
 ```
 
 Compute the chemical potential of a real diatomic gas at (T, p).
@@ -3259,8 +3461,9 @@ that).
 
 Uses the classical (high-temperature) rotational partition function,
 valid whenever T is well above the rotational temperature theta_rot
-(true for H2 -- theta_rot ~ 87 K -- at any remotely ordinary
-temperature).
+(H2: 87.6 K; O2: 2.08 K). Against NIST-JANAF at 1 bar it is within
+~7 meV per H2 and ~2 meV per O2 (with `electronic_degeneracy=3`) at
+300-1000 K.
 
 **Parameters**
 
@@ -3270,6 +3473,7 @@ temperature).
 - `bond_length_angstrom` (*float*): Equilibrium bond length, in Angstrom.
 - `vib_wavenumber_cm` (*float*): Vibrational wavenumber, in cm^-1.
 - `symmetry_number` (*int, optional*): Rotational symmetry number (2 for a homonuclear diatomic). Default is 2.
+- `electronic_degeneracy` (*int, optional*): Degeneracy of the electronic ground state: 1 for closed-shell molecules (H2, N2, Cl2), 3 for the triplet ground state of O2. Default is 1.
 
 **Returns**
 
@@ -3280,7 +3484,7 @@ temperature).
 ### `mu_atomic_from_diatomic_reservoir_eV`
 
 ```python
-mu_atomic_from_diatomic_reservoir_eV(T_kelvin: float, p_pascal: float, D0_eV: float, mass_molecule_amu: float, bond_length_angstrom: float, vib_wavenumber_cm: float, symmetry_number: int = 2, *, e_atom_eV: float) -> float
+mu_atomic_from_diatomic_reservoir_eV(T_kelvin: float, p_pascal: float, D0_eV: float, mass_molecule_amu: float, bond_length_angstrom: float, vib_wavenumber_cm: float, symmetry_number: int = 2, *, e_atom_eV: float, electronic_degeneracy: int = 1) -> float
 ```
 
 Compute an atomic species' chemical potential from a diatomic reservoir.
@@ -3303,6 +3507,7 @@ reservoir.
 - `vib_wavenumber_cm` (*float*): Vibrational wavenumber, in cm^-1.
 - `symmetry_number` (*int, optional*): Rotational symmetry number (2 for a homonuclear diatomic). Default is 2.
 - `e_atom_eV` (*float*): The calculator's energy of one isolated atom (keyword-only, required): the zero of the GCMC energy scale. `'e_atom_eV'` from `diatomic_dissociation_energy_eV`; 0 for `LJCalculator`.
+- `electronic_degeneracy` (*int, optional*): Degeneracy of the molecule's electronic ground state (keyword-only; 3 for O2). Default is 1.
 
 **Returns**
 
@@ -3313,7 +3518,7 @@ reservoir.
 ### `pressure_from_atomic_mu_reservoir_pascal`
 
 ```python
-pressure_from_atomic_mu_reservoir_pascal(T_kelvin: float, mu_atom_eV: float, D0_eV: float, mass_molecule_amu: float, bond_length_angstrom: float, vib_wavenumber_cm: float, symmetry_number: int = 2, *, e_atom_eV: float) -> float
+pressure_from_atomic_mu_reservoir_pascal(T_kelvin: float, mu_atom_eV: float, D0_eV: float, mass_molecule_amu: float, bond_length_angstrom: float, vib_wavenumber_cm: float, symmetry_number: int = 2, *, e_atom_eV: float, electronic_degeneracy: int = 1) -> float
 ```
 
 Invert `mu_atomic_from_diatomic_reservoir_eV` for the reservoir pressure.
@@ -3333,6 +3538,7 @@ range you've already explored (e.g. by direct GCMC scanning) into
 - `vib_wavenumber_cm` (*float*): Vibrational wavenumber, in cm^-1.
 - `symmetry_number` (*int, optional*): Rotational symmetry number (2 for a homonuclear diatomic). Default is 2.
 - `e_atom_eV` (*float*): The calculator's isolated-atom energy (keyword-only, required); see `mu_atomic_from_diatomic_reservoir_eV`.
+- `electronic_degeneracy` (*int, optional*): Degeneracy of the molecule's electronic ground state (keyword-only; 3 for O2). Default is 1.
 
 **Returns**
 
@@ -3383,7 +3589,7 @@ H2_D0_EXPERIMENTAL_EV = 4.478
 ### `MBARSurfaceAnalysis`
 
 ```python
-MBARSurfaceAnalysis(sim: ReplicaExchangeGCMC, solver_protocol: str = 'robust', p0_of_T: Callable[[float], float] = <function p0_reduced_units>, mu_of_Tp: Optional[Callable[[float, float], float]] = None, p_of_Tmu: Optional[Callable[[float, float], float]] = None, lambda_cubed_of_T: Optional[Callable[[float], float]] = None, reservoir=None, pressure_unit: str = 'Pa')
+MBARSurfaceAnalysis(sim: ReplicaExchangeGCMC, solver_protocol: str = 'robust', p0_of_T: Callable[[float], float] = <function p0_reduced_units>, mu_of_Tp: Optional[Callable[[float, float], float]] = None, p_of_Tmu: Optional[Callable[[float, float], float]] = None, lambda_cubed_of_T: Optional[Callable[[float], float]] = None, reservoir=None, pressure_unit: Optional[str] = None, initial_f_k=None, use_pymbar: Optional[bool] = None, subsample=None)
 ```
 
 Reweight recorded (U, N) samples from a finished
@@ -3424,11 +3630,106 @@ the root sits at an extreme pressure, just more expensive per call.
 - `p_of_Tmu` (*callable, optional*): A function `p_of_Tmu(T, mu) -> p`, the inverse of `mu_of_Tp`. Default is None, which falls back to numerically inverting `mu_of_Tp` (or, with neither given, the closed-form inverse of `p0_of_T`'s relationship).
 - `lambda_cubed_of_T` (*callable, optional*): A function `lambda_cubed_of_T(T) -> float` giving the thermal de Broglie wavelength cubed used during sampling. It enters the reduced potential as `N * ln(Lambda^3(T))` (see `_u_of_state`). Default is None, which uses `sim.lambda_cubed_of_T` if the simulation has one, else Lambda^3 = 1 (reduced units).
 - `reservoir` (*regc.reservoir.Reservoir, optional*): Sets `mu_of_Tp` and `p_of_Tmu` (unless given explicitly) from `Reservoir.analysis_functions`. Default None.
-- `pressure_unit` (*str, optional*): Pressure unit for `reservoir` (`'Pa'`, `'bar'`, `'atm'`). Default `'Pa'`.
+- `pressure_unit` (*str, optional*): Pressure unit for `reservoir` (`'Pa'`, `'bar'`, `'atm'`). Default None: Pa, with a FutureWarning (give it explicitly).
+- `initial_f_k` (*array_like, optional*): Starting free energies for the MBAR solver (e.g. those of the full data set when analysing a bootstrap resample). Default None (a Newton estimate).
+- `use_pymbar` (*bool, optional*): Finish (and check) the solve with pymbar, which also provides analytical uncertainties. False keeps the Newton solution only (it agrees with pymbar to round-off), for the many solves of a bootstrap. Default None: True for one run, False for merged runs (`regc.io.merge_samples`), whose duplicated or barely overlapping states can stall pymbar's solver for many minutes; use the bootstrap for their uncertainties.
+- `subsample` (*{None, 'g'} or int, optional*): Thin every replica before the analysis: `'g'` keeps every g-th sample, g being the replica's statistical inefficiency (`regc.diagnostics.replica_inefficiencies`), so the kept samples are roughly independent and pymbar's analytical uncertainties (`mean_N`'s std error) become meaningful; an integer keeps every that-many-th sample. Thinning discards information: the estimates get noisier, so prefer the full data with `regc.diagnostics.bootstrap` error bars for maps, and use this for quick, honest single-number errors. Default None.
 
 **Raises**
 
 - *ValueError*: If any grid point in `sim` has no recorded samples, or several species are exchanged but per-species counts were not recorded.
+
+#### `MBARSurfaceAnalysis.resampled`
+
+```python
+MBARSurfaceAnalysis.resampled(indices: dict) -> MBARSurfaceAnalysis
+```
+
+The same analysis on a resampled data set (for the bootstrap).
+
+**Parameters**
+
+- `indices` (*dict*): `{state_key: integer index array}`: the samples of each state to keep, with repetition (see `regc.diagnostics.bootstrap`).
+
+**Returns**
+
+- *MBARSurfaceAnalysis*: Built with the options of this one, the MBAR solve warm-started from its free energies.
+
+#### `MBARSurfaceAnalysis.with_potential`
+
+```python
+MBARSurfaceAnalysis.with_potential(name: str, reservoir=None, pressure_unit: Optional[str] = None, mu_of_Tp: Optional[Callable] = None, p_of_Tmu: Optional[Callable] = None) -> MBARSurfaceAnalysis
+```
+
+The same analysis reweighted to another potential.
+
+The samples were drawn with potential A (the sampling one); their
+energies under B (`samples[key]['E:<name>']`, from
+`regc.records.reevaluate` and `regc.records.attach_energies`)
+give B's weight at any (T, mu),
+
+    w_n^B(T, mu) ~ exp(-beta U_B(n) + beta mu N_n - N_n ln Lambda^3)
+                   / sum_k N_k exp(f_k - u_k^A(n)),
+
+the denominator being A's MBAR mixture over the sampled states
+(Shirts & Chodera 2008, J. Chem. Phys. 129, 124105, Sec. on
+reweighting to unsampled states). Every map of the returned
+analysis (coverage, C_V, observables, effective sample size,
+configurations) is then B's. The effective sample size measures
+how well A's samples cover B's distribution: where it is low, B
+favours configurations A rarely visited, and only a run with B
+itself can say what happens there.
+
+Samples without a B energy (re-evaluation of a subset) get zero
+weight; choose the subset independently of the configurations
+(every k-th sample) so the estimates stay unbiased.
+
+Chemical potentials keep their meaning only if both potentials
+place the reservoir's reference (e.g. the isolated molecule) at the
+same energy: if B binds the gas molecule differently, give B's own
+`reservoir` (or `mu_of_Tp`/`p_of_Tmu`) for the pressure axes.
+
+**Parameters**
+
+- `name` (*str*): Potential name (the samples hold `'E:<name>'`).
+- `reservoir` (*regc.reservoir.Reservoir, optional*): B's gas reservoir (its pressure <-> mu mapping). Default None: keep this analysis's mapping.
+- `pressure_unit` (*str, optional*): Pressure unit for `reservoir`. Default None (Pa with a warning).
+- `mu_of_Tp, p_of_Tmu` (*callable, optional*): Explicit mapping for B (override `reservoir`). Default None.
+
+**Returns**
+
+- *MBARSurfaceAnalysis*: A copy sharing A's free energies, with U = U_B. Its `mbar` gives no analytical uncertainties (use `regc.diagnostics.bootstrap`, which resamples and reweights again); its overlap matrix is A's (the sampled states).
+
+**Raises**
+
+- *ValueError*: If the samples hold no `'E:<name>'` energies, or none are finite.
+
+#### `MBARSurfaceAnalysis.grand_potential_shift`
+
+```python
+MBARSurfaceAnalysis.grand_potential_shift(T: float, mu) -> Tuple[float, float]
+```
+
+Omega_B - Omega_A at one (T, mu), by exponential averaging.
+
+For an analysis from `with_potential`:
+beta (Omega_B - Omega_A) = -ln < exp(-beta (U_B - U_A)) >_A(T, mu)
+(Zwanzig's free-energy perturbation, in the grand ensemble), with
+the A average MBAR-reweighted to (T, mu) over the evaluated
+samples. Reliable only while the effective sample size stays large.
+
+**Parameters**
+
+- `T` (*float*): Temperature.
+- `mu` (*float or array_like*): Chemical potential (as in this analysis).
+
+**Returns**
+
+- *tuple of float*: `(dOmega, ess)`: the shift in energy units, and the Kish effective sample size of B's weights there.
+
+**Raises**
+
+- *ValueError*: On the sampling analysis itself.
 
 #### `MBARSurfaceAnalysis.mean_N`
 
@@ -3601,6 +3902,233 @@ Compute the reweighted coverage(T, p) surface phase diagram.
 
 - *numpy.ndarray*: Array of shape (len(T_grid), len(p_grid)): the reweighted mean coverage at each (T, p) point -- the temperature-pressure surface phase diagram for the number of adsorbed particles.
 
+#### `MBARSurfaceAnalysis.effective_sample_size`
+
+```python
+MBARSurfaceAnalysis.effective_sample_size(T_grid: np.ndarray, grid: np.ndarray, pressure: bool = False) -> np.ndarray
+```
+
+Kish effective number of samples, 1 / sum_n w_n^2, on a mesh.
+
+It counts how many samples effectively carry the reweighted
+average at a target state: about the number of (independent)
+samples of a simulated state there, and ~1 where one sample
+dominates (extrapolation beyond the sampled ladder, or a state
+between poorly overlapping replicas). Mask cells below a few tens
+before trusting a map; correlated samples make the true number
+smaller still (by the statistical inefficiency).
+
+**Parameters**
+
+- `T_grid` (*numpy.ndarray*): Temperatures.
+- `grid` (*numpy.ndarray*): Pressures (`pressure=True`) or chemical potentials.
+- `pressure` (*bool, optional*): Whether `grid` holds pressures. Default False.
+
+**Returns**
+
+- *numpy.ndarray*: Shape (len(T_grid), len(grid)).
+
+#### `MBARSurfaceAnalysis.observable_map`
+
+```python
+MBARSurfaceAnalysis.observable_map(name: str, T_grid: np.ndarray, grid: np.ndarray, pressure: bool = False) -> np.ndarray
+```
+
+Reweighted mean of every component of a recorded observable on a mesh.
+
+**Parameters**
+
+- `name` (*str*): Observable name (`observables=` of the run).
+- `T_grid` (*numpy.ndarray*): Temperatures.
+- `grid` (*numpy.ndarray*): Pressures (`pressure=True`) or chemical potentials.
+- `pressure` (*bool, optional*): Whether `grid` holds pressures. Default False.
+
+**Returns**
+
+- *numpy.ndarray*: Shape (len(T_grid), len(grid), size).
+
+#### `MBARSurfaceAnalysis.observable_mean`
+
+```python
+MBARSurfaceAnalysis.observable_mean(name: str, T: float, mu) -> np.ndarray
+```
+
+Reweighted mean of every component of a recorded observable at one (T, mu).
+
+**Parameters**
+
+- `name` (*str*): Observable name.
+- `T` (*float*): Temperature.
+- `mu` (*float or array_like*): Chemical potential (one per species with several).
+
+**Returns**
+
+- *numpy.ndarray*: Shape (size,).
+
+#### `MBARSurfaceAnalysis.mean_coordination`
+
+```python
+MBARSurfaceAnalysis.mean_coordination(name: str, T_grid: np.ndarray, grid: np.ndarray, pressure: bool = False) -> np.ndarray
+```
+
+Reweighted mean coordination number, <bonds> / <centers>, on a mesh.
+
+**Parameters**
+
+- `name` (*str*): A `regc.observables.CoordinationNumber` observable.
+- `T_grid` (*numpy.ndarray*): Temperatures.
+- `grid` (*numpy.ndarray*): Pressures (`pressure=True`) or chemical potentials.
+- `pressure` (*bool, optional*): Whether `grid` holds pressures. Default False.
+
+**Returns**
+
+- *numpy.ndarray*: Shape (len(T_grid), len(grid)); NaN where there are (almost) no centre atoms (<centers> < 1e-6).
+
+#### `MBARSurfaceAnalysis.coordination_distribution`
+
+```python
+MBARSurfaceAnalysis.coordination_distribution(name: str, T: float, mu) -> np.ndarray
+```
+
+Probability that a centre atom has coordination 0, 1, ..., max_cn.
+
+**Parameters**
+
+- `name` (*str*): A `regc.observables.CoordinationHistogram` observable.
+- `T` (*float*): Temperature.
+- `mu` (*float or array_like*): Chemical potential.
+
+**Returns**
+
+- *numpy.ndarray*: Shape (max_cn + 1,), summing to 1 (all zeros without centres); the last entry is `P(CN >= max_cn)`.
+
+#### `MBARSurfaceAnalysis.radial_distribution`
+
+```python
+MBARSurfaceAnalysis.radial_distribution(name: str, T: float, mu, normalize: str = 'per_center') -> Tuple[np.ndarray, np.ndarray]
+```
+
+Reweighted radial distribution at one (T, mu).
+
+**Parameters**
+
+- `name` (*str*): A `regc.observables.RadialDistribution` observable.
+- `T` (*float*): Temperature.
+- `mu` (*float or array_like*): Chemical potential.
+- `normalize` (*{'per_center', 'density', 'g'}, optional*): `'per_center'`: n(r) = <H(r)> / (<n_a> dr), neighbours of a centre per unit distance (its integral to r_c is the mean coordination; for surfaces and clusters). `'density'`: n(r) / (4 pi r^2), local density of b around a (1/A^3). `'g'`: density / (<n_b> / V), the bulk g(r) (V includes any vacuum, so only meaningful in bulk). Default `'per_center'`.
+
+**Returns**
+
+- *tuple of numpy.ndarray*: `(r, values)`: bin centres (A) and the distribution (zeros if there are no a atoms).
+
+**Raises**
+
+- *ValueError*: On an unknown `normalize`.
+
+#### `MBARSurfaceAnalysis.heat_capacity`
+
+```python
+MBARSurfaceAnalysis.heat_capacity(T_grid: np.ndarray, grid: np.ndarray, pressure: bool = False, kinetic: bool = True) -> np.ndarray
+```
+
+Heat capacity C_V = (<E^2> - <E>^2) / (k_B T^2) on a mesh, in units of k_B.
+
+[ZSG] PRL 128, 246101, Eq. (1): E is the total energy, potential
+plus kinetic, and the averages are MBAR-reweighted to every (T, mu)
+or (T, p). Ridges of C_V along T at fixed p, or along p at fixed T,
+mark first-order phase boundaries (`heat_capacity_ridges`); a
+change of coverage without a ridge is a smooth crossover.
+
+The kinetic energy of the n moving atoms (mobile + displaceable
+substrate) is classical and independent of the configuration given
+n: <K | n> = (3/2) n k_B T and Var(K | n) = (3/2) n (k_B T)^2. So,
+with x = U + (3/2) k_B T n,
+
+    Var(E) = Var(x) + (3/2) (k_B T)^2 <n>,
+
+computed from the recorded U and N alone (MC diffusion never
+samples momenta, and it does not need to).
+
+In the grand ensemble (momenta included, Lambda^3 proportional to
+T^(-3/2)) this fluctuation formula is exactly d<E>/dT at fixed
+beta*mu -- not at fixed mu, p or N; its ridges still locate the
+transitions, which is what it is for. It is a variance, so it needs
+more samples than <N> to converge: check `effective_sample_size`
+and compare halves of the run.
+
+**Parameters**
+
+- `T_grid` (*numpy.ndarray*): Temperatures (k_B T, in the energy unit of U).
+- `grid` (*numpy.ndarray*): Pressures (`pressure=True`) or chemical potentials.
+- `pressure` (*bool, optional*): Whether `grid` holds pressures. Default False.
+- `kinetic` (*bool, optional*): Include the kinetic energy (as [ZSG]). Default True; False gives the configurational part Var(U) / (k_B T)^2.
+
+**Returns**
+
+- *numpy.ndarray*: C_V / k_B, shape (len(T_grid), len(grid)).
+
+#### `MBARSurfaceAnalysis.sample_location`
+
+```python
+MBARSurfaceAnalysis.sample_location(index: int) -> Tuple[Tuple[int, int], int]
+```
+
+Grid point and run sample index of a sample (in the analysis order).
+
+**Parameters**
+
+- `index` (*int*): Index into `U_all`.
+
+**Returns**
+
+- *tuple*: `(key, sample)`: the grid point it was recorded at and its index there in the run's numbering (as written with the stored configurations, `regc.trajectory.load_configurations`).
+
+#### `MBARSurfaceAnalysis.run_indices`
+
+```python
+MBARSurfaceAnalysis.run_indices(k: int) -> np.ndarray
+```
+
+Run sample indices of the samples of state `k` (in the analysis order).
+
+Accounts for discarded equilibration (`first_index`) and for
+thinning (`subsample`).
+
+**Parameters**
+
+- `k` (*int*): Index into `states`.
+
+**Returns**
+
+- *numpy.ndarray*: One run sample index per sample of that state.
+
+#### `MBARSurfaceAnalysis.representative_samples`
+
+```python
+MBARSurfaceAnalysis.representative_samples(T: np.ndarray, mu: np.ndarray, target_N: np.ndarray, observable: str = 'N', candidates: Optional[np.ndarray] = None) -> np.ndarray
+```
+
+The most probable recorded sample with a given N at each target state.
+
+At each (T, mu) the sample of largest MBAR weight among those whose
+`observable` equals the target value (or, if none has it, the
+closest value): a typical configuration of the phase shown there.
+
+**Parameters**
+
+- `T, mu` (*numpy.ndarray*): Target states, common shape S (`mu` with a species axis with several species).
+- `target_N` (*numpy.ndarray*): Target values of `observable`, shape S (e.g. the most probable N).
+- `observable` (*str, optional*): `'N'`, `'N_ads'`, ... Default `'N'`.
+- `candidates` (*numpy.ndarray, optional*): Boolean mask over all samples allowed to be picked (e.g. those whose configuration was stored). Default None (all).
+
+**Returns**
+
+- *numpy.ndarray*: Integer indices into `U_all`, shape S (see `sample_location`).
+
+**Raises**
+
+- *ValueError*: If `candidates` allows no sample.
+
 #### `MBARSurfaceAnalysis.most_probable_N`
 
 ```python
@@ -3763,7 +4291,9 @@ Locate the approximate 2D-condensation coexistence mu at fixed T.
 
 Via the equal-weight rule: bisect mu until reweighted P(N) has
 equal integrated probability in its low-N ('dilute') and high-N
-('condensed') basins, split at the valley between the two peaks.
+('condensed') basins. The basins are split at one fixed N, midway
+between the valleys of the bimodal P(N) at the two bracket ends, so
+the bisection stays well defined where P(N) is unimodal.
 
 Caveats (this is a diagnostic tool, not a black box): it assumes
 P(N) genuinely becomes bimodal somewhere in `mu_bracket` -- i.e.
@@ -3837,6 +4367,87 @@ The phase boundary on the (T, p) diagram.
 
 - *list of tuple of float*: `(T, p_coex)` pairs, one per T in `T_grid` where a coexistence pressure was found. Skips (and reports, if `verbose`) any T where no bimodal crossing is found, rather than raising.
 
+---
+
+### `heat_capacity_ridges`
+
+```python
+heat_capacity_ridges(T_grid: np.ndarray, grid: np.ndarray, cv: np.ndarray, valid: Optional[np.ndarray] = None, prominence: float = 0.2, ladder: Optional[Sequence[float]] = None, ladder_tol: Optional[float] = None) -> dict
+```
+
+Local maxima of C_V along each axis: candidate phase-boundary points.
+
+[ZSG] PRL 128, 246101: a phase boundary connects the (T, p) points
+where C_V(p) at fixed T, or C_V(T) at fixed p, has a peak; a ridge
+that fades out ends at a critical point.
+
+**Parameters**
+
+- `T_grid` (*numpy.ndarray*): Temperatures, length n_T.
+- `grid` (*numpy.ndarray*): Pressures or chemical potentials, length n_y.
+- `cv` (*numpy.ndarray*): Heat capacity, shape (n_T, n_y) (`MBARSurfaceAnalysis.heat_capacity`).
+- `valid` (*numpy.ndarray, optional*): Boolean mask of trustworthy cells (e.g. effective sample size above a threshold); peaks in other cells are dropped. Default None (all).
+- `prominence` (*float, optional*): Minimum relative height of a peak over the deeper of its two flanking minima: a peak counts if C_V there exceeds that minimum by this fraction (found on ln C_V, so it is the same for a small bump on a large background and for one near C_V = 0). Default 0.2 (20 %); raise it for noisy maps from short runs.
+- `ladder` (*sequence of float, optional*): The sampled values along `grid` (the replica ladder's p or mu). C_V is a variance: between replicas whose samples barely overlap, MBAR rests on few effective samples and underestimates it, so spurious peaks appear *on* the sampled values. With `ladder` given, each point is flagged (`'on_ladder'`) if it lies within `ladder_tol` of a sampled value, and a warning is issued when most do. Real boundaries move with T; artefacts stay on the ladder. For a pressure grid, give the ladder's pressures. Default None.
+- `ladder_tol` (*float, optional*): Distance counting as "on" the ladder. Default: a quarter of the smallest ladder spacing (in log10 for a positive ladder spanning more than a decade, i.e. pressures).
+
+**Returns**
+
+- *dict*: `'along_y'`: (i_T, j_y) index pairs of peaks of C_V(y) at fixed T; `'along_T'`: the same for C_V(T) at fixed y; `'points'`: the union as `(T, y)` values, shape (n, 2), and `'cells'` the same as index pairs; `'along_y_bases'`, `'along_T_bases'`: the indices of the two flanking minima of each peak along its axis (for `regc.diagnostics.ridge_support`); with `ladder`, also `'on_ladder'`.
+
+---
+
+### `export_phase_configurations`
+
+```python
+export_phase_configurations(analysis: MBARSurfaceAnalysis, configurations_dir: str, T_grid: np.ndarray, grid: np.ndarray, path: str, pressure: bool = False, mode: str = 'phases', observable: str = 'N', min_ess: float = 0.0, temperature_K: bool = False, area: Optional[float] = None, tile_path: Optional[str] = None, min_cells: int = 1) -> List[dict]
+```
+
+Write the configurations visible in a phase diagram as extended XYZ.
+
+The run must have stored configurations (`configurations_dir` of
+`ReplicaExchangeGCMC`, `configurations: save` in a config file). On
+the (T, y) mesh, the most probable value of `observable` labels the
+phase of every cell. Then:
+
+* `mode='phases'`: one frame per connected phase region, taken at
+  the cell of the region where that phase is most probable;
+* `mode='grid'`: one frame per mesh cell (use a coarse mesh).
+
+Each frame is the recorded sample with the largest MBAR weight at that
+cell among those with the phase's value of `observable` (and a stored
+configuration): a typical structure of the phase, as pySNOW shows when
+a point of the diagram is picked. The comment line carries the cell's
+T, p or mu, the phase label, the probability of that label there, the
+sample's weight, its origin (grid point, sample index, energy) and the
+effective sample size; per-atom `group` is 0 frozen, 1 substrate,
+2 mobile.
+
+**Parameters**
+
+- `analysis` (*MBARSurfaceAnalysis*): The analysis of the run.
+- `configurations_dir` (*str or sequence of str*): Where the run stored `configs_T{it}_mu{imu}.extxyz`; for merged runs (`regc.io.merge_samples`), one directory per run, in the order the runs were merged.
+- `T_grid` (*numpy.ndarray*): Temperatures (k_B T, as given to the analysis).
+- `grid` (*numpy.ndarray*): Pressures (`pressure=True`) or chemical potentials.
+- `path` (*str*): Output `.extxyz` file (multi-frame).
+- `pressure` (*bool, optional*): Whether `grid` holds pressures. Default False.
+- `mode` (*{'phases', 'grid'}, optional*): See above. Default `'phases'`.
+- `observable` (*str, optional*): Phase label: `'N'` (default), `'N_ads'`, `'N_<species>'`.
+- `min_ess` (*float, optional*): Ignore cells whose effective sample size is below this (their phase is extrapolated). Default 0.0.
+- `temperature_K` (*bool, optional*): Also write `T_K` (temperatures given as k_B T in eV). Default False.
+- `area` (*float, optional*): If given, also write `coverage` = label / area. Default None.
+- `tile_path` (*str, optional*): If given, also write all exported frames side by side in one frame (rows: T, columns: p or mu), a visual phase diagram. Default None.
+- `min_cells` (*int, optional*): `mode='phases'`: skip regions smaller than this many mesh cells (where the label changes almost continuously, as in a fluid, every cell is its own region). Default 1.
+
+**Returns**
+
+- *list of dict*: One entry per exported frame: its comment-line values.
+
+**Raises**
+
+- *FileNotFoundError*: If no configurations were stored.
+- *ValueError*: On an unknown `mode`, or if no cell passes `min_ess`.
+
 ## Plotting (`regc.plotting`)
 
 ### `plot_phase_diagram`
@@ -3875,6 +4486,592 @@ linear) edge-averaging is exactly right.
 **Returns**
 
 - *None*: Saves the figure to `save_path` and returns nothing.
+
+---
+
+### `plot_map`
+
+```python
+plot_map(T_grid: np.ndarray, grid: np.ndarray, values: np.ndarray, save_path: str, log_x: bool = True, valid: Optional[np.ndarray] = None, points: Optional[np.ndarray] = None, discrete: bool = False, log_color: bool = False, colorbar_label: str = '', xlabel: str = 'pressure p', ylabel: str = 'temperature T', title: str = '', cmap: str = 'viridis', invalid_label: str = 'too few effective samples', vmin: Optional[float] = None, vmax: Optional[float] = None, contour_levels: Optional[Sequence[float]] = None, contour_label: str = '', points_label: str = '$C_V$ peak', figsize: Tuple[float, float] = (6.0, 4.0), dpi: int = 300) -> None
+```
+
+Plot a (T, p) or (T, mu) map, with unreliable cells shown as gaps.
+
+Cells where `valid` is False are drawn grey and hatched (not
+interpolated or hidden, and distinct from any colour of the map), and
+named in a legend placed outside the axes so it never covers data.
+Integer label maps (`discrete=True`) get one colour per value up to
+20 values; beyond that the colours are continuous but the boundaries
+between values are outlined. On a logarithmic colour scale, values
+at or below zero are not hidden: they take the colour below the scale
+(black) and get their own legend entry.
+
+**Parameters**
+
+- `T_grid` (*numpy.ndarray*): Temperatures (y axis), length n_T.
+- `grid` (*numpy.ndarray*): Pressures or chemical potentials (x axis), length n_y.
+- `values` (*numpy.ndarray*): Shape (n_T, n_y).
+- `save_path` (*str*): Output image.
+- `log_x` (*bool, optional*): Plot log10 of `grid` (pressures). Default True.
+- `valid` (*numpy.ndarray, optional*): Boolean mask of trustworthy cells (e.g. effective sample size above a threshold). Default None (all valid).
+- `points` (*numpy.ndarray, optional*): `(T, x)` points to overlay (e.g. heat-capacity ridges, x in the units of `grid`). Default None.
+- `discrete` (*bool, optional*): Integer labels (e.g. most probable N). Default False.
+- `log_color` (*bool, optional*): Logarithmic colour scale (for quantities spanning decades, like C_V). Default False.
+- `colorbar_label, xlabel, ylabel, title` (*str, optional*): Labels.
+- `cmap` (*str, optional*): Matplotlib colormap (perceptually uniform by default). Default `'viridis'`.
+- `invalid_label` (*str, optional*): Legend text for the hatched cells.
+- `vmin, vmax` (*float, optional*): Colour range. Default None: the data range (for `log_color`, from the 2nd percentile of the positive values; the colorbar arrow marks anything below).
+- `contour_levels` (*sequence of float, optional*): Draw these contour levels of `values` in white (e.g. an effective sample size threshold). Default None.
+- `contour_label` (*str, optional*): Legend text for the contours.
+- `points_label` (*str, optional*): Legend text for `points`. Default `'$C_V$ peak'`.
+- `figsize` (*tuple of float, optional*): Figure size in inches. Default (6.0, 4.0).
+- `dpi` (*int, optional*): Resolution of the saved image. Default 300.
+
+**Returns**
+
+- *None*: Saves the figure.
+
+---
+
+### `plot_radial_distribution`
+
+```python
+plot_radial_distribution(curves: dict, save_path: str, ylabel: str = '$n(r)$ (Å$^{-1}$)', xlabel: str = '$r$ (Å)', title: str = '', xlim: Optional[Tuple[float, float]] = None, figsize: Tuple[float, float] = (5.0, 3.2), dpi: int = 300) -> None
+```
+
+Plot reweighted radial distributions at several states.
+
+Each curve gets a colour-blind-safe colour and its own line style, so
+the curves stay distinguishable in greyscale.
+
+**Parameters**
+
+- `curves` (*dict*): `{label: (r, values)}`, e.g. from `MBARSurfaceAnalysis.radial_distribution`.
+- `save_path` (*str*): Output image.
+- `ylabel, xlabel, title` (*str, optional*): Labels.
+- `xlim` (*tuple of float, optional*): x range. Default None: from the first nonzero value to the end.
+- `figsize` (*tuple of float, optional*): Figure size in inches. Default (5.0, 3.2).
+- `dpi` (*int, optional*): Resolution of the saved image. Default 300.
+
+**Returns**
+
+- *None*: Saves the figure.
+
+## Per-sample records and other potentials (`regc.records`)
+
+### `RecordWriter`
+
+```python
+RecordWriter(path: str, sampling_potential: str, species: Sequence[str], lattice: np.ndarray, pbc: Sequence[bool], n_frozen: int, n_substrate: int, temperatures, mu_grid, n_species: int = 1, positions_dtype: str = 'float64')
+```
+
+Append per-sample records to an HDF5 file.
+
+Records are queued by `add` and written by `flush` (called by the
+engine at checkpoints and at the end of every run call, and here
+every `FLUSH_EVERY` records, so memory stays bounded).
+
+**Parameters**
+
+- `path` (*str*): The file (created if missing, appended to otherwise).
+- `sampling_potential` (*str*): Name under which the sampling energies are stored (`E/<name>`).
+- `species` (*sequence of str*): All atom labels that can occur (frozen, substrate and exchanged).
+- `lattice` (*numpy.ndarray*): Cell matrix, shape (3, 3).
+- `pbc` (*sequence of bool*): Periodicity.
+- `n_frozen, n_substrate` (*int*): Sizes of the first two atom groups (constant during a run).
+- `temperatures, mu_grid` (*array_like*): The run's ladder (stored for reference).
+- `n_species` (*int, optional*): Exchanged species (`/samples/N_s` with more than one). Default 1.
+- `positions_dtype` (*str, optional*): `'float64'` (default, exact re-evaluation) or `'float32'` (half the size; energies change by ~1e-6 relative).
+
+**Constructor**
+
+Open or create the file.
+
+**Parameters**
+
+- `path` (*str*): See the class docstring (likewise below).
+- `sampling_potential` (*str*): Energy column of the sampling potential.
+- `species` (*sequence of str*): Atom labels.
+- `lattice` (*numpy.ndarray*): Cell matrix.
+- `pbc` (*sequence of bool*): Periodicity.
+- `n_frozen, n_substrate` (*int*): Group sizes.
+- `temperatures, mu_grid` (*array_like*): The ladder.
+- `n_species` (*int, optional*): Exchanged species.
+- `positions_dtype` (*str, optional*): Position precision.
+
+**Raises**
+
+- *ValueError*: If an existing file was written for another sampling potential or species set.
+
+#### `RecordWriter.add`
+
+```python
+RecordWriter.add(key: Tuple[int, int], sample: int, walker: int, energy: float, n: int, config: Optional[tuple], n_s: Optional[Sequence[int]] = None) -> None
+```
+
+Queue one record (written by `flush`).
+
+**Parameters**
+
+- `key` (*tuple of int*): Grid point.
+- `sample` (*int*): Sample index at that grid point.
+- `walker` (*int*): Walker id (-1 if unknown).
+- `energy` (*float*): Energy under the sampling potential.
+- `n` (*int*): Mobile atoms.
+- `config` (*tuple or None*): `regc.trajectory.snapshot` of the configuration, or None (not stored for this sample).
+- `n_s` (*sequence of int, optional*): Counts per exchanged species.
+
+#### `RecordWriter.flush`
+
+```python
+RecordWriter.flush() -> None
+```
+
+Write the queued records and flush the file to disk.
+
+#### `RecordWriter.close`
+
+```python
+RecordWriter.close() -> None
+```
+
+Flush and close the file.
+
+---
+
+### `Records`
+
+```python
+Records(path: str, writable: bool = False)
+```
+
+Read access to a records file (read-only unless `writable`).
+
+**Parameters**
+
+- `path` (*str*): The file.
+- `writable` (*bool, optional*): Open for adding energy columns (`reevaluate`). Default False.
+
+**Constructor**
+
+Open the file and index its records.
+
+**Parameters**
+
+- `path, writable`: See the class docstring.
+
+#### `Records.potentials` (property)
+
+list of str: Names of the stored energy columns.
+
+#### `Records.energies`
+
+```python
+Records.energies(name: str) -> Dict[Tuple[Tuple[int, int], int], float]
+```
+
+Energies under one potential.
+
+**Parameters**
+
+- `name` (*str*): Potential name (`E/<name>`).
+
+**Returns**
+
+- *dict*: `{((it, imu), sample): energy}` (nan where not evaluated).
+
+#### `Records.configuration`
+
+```python
+Records.configuration(key: Tuple[int, int], sample: int) -> Optional[dict]
+```
+
+One stored configuration.
+
+**Parameters**
+
+- `key` (*tuple of int*): Grid point.
+- `sample` (*int*): Sample index there.
+
+**Returns**
+
+- *dict or None*: Frame-like dict (`positions`, `species`, `lattice`, `pbc`, `info`, `arrays` with `group`), as from `regc.trajectory.read_extxyz_frames`; None if not stored.
+
+#### `Records.stored`
+
+```python
+Records.stored(key: Tuple[int, int]) -> set
+```
+
+Sample indices of one grid point that have a stored configuration.
+
+**Parameters**
+
+- `key` (*tuple of int*): Grid point.
+
+**Returns**
+
+- *set of int*: The sample indices.
+
+#### `Records.close`
+
+```python
+Records.close() -> None
+```
+
+Close the file.
+
+---
+
+### `attach_energies`
+
+```python
+attach_energies(samples, records_path: str, names: Optional[Sequence[str]] = None)
+```
+
+Add energies under other potentials to a sample set, sample by sample.
+
+**Parameters**
+
+- `samples` (*SampleSet*): Loaded with `regc.io.load_samples` (any `discard`).
+- `records_path` (*str*): The run's records file.
+- `names` (*sequence of str, optional*): Potentials to attach. Default None: every one except the sampling potential.
+
+**Returns**
+
+- *SampleSet*: The same set, with `samples[key]['E:<name>']` lists (nan where a sample has not been evaluated).
+
+**Raises**
+
+- *ValueError*: If a sample of the set is missing from the records.
+
+---
+
+### `reevaluate`
+
+```python
+reevaluate(records_path: str, make_system: Callable, name: str, subset: Optional[Callable[[Tuple[int, int], int], bool]] = None, n_workers: int = 1, chunk: int = 200, progress: Optional[Callable[[int, int], None]] = None) -> int
+```
+
+Evaluate the stored configurations with another potential.
+
+Every stored configuration not yet evaluated under `name` is rebuilt in
+a system from `make_system` (same geometry, the new calculator) and its
+`total_energy` written to `E/<name>`. The energies are flushed to disk
+after every `chunk` configurations, so an interrupted call loses at
+most one chunk and rerunning continues where it stopped. Use a
+`subset` that does not depend on the configurations (e.g. every k-th
+sample), so that reweighting over the evaluated samples stays unbiased.
+
+**Parameters**
+
+- `records_path` (*str*): The records file (not open for writing elsewhere: HDF5 locks it).
+- `make_system` (*callable*): `make_system(rng)`: a system of the run's geometry with the new calculator. Called once per worker (picklable for `n_workers > 1`).
+- `name` (*str*): Name of the new potential.
+- `subset` (*callable, optional*): `subset(key, sample) -> bool`: evaluate only these. Default None (all stored configurations).
+- `n_workers` (*int, optional*): Worker processes. Default 1.
+- `chunk` (*int, optional*): Configurations per task and between flushes. Default 200.
+- `progress` (*callable, optional*): Called with `(done, total)` after every chunk. Default None.
+
+**Returns**
+
+- *int*: Number of configurations evaluated in this call.
+
+**Raises**
+
+- *ValueError*: If `name` is the sampling potential.
+
+## `regc.observables`
+
+### `Observable`
+
+```python
+Observable(*args, **kwargs)
+```
+
+Base class: a named, fixed-length vector function of a configuration.
+
+Subclasses set `name`, implement `labels` (one per component) and
+`__call__` (system -> numpy array of that length), and describe
+themselves in `metadata` (JSON-able; stored in `samples.npz` so the
+analysis can interpret the components without the original objects).
+
+#### `Observable.labels`
+
+```python
+Observable.labels() -> List[str]
+```
+
+Names of the components.
+
+**Returns**
+
+- *list of str*: One label per component.
+
+**Raises**
+
+- *NotImplementedError*: On the base class.
+
+#### `Observable.size` (property)
+
+int: Number of components.
+
+#### `Observable.metadata`
+
+```python
+Observable.metadata() -> dict
+```
+
+JSON-able description (type, parameters, component labels).
+
+**Returns**
+
+- *dict*: At least `'type'` and `'labels'`.
+
+---
+
+### `CoordinationNumber`
+
+```python
+CoordinationNumber(name: str, r_cut: float, center: str = 'mobile', neighbor: str = 'substrate', z_range: Optional[Tuple[float, float]] = None)
+```
+
+Mean coordination number of a set of atoms.
+
+Records `[bonds, centers]`: the number of (centre, neighbour) pairs
+closer than `r_cut` and the number of centre atoms. The reweighted
+mean coordination is <bonds> / <centers>
+(`MBARSurfaceAnalysis.mean_coordination`).
+
+**Parameters**
+
+- `name` (*str*): Observable name (sample key `'obs:<name>'`).
+- `r_cut` (*float*): Bond cutoff, in Angstrom (e.g. the first minimum of the corresponding RDF; [ZSG] use 2.0 A for D-Si).
+- `center` (*str, optional*): Atoms whose coordination is counted. Default `'mobile'`.
+- `neighbor` (*str, optional*): Atoms counted as neighbours. Default `'substrate'`.
+- `z_range` (*tuple of float, optional*): Restrict the centre atoms to `z_min <= z < z_max`. Default None.
+
+**Constructor**
+
+Store the definition.
+
+**Parameters**
+
+- `name, r_cut, center, neighbor, z_range`: See the class docstring.
+
+#### `CoordinationNumber.labels`
+
+```python
+CoordinationNumber.labels() -> List[str]
+```
+
+Component names.
+
+**Returns**
+
+- *list of str*: `['bonds', 'centers']`.
+
+#### `CoordinationNumber.metadata`
+
+```python
+CoordinationNumber.metadata() -> dict
+```
+
+JSON-able description.
+
+**Returns**
+
+- *dict*: Type, labels and parameters.
+
+#### `CoordinationNumber.coordination`
+
+```python
+CoordinationNumber.coordination(system) -> np.ndarray
+```
+
+Coordination number of every centre atom.
+
+**Parameters**
+
+- `system` (*ParticleSystem*): The configuration.
+
+**Returns**
+
+- *numpy.ndarray*: Integer array, one entry per centre atom.
+
+---
+
+### `CoordinationHistogram`
+
+```python
+CoordinationHistogram(name: str, r_cut: float, max_cn: int = 12, center: str = 'substrate', neighbor: str = 'all', z_range: Optional[Tuple[float, float]] = None)
+```
+
+Distribution of the coordination numbers of a set of atoms.
+
+Records how many centre atoms have coordination 0, 1, ..., `max_cn`
+(the last bin collects `>= max_cn`): [ZSG]'s coordination histogram
+H_coord of the top-layer Si atoms, a structural phase descriptor.
+`MBARSurfaceAnalysis.coordination_distribution` normalises the
+reweighted counts to a probability per centre atom.
+
+**Parameters**
+
+- `name` (*str*): Observable name.
+- `r_cut` (*float*): Bond cutoff, in Angstrom.
+- `max_cn` (*int, optional*): Largest coordination with its own bin. Default 12.
+- `center, neighbor, z_range`: As in `CoordinationNumber` (defaults `'substrate'` and `'all'`: the substrate atoms' bonds to anything).
+
+**Constructor**
+
+Store the definition.
+
+**Parameters**
+
+- `name, r_cut, max_cn, center, neighbor, z_range`: See the class docstring.
+
+#### `CoordinationHistogram.labels`
+
+```python
+CoordinationHistogram.labels() -> List[str]
+```
+
+Component names.
+
+**Returns**
+
+- *list of str*: `['cn0', 'cn1', ..., 'cn<max_cn>']`.
+
+#### `CoordinationHistogram.metadata`
+
+```python
+CoordinationHistogram.metadata() -> dict
+```
+
+JSON-able description.
+
+**Returns**
+
+- *dict*: Type, labels and parameters.
+
+---
+
+### `RadialDistribution`
+
+```python
+RadialDistribution(name: str, r_max: float, n_bins: int = 100, a: str = 'mobile', b: str = 'substrate', z_range: Optional[Tuple[float, float]] = None)
+```
+
+Pair-distance histogram between two atom sets (for an RDF).
+
+Records the number of (a, b) pairs per distance bin (self-pairs
+excluded), followed by `n_a`, `n_b` and the system volume.
+`MBARSurfaceAnalysis.radial_distribution` turns the reweighted
+histogram into
+
+* `'per_center'`: n(r) = <H(r)> / (<n_a> dr), neighbours of a centre
+  per unit distance -- its integral up to r_c is the mean coordination
+  (the natural form for surfaces and clusters, where no uniform
+  reference density exists);
+* `'density'`: n(r) / (4 pi r^2), the local density of b around a;
+* `'g'`: that density over <n_b> / V, the bulk-normalised g(r)
+  (meaningful for bulk systems only: V includes a slab's vacuum).
+
+**Parameters**
+
+- `name` (*str*): Observable name.
+- `r_max` (*float*): Largest distance, in Angstrom (below the minimum-image radius).
+- `n_bins` (*int, optional*): Number of distance bins. Default 100.
+- `a, b` (*str, optional*): The two atom sets. Default `'mobile'` and `'substrate'`.
+- `z_range` (*tuple of float, optional*): Restrict the a atoms to `z_min <= z < z_max`. Default None.
+
+**Constructor**
+
+Store the definition.
+
+**Parameters**
+
+- `name, r_max, n_bins, a, b, z_range`: See the class docstring.
+
+#### `RadialDistribution.edges` (property)
+
+numpy.ndarray: The n_bins + 1 bin edges, in Angstrom.
+
+#### `RadialDistribution.labels`
+
+```python
+RadialDistribution.labels() -> List[str]
+```
+
+Component names.
+
+**Returns**
+
+- *list of str*: `['h0', ..., 'h<n_bins-1>', 'n_a', 'n_b', 'volume']`.
+
+#### `RadialDistribution.metadata`
+
+```python
+RadialDistribution.metadata() -> dict
+```
+
+JSON-able description.
+
+**Returns**
+
+- *dict*: Type, labels and parameters (incl. the bin edges).
+
+---
+
+### `FunctionObservable`
+
+```python
+FunctionObservable(name: str, func: Callable, labels: Optional[Sequence[str]] = None)
+```
+
+Wrap a user function `f(system) -> float or array` as an observable.
+
+The function must be picklable (a module-level function, not a lambda)
+to run in parallel workers, and must always return the same number of
+components.
+
+**Parameters**
+
+- `name` (*str*): Observable name.
+- `func` (*callable*): `func(system)` returning a float or a 1-D array.
+- `labels` (*sequence of str, optional*): Component labels. Default None: `['value']` (one component).
+
+**Constructor**
+
+Store the function.
+
+**Parameters**
+
+- `name, func, labels`: See the class docstring.
+
+#### `FunctionObservable.labels`
+
+```python
+FunctionObservable.labels() -> List[str]
+```
+
+Component names.
+
+**Returns**
+
+- *list of str*: As given (default `['value']`).
+
+#### `FunctionObservable.metadata`
+
+```python
+FunctionObservable.metadata() -> dict
+```
+
+JSON-able description.
+
+**Returns**
+
+- *dict*: Type, labels and the function's qualified name.
 
 ## Config runner (`regc.runner`)
 
@@ -4022,6 +5219,42 @@ Build the setup and print it, with the mu ladder, without sampling.
 
 ---
 
+### `reevaluate_from_config`
+
+```python
+reevaluate_from_config(config: Dict[str, Any], potential: Dict[str, Any], name: str, every: int = 1, n_workers: int = 1, verbose: bool = True) -> int
+```
+
+Re-evaluate a run's recorded configurations with another potential.
+
+The run's config with its `calculator` section (and any other
+top-level section given in `potential`, e.g. `reservoir`) replaced
+builds the same geometry with the new potential; its energies go to
+`E/<name>` in the records file, and its gas reservoirs (whose
+reference energies depend on the potential) to the file's attribute
+`reservoirs:<name>`, for the pressure axes of the reweighted phase
+diagram (`phase_diagram.potentials`).
+
+**Parameters**
+
+- `config` (*dict*): The run's parsed config (`records: {save: true}` must have been on).
+- `potential` (*dict*): Top-level sections to replace, at least `calculator`.
+- `name` (*str*): Name of the new potential.
+- `every` (*int, optional*): Evaluate every this many stored samples (by sample index). Default 1.
+- `n_workers` (*int, optional*): Worker processes. Default 1.
+- `verbose` (*bool, optional*): Print progress. Default True.
+
+**Returns**
+
+- *int*: Configurations evaluated.
+
+**Raises**
+
+- *FileNotFoundError*: If the run has no records file.
+- *ValueError*: If `potential` has no calculator, or the new setup's cell differs from the recorded one (fix the lattice constant in `structure`).
+
+---
+
 ### `main`
 
 ```python
@@ -4041,3 +5274,27 @@ prints the setup, `--analyze-only` re-analyses saved samples.
 **Returns**
 
 - *int*: Process exit status: 0 on success, `EXIT_RESUBMIT` (75) if a checkpointed run stopped for its time limit.
+
+---
+
+### `reevaluate_main`
+
+```python
+reevaluate_main(argv: Optional[list] = None) -> int
+```
+
+Command-line entry point: `regc-reevaluate config.yaml potential.yaml --name B`.
+
+Re-evaluates the configurations a run recorded (`records: {save:
+true}`) with the potential described in `potential.yaml` (a
+`calculator` section, plus any other top-level section to replace);
+then list `B` under `phase_diagram.potentials` and run
+`regc-run --analyze-only` for the reweighted phase diagram.
+
+**Parameters**
+
+- `argv` (*list of str, optional*): Arguments. Default None: `sys.argv[1:]`.
+
+**Returns**
+
+- *int*: 0.

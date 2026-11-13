@@ -1,0 +1,14 @@
+sequenceDiagram
+    accTitle: One block of steps in a parallel run
+    accDescr: The engine draws the random decisions of a block, ships each replica to a worker that runs the block and evaluates observables, receives samples and configurations back, writes the files, and then performs the replica exchange in the main process.
+
+    participant E as Engine (main process)
+    participant W as Worker pool
+    participant F as Files
+    E->>E: Draw GC/RE decisions up to the next swap
+    E->>W: Replica + block of GC flags + observables
+    W->>W: GC attempts, diffusion, record U, N, observables
+    W-->>E: Updated replica + block samples (+ configurations)
+    E->>F: Append configurations (configs_T*_mu*.extxyz)
+    E->>E: Replica-exchange round (Eq. 5)
+    E->>F: Every chunk: samples.npz, checkpoint.pkl
