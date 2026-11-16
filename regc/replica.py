@@ -102,9 +102,11 @@ class Replica:
         self.energy = system.total_energy()
 
         self.n_attempts = {'displace': 0, 'insert': 0, 'delete': 0, 'hmc': 0,
-                            'displace_substrate': 0}
+                            'displace_substrate': 0, 'identity': 0}
         self.n_accepts = {'displace': 0, 'insert': 0, 'delete': 0, 'hmc': 0,
-                           'displace_substrate': 0}
+                           'displace_substrate': 0, 'identity': 0}
+        # semi-grand-canonical identity swaps per REGC step (set by the engine)
+        self.identity_attempts = 0
         self.exchange_attempts = 0
         self.exchange_accepts = 0
 
@@ -424,6 +426,46 @@ class Replica:
             self.energy += du
         self._count('delete', sp, accept)
 
+    def _move_identity(self) -> None:
+        """
+        Attempt one semi-grand-canonical identity swap of a substrate atom.
+
+        Picks a swappable substrate atom uniformly (`system.sgc_candidates`,
+        a set the move does not change) and a new species uniformly among
+        the other `system.sgc_species`: a symmetric proposal. Accepts with
+        min(1, exp(-beta * dU + beta * (dmu_new - dmu_old))), dmu from
+        `state.sgc_dmu` -- the Metropolis rule for the weight
+        exp(-beta U + beta sum_k dmu_k N_k) at fixed total substrate count
+        (docs/REGC_algorithm.md, Sec. 9). Counted under ``'identity'``. A
+        no-op when the substrate is not semi-grand-canonical.
+
+        Returns
+        -------
+        None
+        """
+        sysm = self.system
+        species = getattr(sysm, 'sgc_species', ())
+        if not species or self.state.sgc_dmu is None:
+            return
+        candidates = sysm.sgc_candidates()
+        if len(candidates) == 0:
+            return
+        i = int(candidates[self.rng.integers(len(candidates))])
+        old = str(sysm.substrate_species[i])
+        k_old = species.index(old)
+        k_new = int(self.rng.integers(len(species) - 1))
+        k_new += k_new >= k_old            # uniform among the other species
+        new = species[k_new]
+        du = sysm.generic_identity_dU(i, new)
+        dmu = self.state.sgc_dmu
+        beta = self.state.beta
+        log_arg = -beta * du + beta * (dmu[k_new] - dmu[k_old])
+        self.n_attempts['identity'] = self.n_attempts.get('identity', 0) + 1
+        if np.isfinite(log_arg) and (log_arg >= 0.0 or self.rng.random() < np.exp(log_arg)):
+            sysm.apply_identity(i, new)
+            self.energy += du
+            self.n_accepts['identity'] = self.n_accepts.get('identity', 0) + 1
+
     # -- [ZSG] Fig. 1 building blocks (used by ReplicaExchangeGCMC.run_regc) --
     def gc_attempt(self) -> None:
         """
@@ -444,8 +486,9 @@ class Replica:
 
     def regc_local_step(self, gc: bool, mode: str, n: int, **kwargs) -> "Replica":
         """
-        The per-replica part of one REGC step: optional GC attempt, then
-        diffusion.
+        The per-replica part of one REGC step: optional GC attempt, the
+        `identity_attempts` semi-grand-canonical identity swaps (if the
+        substrate is semi-grand-canonical), then diffusion.
 
         Parameters
         ----------
@@ -462,6 +505,8 @@ class Replica:
         """
         if gc:
             self.gc_attempt()
+        for _ in range(getattr(self, 'identity_attempts', 0)):
+            self._move_identity()
         self.diffuse(mode, n, **kwargs)
         return self
 

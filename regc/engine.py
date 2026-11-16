@@ -51,7 +51,7 @@ import numpy as np
 from .replica import Replica
 from .state import ThermoState
 from .systems import ParticleSystem
-from .observables import Observable, check_observables, evaluate_observables
+from .observables import Observable, SGCCounts, check_observables, evaluate_observables
 from .trajectory import snapshot
 from .units import SpeciesLambdaCubed
 
@@ -136,7 +136,8 @@ class ReplicaExchangeGCMC:
                  observables: Optional[Sequence[Observable]] = None,
                  configurations_dir: Optional[str] = None, configurations_every: int = 1,
                  skip_empty_swaps: bool = True, records_path: Optional[str] = None,
-                 records_potential: str = "sampling", records_every: int = 1):
+                 records_potential: str = "sampling", records_every: int = 1,
+                 sgc_dmu: Optional[Sequence[float]] = None, sgc_attempts: int = 1):
         """
         Construct the replica-exchange ladder.
 
@@ -227,6 +228,18 @@ class ReplicaExchangeGCMC:
         records_every : int, optional
             Store the configuration of every this many samples (the energy
             and N of all of them). Default 1.
+        sgc_dmu : sequence of float, optional
+            Semi-grand-canonical substrate: the field mu_k - mu_ref, one
+            value per ``system.sgc_species`` (reference first, 0), the same
+            at every grid point (`ThermoState.sgc_dmu`). Required when the
+            systems have `sgc_species`, ignored otherwise. Each sample then
+            also records the counts (`regc.observables.SGCCounts`, carrying
+            the field for the analysis), and replica exchange includes
+            the -(beta_a dmu_a - beta_b dmu_b) . (N_a - N_b) term
+            (docs/REGC_algorithm.md, Sec. 9). Default None.
+        sgc_attempts : int, optional
+            Identity-swap attempts per replica per REGC step
+            (`Replica._move_identity`). Default 1.
 
         Raises
         ------
@@ -268,6 +281,28 @@ class ReplicaExchangeGCMC:
                 built.append(((it, imu), rng, system_factory(rng)))
         if any(sysm.exchange_species_list != species for _, _, sysm in built):
             raise ValueError("every system from system_factory must exchange the same species")
+        # semi-grand-canonical substrate: same swappable species and total count everywhere
+        self.sgc_species: Tuple[str, ...] = tuple(getattr(built[0][2], "sgc_species", ()))
+        self.sgc_dmu = None
+        if self.sgc_species:
+            if any(tuple(getattr(sysm, "sgc_species", ())) != self.sgc_species
+                   for _, _, sysm in built):
+                raise ValueError("every system from system_factory must have the same sgc_species")
+            if len({int(sysm.sgc_counts().sum()) for _, _, sysm in built}) != 1:
+                # replica exchange is only exact between equal total counts: then
+                # the reference chemical potential cancels (docs Sec. 9)
+                raise ValueError("every system must hold the same number of swappable "
+                                 "substrate atoms")
+            if sgc_dmu is None:
+                raise ValueError(f"the systems are semi-grand-canonical in {self.sgc_species}: "
+                                 f"pass sgc_dmu (one value per species, reference first)")
+            dmu = np.asarray(sgc_dmu, dtype=float).ravel()
+            if dmu.size != len(self.sgc_species):
+                raise ValueError(f"sgc_dmu needs {len(self.sgc_species)} values "
+                                 f"({self.sgc_species}), got {dmu.size}")
+            self.sgc_dmu = dmu - dmu[0]   # only differences matter: the reference is 0
+            self.observables = check_observables(
+                self.observables + [SGCCounts(self.sgc_species, self.sgc_dmu)])
 
         self.grid: Dict[Tuple[int, int], Replica] = {}
         self.samples: Dict[Tuple[int, int], Dict[str, list]] = {}
@@ -282,11 +317,14 @@ class ReplicaExchangeGCMC:
                     raise ValueError(f"lambda_cubed_of_T must give 1 or {self.n_species} "
                                      f"values, got shape {lam3.shape}")
                 lam3 = np.broadcast_to(lam3, (self.n_species,)).copy()
-            state = ThermoState(T, mu, label=(it, imu), lambda_cubed=lam3)
+            state = ThermoState(T, mu, label=(it, imu), lambda_cubed=lam3,
+                                sgc_dmu=None if self.sgc_dmu is None else self.sgc_dmu.copy())
             self.grid[(it, imu)] = Replica(state, system, rng, max_disp=max_disp,
                                             hmc_enabled=hmc_enabled,
                                             hmc_leapfrog_steps=hmc_leapfrog_steps,
                                             hmc_dt=hmc_dt)
+            if self.sgc_species:
+                self.grid[(it, imu)].identity_attempts = int(sgc_attempts)
             self.samples[(it, imu)] = ({'U': [], 'N': []} if adsorbed_cutoff is None
                                        else {'U': [], 'N': [], 'N_ads': []})
             if self.n_species > 1:
@@ -464,6 +502,56 @@ class ReplicaExchangeGCMC:
         for k, updated_replica in zip(keys, executor.map(_call_worker, payloads)):
             self.grid[k] = updated_replica
 
+    @staticmethod
+    def swap_log_acceptance(ra: Replica, rb: Replica) -> float:
+        """
+        Log of the acceptance ratio of swapping two replicas' configurations.
+
+        docs/REGC_algorithm.md, Eq. (8), summed over exchanged species
+        (Sec. 8), plus the semi-grand-canonical substrate term (Sec. 9):
+
+            (beta_a - beta_b)(U_a - U_b)
+            - sum_s (beta_a mu_s,a - beta_b mu_s,b)(N_s,a - N_s,b)
+            + sum_s (N_s,a - N_s,b) ln(Lambda_s,a^3 / Lambda_s,b^3)
+            - sum_k (beta_a dmu_k,a - beta_b dmu_k,b)(N_k,a - N_k,b).
+
+        The Lambda^3 prefactor uses the same lambda_cubed the insert/delete
+        moves use, so it reduces to the paper's (beta_a/beta_b)^(3/2 dN)
+        for a physical Lambda(T) and to 1 for the reduced-units Lambda = 1.
+        The substrate term needs no Lambda: identity swaps keep the total
+        count, and Lambda_k,a / Lambda_k,b = (T_b / T_a)^(1/2) is the same
+        for every species, so it cancels, and so does the reference
+        chemical potential.
+
+        Parameters
+        ----------
+        ra, rb : Replica
+            The two grid slots (their states and current configurations).
+
+        Returns
+        -------
+        float
+            The log acceptance ratio (accept with min(1, exp of it)).
+        """
+        beta_a, beta_b = ra.state.beta, rb.state.beta
+        Ua, Ub = ra.energy, rb.energy
+        if ra.system.n_exchange_species == 1:
+            Na, Nb = ra.system.n, rb.system.n
+            log_acc = ((beta_a - beta_b) * (Ua - Ub)
+                       - (beta_a * ra.state.mu - beta_b * rb.state.mu) * (Na - Nb)
+                       + (Na - Nb) * np.log(ra.state.lambda_cubed / rb.state.lambda_cubed))
+        else:
+            dN = ra.system.species_counts() - rb.system.species_counts()
+            log_acc = float((beta_a - beta_b) * (Ua - Ub)
+                            - np.dot(beta_a * ra.state.mu_vec - beta_b * rb.state.mu_vec, dN)
+                            + np.dot(dN, np.log(ra.state.lambda_cubed_vec
+                                                / rb.state.lambda_cubed_vec)))
+        if getattr(ra.state, "sgc_dmu", None) is not None:
+            dN_sgc = ra.system.sgc_counts() - rb.system.sgc_counts()
+            log_acc -= float(np.dot(beta_a * ra.state.sgc_dmu - beta_b * rb.state.sgc_dmu,
+                                    dN_sgc))
+        return float(log_acc)
+
     def _attempt_exchange(self, key_a: Tuple[int, int], key_b: Tuple[int, int]) -> bool:
         """
         Attempt one replica-exchange swap between two grid points.
@@ -483,28 +571,8 @@ class ReplicaExchangeGCMC:
             `key_b`'s configurations and energies have already been
             exchanged, in place); False otherwise.
         """
-        #ra, rb = self.grid[key_a], self.grid[key_b]
         ra, rb = self[key_a], self[key_b]
-        beta_a, beta_b = ra.state.beta, rb.state.beta
-        mu_a, mu_b = ra.state.mu, rb.state.mu
-        Ua, Ub = ra.energy, rb.energy
-        if self.n_species == 1:
-            Na, Nb = ra.system.n, rb.system.n
-            # log of the swap acceptance ratio (see docs/REGC_algorithm.md, Eq. (8)).
-            # The Lambda^3 prefactor uses the same lambda_cubed the insert/delete
-            # moves use, so it reduces to the paper's (beta_a/beta_b)^(3/2 dN)
-            # for a physical Lambda(T) and to 1 for the reduced-units Lambda = 1.
-            log_acc = ((beta_a - beta_b) * (Ua - Ub)
-                       - (beta_a * mu_a - beta_b * mu_b) * (Na - Nb)
-                       + (Na - Nb) * np.log(ra.state.lambda_cubed / rb.state.lambda_cubed))
-        else:
-            # Eq. (8) summed over species (docs/REGC_algorithm.md, Sec. 8)
-            dN = ra.system.species_counts() - rb.system.species_counts()
-            log_acc = float((beta_a - beta_b) * (Ua - Ub)
-                            - np.dot(beta_a * ra.state.mu_vec - beta_b * rb.state.mu_vec, dN)
-                            + np.dot(dN, np.log(ra.state.lambda_cubed_vec
-                                                / rb.state.lambda_cubed_vec)))
-
+        log_acc = self.swap_log_acceptance(ra, rb)
         ra.exchange_attempts += 1
         rb.exchange_attempts += 1
         accept = bool(log_acc >= 0.0 or ra.rng.random() < np.exp(log_acc))
@@ -738,7 +806,16 @@ class ReplicaExchangeGCMC:
         Returns
         -------
         None
+
+        Raises
+        ------
+        ValueError
+            If the substrate is semi-grand-canonical (identity swaps need
+            `run_regc`).
         """
+        if self.sgc_species:
+            raise ValueError("the sweep scheme makes no identity swaps: run a "
+                             "semi-grand-canonical substrate with run_regc")
         if trajectory_dir is not None and trajectory_every is None:
             trajectory_every = record_every
 
@@ -1137,6 +1214,7 @@ class ReplicaExchangeGCMC:
             r.system.calculator = f.system.calculator
             r.max_disp, r.hmc_enabled = f.max_disp, f.hmc_enabled
             r.hmc_leapfrog_steps, r.hmc_dt = f.hmc_leapfrog_steps, f.hmc_dt
+            r.identity_attempts = getattr(f, "identity_attempts", 0)
             energy = r.system.total_energy()
             if not np.isclose(energy, r.energy, rtol=1e-9, atol=1e-8):
                 resynced.append((key, r.energy, energy))
@@ -1372,6 +1450,7 @@ class ReplicaExchangeGCMC:
         total = self._status_total if self._status_total is not None else n_steps
         trips = self.round_trip_counts()
         att = {t: int(a) for t, (a, _) in self.swap_stats.items()}
+        composition = self._status_composition(keys, grid_of, stride) if self.sgc_species else None
         return {
             "schema": 1, "time": time.time(), "started": self._status_started,
             "scheme": scheme, "step": int(self._status_offset + step), "n_steps": int(total),
@@ -1393,7 +1472,66 @@ class ReplicaExchangeGCMC:
                 "every": self.records_every},
             "configurations_dir": self.configurations_dir,
             "labels": self.status_extra,
+            "composition": composition,
         }
+
+    def _status_composition(self, keys, grid_of, stride: int) -> Optional[dict]:
+        """
+        The semi-grand-canonical substrate's part of `status`.
+
+        Parameters
+        ----------
+        keys : list of tuple
+            Grid points, in status order.
+        grid_of : callable
+            Values per key -> (n_T, n_mu) nested list (None for NaN).
+        stride : int
+            Trace subsampling, as for the N traces.
+
+        Returns
+        -------
+        dict or None
+            ``species`` (the one shown), ``sgc_species``, ``dmu``, ``grids``
+            (``mean_swappable``, ``mean_top``, ``current_swappable``,
+            ``current_top``, ``identity_acceptance``), ``traces``
+            (``stride``, ``swappable``, ``top``); None without the counts.
+        """
+        from .observables import composition_fractions
+        meta = self.observables_meta
+        sizes = {o.name: o.size for o in self.observables
+                 if type(o).__name__ in ("SGCCounts", "LayerComposition")}
+        names = list(sizes)
+        mean_sw, mean_top, cur_sw, cur_top, acc, tr_sw, tr_top = [], [], [], [], [], [], []
+        show = None
+        for k in keys:
+            vals = {n: np.asarray(self.samples[k]["obs:" + n], dtype=float).reshape(
+                len(self.samples[k]["U"]), sizes[n]) for n in names}
+            f = composition_fractions(meta, vals)
+            r = self.grid[k]
+            now = composition_fractions(meta, {o.name: np.asarray(o(r.system), dtype=float)
+                                               for o in self.observables if o.name in names})
+            if f is None or now is None:
+                return None
+            show = f
+            sw, top = f["swappable"], f["top"]
+            ok_sw = sw[np.isfinite(sw)]
+            ok_top = np.zeros(0) if top is None else top[np.isfinite(top)]
+            mean_sw.append(ok_sw.mean() if ok_sw.size else np.nan)
+            mean_top.append(ok_top.mean() if ok_top.size else np.nan)
+            cur_sw.append(float(now["swappable"]))
+            cur_top.append(np.nan if now["top"] is None else float(now["top"]))
+            n_att = r.n_attempts.get("identity", 0)
+            acc.append(r.n_accepts.get("identity", 0) / n_att if n_att else np.nan)
+            tr_sw.append([None if not np.isfinite(x) else float(x) for x in sw[::stride]])
+            tr_top.append(None if top is None else
+                          [None if not np.isfinite(x) else float(x) for x in top[::stride]])
+        return {"species": show["species"], "sgc_species": show["sgc_species"],
+                "dmu": [float(x) for x in show["dmu"]],
+                "grids": {"mean_swappable": grid_of(mean_sw), "mean_top": grid_of(mean_top),
+                          "current_swappable": grid_of(cur_sw), "current_top": grid_of(cur_top),
+                          "identity_acceptance": grid_of(acc)},
+                "traces": {"stride": stride, "swappable": tr_sw,
+                           "top": tr_top if any(t is not None for t in tr_top) else None}}
 
     def _maybe_write_status(self, step: int, n_steps: int, scheme: str, force: bool = False,
                             **flags) -> None:

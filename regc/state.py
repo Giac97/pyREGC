@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import numpy as np
 
@@ -47,12 +47,23 @@ class ThermoState:
         `regc.units.thermal_wavelength_cubed_angstrom3`) so the
         insertion/deletion acceptance formulas in `replica.py` stay
         dimensionally correct.
+    sgc_dmu : numpy.ndarray, optional
+        Semi-grand-canonical field of the substrate (see
+        `ParticleSystem.sgc_species`): one chemical-potential difference
+        mu_k - mu_ref per entry of ``system.sgc_species``, in the units of
+        `temperature`; the first (reference) entry is 0. The weight of a
+        configuration gains exp(beta * sum_k sgc_dmu[k] * N_k), N_k the
+        number of swappable substrate atoms of species k. Configurational
+        (mass-free): a T-independent value describes equilibrium with a
+        bulk alloy whose excess free energy is T-independent (regular
+        solution). Default None: no identity swaps.
     """
 
     temperature: float
     mu: Union[float, np.ndarray]
     label: Tuple[int, int]
     lambda_cubed: Union[float, np.ndarray] = 1.0
+    sgc_dmu: Optional[np.ndarray] = None
 
     @property
     def beta(self) -> float:

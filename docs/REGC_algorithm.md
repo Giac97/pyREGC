@@ -602,7 +602,77 @@ path instead.
 
 ---
 
-## 9. Summary of changes relative to [ZSG]
+## 9. Semi-grand-canonical substrate (an extension beyond [ZSG])
+
+An alloy surface (PdPt, PtNi, ...) under a gas changes its own composition: an adsorbate that
+binds one metal more strongly pulls that metal to the surface. `ParticleSystem.set_sgc_species`
+(config section `sgc`) makes the displaceable substrate semi-grand-canonical: its atoms of species
+$k \in \{1,\dots,K\}$ change identity among themselves at fixed total
+$M = \sum_k N_k$, under chemical-potential differences $\Delta\mu_k = \mu_k - \mu_1$
+(`ThermoState.sgc_dmu`, reference $k=1$, $\Delta\mu_1 = 0$). Frozen atoms keep their species. The
+gas stays grand canonical, so (16) becomes
+
+$$
+\mathcal N(\beta,\boldsymbol\mu,\Delta\boldsymbol\mu,\mathbf R,\boldsymbol\sigma) \propto
+\prod_{s}\frac{V^{N_s}}{N_s!\,\Lambda_s^{3N_s}(T)}\;
+e^{-\beta\left[E(\mathbf R,\boldsymbol\sigma) - \sum_s \mu_s N_s
+- \sum_k \Delta\mu_k N_k(\boldsymbol\sigma)\right]},
+\qquad (22)
+$$
+
+with $\boldsymbol\sigma$ the substrate identities and $N_k(\boldsymbol\sigma)$ the swappable atoms
+of species $k$ (`ParticleSystem.sgc_counts`). Derived from a grand-canonical substrate, (22) is
+missing the factor $\prod_k \Lambda_k^{-3N_k}$ and the term $\mu_1 M$. Both are constant here:
+$M$ is fixed, and $\Lambda_k^{-3N_k}$ differs between identities only by
+$(m_k/m_1)^{3N_k/2}$, which is independent of $T$. $\Delta\mu_k$ is therefore *configurational*,
+i.e. mass-free, the quantity that sets alloy phase equilibria. For a random bulk alloy at
+$x = 1/2$ the ideal-mixing term $kT\ln[x/(1-x)]$ vanishes, so the $\Delta\mu$ of a 50-50
+reservoir is $\partial E/\partial N_k$ there and is independent of $T$ (regular solution;
+`examples/pdpt111_o_warp_nano/dmu_bulk.py`).
+
+**Identity move** (`Replica._move_identity`, `sgc.attempts_per_step` per replica per step). Pick a
+swappable atom uniformly from a set the move does not change, and a new species $k'$ uniformly
+among the other $K-1$. The proposal is symmetric, so
+
+$$
+P_\text{acc}(k\to k') = \min\!\left[1,\; e^{-\beta\left[E' - E - (\Delta\mu_{k'} - \Delta\mu_k)\right]}\right].
+\qquad (23)
+$$
+
+**Replica exchange.** Inserting (22) into (7) adds one term to (18):
+
+$$
+\ln P_\text{acc}^\text{swap} \mathrel{+}= -\sum_k (\beta_a\Delta\mu_{a,k} - \beta_b\Delta\mu_{b,k})
+(N_{a,k} - N_{b,k}).
+\qquad (24)
+$$
+
+The term has no $\Lambda$ factor. Writing it with full $\mu_k$ and $\Lambda_k$, as for a gas,
+gives the same result, because $\sum_k (N_{a,k} - N_{b,k}) = 0$. Shifting every $\mu_k$ of a
+replica by a constant (its reference $\mu_1$) then adds
+$-(\beta_a c_a - \beta_b c_b)\cdot 0$. The ratio $\Lambda_k(T_a)/\Lambda_k(T_b) =
+(T_b/T_a)^{1/2}$ is the same for every species, so the $\Lambda$ term reduces to
+$\tfrac32\ln(T_b/T_a)\cdot 0$. Both cancellations need equal $M$ in every replica, and
+`ReplicaExchangeGCMC` checks this. `ReplicaExchangeGCMC.swap_log_acceptance` implements
+(18) + (24).
+
+**MBAR.** The reduced potential (19) gains $-\beta\sum_k \Delta\mu_k N_k$. The engine records the
+counts as the observable `sgc_counts` (`regc.observables.SGCCounts`). Its metadata carries
+$\Delta\boldsymbol\mu$, so the analysis can rebuild (22) from `samples.npz` alone. With
+$\Delta\boldsymbol\mu$ equal at every grid point and independent of $T$, the term is an energy:
+`MBARSurfaceAnalysis` reweights with $E_\text{eff} = E - \sum_k\Delta\mu_k N_k$ (`U_all`; the
+physical energy is kept in `U_phys_all`). Every $(T,p)$ map, and the heat capacity (20)–(21)
+taken at fixed $\Delta\boldsymbol\mu$, then holds in the ensemble (22). Surface compositions
+are ratios of reweighted counts, $\langle N_{k,\text{top}}\rangle/\langle N_\text{top}\rangle$
+(`regc.observables.LayerComposition`).
+
+**Tests** (`tests/test_sgc.py`). Swappable atoms with site energies only are independent two-state
+systems, $x_k(T) = [1 + e^{(h_k - h_1 - \Delta\mu_k)/T}]^{-1}$. The test checks this on a ladder
+in $T$, at the grid points and reweighted between them. It uses a large $\Delta\mu$ and
+swap-dominated sampling, so dropping the term (24) biases the composition visibly and fails the
+test.
+
+## 10. Summary of changes relative to [ZSG]
 
 | # | Item | Status |
 |---|---|---|
@@ -617,3 +687,4 @@ path instead.
 | — | Mixed sweep scheme `run` | Kept as an alternative (§4.2) |
 | 8 | Reservoir $\mu_\text{H}$ missing the calculator's isolated-atom energy | **Fixed:** Eq. (14), `e_atom_eV` in `reservoir.py` and the runner |
 | 9 | Several gas reservoirs at once (e.g. O + Cl) | **Implemented:** Eqs. (16)–(19), §8 |
+| 10 | Semi-grand-canonical substrate (identity swaps) with a gas | **Implemented:** Eqs. (22)–(24), §9 |

@@ -603,6 +603,243 @@ class FunctionObservable(Observable):
         return value
 
 
+#: Name under which the engine records `SGCCounts` (reserved for it).
+SGC_COUNTS_NAME = "sgc_counts"
+
+
+class SGCCounts(Observable):
+    """
+    Counts of the swappable substrate atoms of each semi-grand-canonical species.
+
+    Recorded automatically by `ReplicaExchangeGCMC` when the substrate is
+    semi-grand-canonical (`ParticleSystem.sgc_species`), under the reserved
+    name `SGC_COUNTS_NAME`. Its metadata carries the field ``dmu`` (one
+    value per species, reference first and 0), which
+    `regc.analysis.MBARSurfaceAnalysis` needs to put the
+    -beta * sum_k dmu_k N_k term into the reduced potential: without it
+    MBAR would reweight with the wrong ensemble.
+
+    Parameters
+    ----------
+    species : sequence of str
+        The semi-grand-canonical species, reference first.
+    dmu : sequence of float
+        mu_k - mu_ref per species (energy units of the run, eV for real
+        potentials), the same for every grid point.
+    """
+
+    def __init__(self, species: Sequence[str], dmu: Sequence[float]):
+        """
+        Set up the counter.
+
+        Parameters
+        ----------
+        species : sequence of str
+            The semi-grand-canonical species, reference first.
+        dmu : sequence of float
+            mu_k - mu_ref per species.
+
+        Raises
+        ------
+        ValueError
+            If `dmu` does not have one value per species.
+        """
+        self.name = SGC_COUNTS_NAME
+        self.species = [str(s) for s in species]
+        self.dmu = [float(x) for x in dmu]
+        if len(self.dmu) != len(self.species):
+            raise ValueError(f"dmu needs one value per species {self.species}, got {self.dmu}")
+
+    def labels(self) -> List[str]:
+        """
+        Names of the components.
+
+        Returns
+        -------
+        list of str
+            The species.
+        """
+        return list(self.species)
+
+    def metadata(self) -> dict:
+        """
+        JSON-able description.
+
+        Returns
+        -------
+        dict
+            Type, labels, species and the field ``dmu``.
+        """
+        return dict(super().metadata(), species=self.species, dmu=self.dmu)
+
+    def __call__(self, system) -> np.ndarray:
+        """
+        Evaluate on a configuration.
+
+        Parameters
+        ----------
+        system : ParticleSystem
+            The replica's current configuration.
+
+        Returns
+        -------
+        numpy.ndarray
+            `ParticleSystem.sgc_counts` as floats.
+        """
+        return np.asarray(system.sgc_counts(), dtype=float)
+
+
+class LayerComposition(Observable):
+    """
+    Number of atoms of each species in each atomic layer of a slab.
+
+    Layers are z-intervals between the midpoints of the slab's initial
+    layer heights (`regc.structures.SlabGeometry.layer_z`); the lowest and
+    the highest are open-ended, so an adatom counts in the top layer.
+    Only slab atoms (frozen and displaceable substrate) are counted, never
+    the exchanged gas. Recorded as counts -- surface fractions are ratios
+    of reweighted counts, <N_Pt,top> / <N_top> -- in the order
+    (layer, species), layer 0 the lowest.
+
+    Parameters
+    ----------
+    name : str
+        Observable name.
+    species : sequence of str
+        The species to count.
+    layer_z : sequence of float
+        z of every layer, ascending (the config runner fills it in from
+        the slab geometry for ``layer_z: auto``).
+    """
+
+    def __init__(self, name: str, species: Sequence[str], layer_z: Sequence[float]):
+        """
+        Set up the layers.
+
+        Parameters
+        ----------
+        name : str
+            Observable name.
+        species : sequence of str
+            The species to count.
+        layer_z : sequence of float
+            z of every layer (any order).
+
+        Raises
+        ------
+        ValueError
+            Without species or layer heights.
+        """
+        self.name = name
+        self.species = [str(s) for s in species]
+        self.layer_z = [float(z) for z in np.sort(np.asarray(layer_z, dtype=float))]
+        if not self.species or not self.layer_z:
+            raise ValueError("layer_composition needs species and at least one layer height")
+        mid = 0.5 * (np.asarray(self.layer_z[1:]) + np.asarray(self.layer_z[:-1]))
+        self._edges = mid
+
+    @property
+    def n_layers(self) -> int:
+        """int: Number of layers."""
+        return len(self.layer_z)
+
+    def labels(self) -> List[str]:
+        """
+        Names of the components.
+
+        Returns
+        -------
+        list of str
+            ``'L<layer>:<species>'``, layer-major.
+        """
+        return [f"L{i}:{s}" for i in range(self.n_layers) for s in self.species]
+
+    def metadata(self) -> dict:
+        """
+        JSON-able description.
+
+        Returns
+        -------
+        dict
+            Type, labels, species and layer heights.
+        """
+        return dict(super().metadata(), species=self.species, layer_z=self.layer_z)
+
+    def __call__(self, system) -> np.ndarray:
+        """
+        Evaluate on a configuration.
+
+        Parameters
+        ----------
+        system : ParticleSystem
+            The replica's current configuration.
+
+        Returns
+        -------
+        numpy.ndarray
+            The counts, length n_layers * n_species.
+        """
+        pos, sp, groups = configuration_groups(system)
+        slab = groups != GROUP_MOBILE
+        layer = np.searchsorted(self._edges, pos[slab, 2])
+        sp = sp[slab]
+        out = np.zeros((self.n_layers, len(self.species)))
+        for j, s in enumerate(self.species):
+            out[:, j] = np.bincount(layer[sp == s], minlength=self.n_layers)[:self.n_layers]
+        return out.ravel()
+
+
+def composition_fractions(observables_meta: dict, values: Dict[str, np.ndarray],
+                          species: Optional[str] = None) -> Optional[dict]:
+    """
+    Per-sample substrate fractions of one species, for monitoring.
+
+    Parameters
+    ----------
+    observables_meta : dict
+        ``{name: metadata}`` of the recorded observables (needs an
+        `SGCCounts` entry).
+    values : dict
+        ``{name: array}``: the recorded values of those observables, each
+        shape (..., size) with the samples along the leading axes.
+    species : str, optional
+        The species whose fraction to give. Default: the first
+        non-reference semi-grand-canonical species.
+
+    Returns
+    -------
+    dict or None
+        ``species`` (the one shown), ``sgc_species``, ``dmu``, ``swappable``
+        (its fraction among the swappable substrate atoms, shape of the
+        leading axes) and ``top`` (its fraction in the top layer of the
+        first `LayerComposition` observable that counts it, or None); None
+        without semi-grand-canonical counts.
+    """
+    sgc = next((n for n, m in observables_meta.items() if m.get("type") == "SGCCounts"
+                and n in values), None)
+    if sgc is None:
+        return None
+    meta = observables_meta[sgc]
+    sgc_species = list(meta["species"])
+    show = species or sgc_species[min(1, len(sgc_species) - 1)]
+    c = np.asarray(values[sgc], dtype=float)
+    total = c.sum(axis=-1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        swappable = np.where(total > 0, c[..., sgc_species.index(show)] / total, np.nan)
+    top = None
+    for n, m in observables_meta.items():
+        if m.get("type") == "LayerComposition" and n in values and show in m["species"]:
+            S, L = len(m["species"]), len(m["layer_z"])
+            a = np.asarray(values[n], dtype=float)
+            a = a.reshape(a.shape[:-1] + (L, S))[..., -1, :]
+            t = a.sum(axis=-1)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                top = np.where(t > 0, a[..., m["species"].index(show)] / t, np.nan)
+            break
+    return {"species": show, "sgc_species": sgc_species, "dmu": list(meta["dmu"]),
+            "swappable": swappable, "top": top}
+
+
 def check_observables(observables: Optional[Sequence[Observable]]) -> List[Observable]:
     """
     Validate a list of observables (unique, non-reserved names).
@@ -624,8 +861,10 @@ def check_observables(observables: Optional[Sequence[Observable]]) -> List[Obser
     """
     obs = list(observables or [])
     names = [o.name for o in obs]
-    for n in names:
-        if n in RESERVED_NAMES or ":" in n or not n:
+    for o, n in zip(obs, names):
+        if n == SGC_COUNTS_NAME and isinstance(o, SGCCounts):
+            continue  # the engine's own record of the semi-grand-canonical counts
+        if n in RESERVED_NAMES or n == SGC_COUNTS_NAME or ":" in n or not n:
             raise ValueError(f"observable name {n!r} is reserved or invalid "
                              f"(reserved: {sorted(RESERVED_NAMES)}; no ':')")
     if len(set(names)) != len(names):
@@ -654,7 +893,7 @@ def evaluate_observables(observables: Sequence[Observable], system) -> Dict[str,
 
 _TYPES = {"coordination": CoordinationNumber, "coordination_number": CoordinationNumber,
           "coordination_histogram": CoordinationHistogram, "rdf": RadialDistribution,
-          "radial_distribution": RadialDistribution}
+          "radial_distribution": RadialDistribution, "layer_composition": LayerComposition}
 
 
 def observable_from_config(cfg: dict) -> Observable:
@@ -664,9 +903,9 @@ def observable_from_config(cfg: dict) -> Observable:
     Parameters
     ----------
     cfg : dict
-        ``{type: coordination | coordination_histogram | rdf, name: ...,
-        ...}`` with the class's keyword arguments (``z_range`` as a
-        two-element list).
+        ``{type: coordination | coordination_histogram | rdf |
+        layer_composition, name: ..., ...}`` with the class's keyword
+        arguments (``z_range`` as a two-element list).
 
     Returns
     -------

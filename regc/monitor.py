@@ -31,6 +31,7 @@ import os
 import re
 import threading
 import time
+import warnings
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Optional
@@ -136,7 +137,10 @@ def _samples_summary(path: str, trace_length: int = 400) -> Optional[dict]:
     -------
     dict or None
         ``keys``, ``n_samples``, ``mean_N``, ``std_N``, ``mean_U``,
-        ``traces`` (``N``, ``U``, ``stride``), ``mtime``; None if unreadable.
+        ``traces`` (``N``, ``U``, ``stride``), ``mtime``, and for a
+        semi-grand-canonical substrate ``composition`` (as in the status
+        heartbeat, without the current values and identity acceptance);
+        None if unreadable.
     """
     try:
         mtime = os.path.getmtime(path)
@@ -150,6 +154,9 @@ def _samples_summary(path: str, trace_length: int = 400) -> Optional[dict]:
             U = np.asarray(d["U"], dtype=float)
             N = np.asarray(d["N"], dtype=float)
             keys = np.asarray(d["keys"], dtype=int)
+            obs_meta = json.loads(str(d["observables_meta"])) if "observables_meta" in d else {}
+            obs = {n: np.asarray(d["obs:" + n], dtype=float) for n, m in obs_meta.items()
+                   if m.get("type") in ("SGCCounts", "LayerComposition") and "obs:" + n in d}
     except (OSError, ValueError, KeyError):
         return None
     U, N = U.reshape(len(keys), -1), N.reshape(len(keys), -1)
@@ -159,8 +166,57 @@ def _samples_summary(path: str, trace_length: int = 400) -> Optional[dict]:
            "std_N": N.std(axis=1).tolist() if N.size else [],
            "mean_U": U.mean(axis=1).tolist() if U.size else [],
            "traces": {"stride": stride, "N": N[:, ::stride].tolist(), "U": U[:, ::stride].tolist()}}
+    out["composition"] = _composition_from_samples(obs_meta, obs, keys, stride)
     _CACHE[path] = (mtime, out)
     return out
+
+
+def _composition_from_samples(obs_meta: dict, obs: dict, keys: np.ndarray,
+                              stride: int) -> Optional[dict]:
+    """
+    The composition block of the page, from the saved samples.
+
+    Parameters
+    ----------
+    obs_meta : dict
+        ``observables_meta`` of ``samples.npz``.
+    obs : dict
+        ``{name: array (n_keys, n_samples, size)}`` of the composition observables.
+    keys : numpy.ndarray
+        Grid point of each row, shape (n_keys, 2).
+    stride : int
+        Trace subsampling.
+
+    Returns
+    -------
+    dict or None
+        Like ``status['composition']``, with ``current_*`` and
+        ``identity_acceptance`` grids absent; None without
+        semi-grand-canonical counts.
+    """
+    from .observables import composition_fractions
+    f = composition_fractions(obs_meta, obs)
+    if f is None or not len(keys):
+        return None
+    shape = (int(keys[:, 0].max()) + 1, int(keys[:, 1].max()) + 1)
+
+    def grid(values):
+        z = [[None] * shape[1] for _ in range(shape[0])]
+        for (i, j), v in zip(keys, values):
+            z[int(i)][int(j)] = None if not np.isfinite(v) else float(v)
+        return z
+
+    def traces(a):
+        return [[None if not np.isfinite(x) else float(x) for x in row[::stride]] for row in a]
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)   # all-NaN rows
+        grids = {"mean_swappable": grid(np.nanmean(f["swappable"], axis=1))}
+        if f["top"] is not None:
+            grids["mean_top"] = grid(np.nanmean(f["top"], axis=1))
+    return {"species": f["species"], "sgc_species": f["sgc_species"], "dmu": f["dmu"],
+            "grids": grids, "traces": {"stride": stride, "swappable": traces(f["swappable"]),
+                                       "top": None if f["top"] is None else traces(f["top"])}}
 
 
 def _records_summary(path: str) -> dict:
@@ -249,7 +305,8 @@ class Run:
             has not changed for `STALE_S`, normal between its progress lines;
             finished; error; waiting), ``status`` (the heartbeat), ``log``,
             ``metadata``, ``mixing``, ``samples``, ``records``, ``files``,
-            ``images``, ``history``, ``rate`` (steps/s) and ``eta_s``.
+            ``images``, ``history``, ``rate`` (steps/s), ``eta_s`` and
+            ``composition`` (semi-grand-canonical substrate, else None).
         """
         now = time.time()
         d = self.directory
@@ -313,6 +370,14 @@ class Run:
             records = (_records_summary(rec_path) if idle else
                        {"size": os.path.getsize(rec_path), "note": "being written; summary when idle"})
         images = [f["name"] for f in files if f["name"].endswith((".png", ".svg"))]
+        # substrate composition: live from the heartbeat, else from the last checkpoint
+        composition = (status or {}).get("composition")
+        if composition:
+            composition = dict(composition, source="status.json (live)", keys=status["keys"])
+        elif samples and samples.get("composition"):
+            composition = dict(samples["composition"], keys=samples["keys"],
+                               source=f"samples.npz (last checkpoint, {samples['n_samples']} "
+                                      f"samples per replica)")
         return {
             "name": self.name, "directory": d, "now": now, "state": state,
             "last_update": last_update or None, "step": step, "n_steps": n_steps,
@@ -320,6 +385,7 @@ class Run:
             "metadata": _read_json(os.path.join(d, "run_metadata.json")),
             "mixing": _read_json(os.path.join(d, "mixing.json")),
             "samples": samples, "records": records, "files": files, "images": images,
+            "composition": composition or None,
             "history": [[t, s, m] for t, s, m in hist],
         }
 
@@ -570,6 +636,10 @@ white-space:pre-wrap}.plot{width:100%;height:300px}.imgs{display:flex;flex-wrap:
 <option value="mean_U">mean U (eV)</option><option value="current_U">current U (eV)</option></select>
 <span class="note">click a cell to show its traces</span></div><div id="grid" class="plot"></div></section>
 <section class="card"><h2>Traces <span id="tracekey" class="muted"></span></h2><div id="traces" class="plot"></div></section>
+<section class="card" id="compcard" hidden><h2>Substrate composition</h2><div class="row"><select id="compq"></select>
+<span class="note">click a cell to show its traces</span></div><div id="compgrid" class="plot"></div>
+<div class="note" id="compsrc"></div></section>
+<section class="card" id="comptrcard" hidden><h2>Composition traces <span id="comptrkey" class="muted"></span></h2><div id="comptr" class="plot"></div></section>
 <section class="card"><h2>Mean N across the grid</h2><div id="hist" class="plot"></div></section>
 <section class="card"><h2>Replica exchange</h2><div id="swaps" class="plot" style="height:220px"></div>
 <div id="pairs"></div></section>
@@ -610,7 +680,7 @@ const k=[["step",d.step!=null?`${d.step.toLocaleString()} / ${d.n_steps.toLocale
 ["replicas",nrep??"–"],["samples / replica",ns??"–"]];
 $("kpis").innerHTML=k.map(([a,b])=>`<div class="kpi"><b>${b}</b><span>${a}</span></div>`).join("");
 $("where").textContent=d.directory+(d.log?"  ·  log "+d.log.path:"")+(st?"":"  ·  no status.json: progress from the log only (run started without the heartbeat)");
-drawGrid(d);drawTraces(d);drawHist(d);drawSwaps(d);drawConv(d);drawData(d);
+drawGrid(d);drawTraces(d);drawComp(d);drawHist(d);drawSwaps(d);drawConv(d);drawData(d);
 $("logname").textContent=d.log?d.log.path:"";$("log").textContent=d.log?d.log.tail.join("\n"):"(no log)";
 const imgs=d.images||[];$("imgcard").hidden=!imgs.length;
 $("imgs").innerHTML=imgs.map(n=>`<a href="file/${cur}/${encodeURIComponent(n)}" target="_blank"><img loading="lazy" src="file/${cur}/${encodeURIComponent(n)}?t=${Math.round(d.now)}" alt="${n}"><div class="note">${n}</div></a>`).join("");}
@@ -625,7 +695,7 @@ Plotly.react("grid",[{type:"heatmap",z:g.z,x:a.x,y:a.y,colorscale:"Viridis",text
 hovertemplate:"%{y}, %{x}<br>%{z}<extra></extra>",colorbar:{thickness:10}}],
 layout({xaxis:{title:a.xt,type:"category",tickangle:-30},yaxis:{title:a.yt,type:"category"},margin:{l:70,r:10,t:8,b:70}}),cfg);
 $("grid").on&&($("grid").removeAllListeners?.("plotly_click"),$("grid").on("plotly_click",e=>{const p=e.points[0];
-sel=[a.y.indexOf(p.y),a.x.indexOf(p.x)];drawTraces(last)}));}
+sel=[a.y.indexOf(p.y),a.x.indexOf(p.x)];drawTraces(last);drawCompTraces(last)}));}
 function drawTraces(d){const st=d.status;let tr=st?st.traces:d.samples&&d.samples.traces,keys=st?st.keys:d.samples&&d.samples.keys;
 if(!tr){Plotly.purge("traces");$("tracekey").textContent="";return}if(!sel)sel=keys[0];
 let i=keys.findIndex(k=>k[0]==sel[0]&&k[1]==sel[1]);if(i<0)i=0;const x=tr.N[i].map((_,j)=>j*tr.stride);
@@ -633,6 +703,31 @@ $("tracekey").textContent=`replica (${keys[i][0]}, ${keys[i][1]}) · ${tr.stride
 Plotly.react("traces",[{x,y:tr.N[i],name:"N",mode:"lines",line:{color:css("--accent"),width:1.2}},
 {x,y:tr.U[i],name:"U (eV)",yaxis:"y2",mode:"lines",line:{color:css("--warn"),width:1,dash:"dot"}}],
 layout({xaxis:{title:"sample"},yaxis:{title:"N"},yaxis2:{title:"U (eV)",overlaying:"y",side:"right",showgrid:false},margin:{l:48,r:60,t:8,b:42}}),cfg)}
+function compSt(d,c){if(d.status)return d.status;const m=d.metadata||{},z=c.grids.mean_swappable;
+return {shape:[z.length,z[0].length],temperatures:m.temperatures_K||z.map((_,i)=>i),mu_grid:m.mu_grid_eV||[z[0]],labels:{}}}
+function drawComp(d){const c=d.composition;$("compcard").hidden=$("comptrcard").hidden=!c;if(!c)return;
+const sp=c.species,names={mean_swappable:`mean ${sp} fraction, swappable layers`,mean_top:`mean ${sp} fraction, top layer`,
+current_swappable:`current ${sp} fraction, swappable layers`,current_top:`current ${sp} fraction, top layer`,
+identity_acceptance:"identity-swap acceptance"};
+const avail=Object.keys(names).filter(k=>c.grids[k]&&c.grids[k].flat().some(v=>v!=null));const q=$("compq");
+if(q.dataset.opts!==avail.join()){const keep=q.value;q.innerHTML=avail.map(k=>`<option value="${k}">${names[k]}</option>`).join("");
+q.dataset.opts=avail.join();if(avail.includes(keep))q.value=keep}
+const key=q.value||avail[0],z=c.grids[key],st=compSt(d,c),a=axes(st,d.metadata),acc=key=="identity_acceptance";
+const text=z.map(r=>r.map(v=>v==null?"":fmtN(v,2)));
+Plotly.react("compgrid",[{type:"heatmap",z,x:a.x,y:a.y,zmin:0,zmax:1,colorscale:acc?"Viridis":"RdBu",reversescale:!acc,
+text,texttemplate:"%{text}",hovertemplate:"%{y}, %{x}<br>%{z:.3f}<extra></extra>",colorbar:{thickness:10}}],
+layout({xaxis:{title:a.xt,type:"category",tickangle:-30},yaxis:{title:a.yt,type:"category"},margin:{l:70,r:10,t:8,b:70}}),cfg);
+$("compgrid").removeAllListeners?.("plotly_click");$("compgrid").on&&$("compgrid").on("plotly_click",e=>{const p=e.points[0];
+sel=[a.y.indexOf(p.y),a.x.indexOf(p.x)];drawTraces(last);drawCompTraces(last)});
+const dm=c.sgc_species.slice(1).map((s,i)=>`${s} ${fmtN(c.dmu[i+1],4)}`).join(", ");
+$("compsrc").textContent=`${c.sgc_species.join("/")} semi-grand-canonical, Δμ vs ${c.sgc_species[0]}: ${dm} eV · from ${c.source}`;
+drawCompTraces(d)}
+function drawCompTraces(d){const c=d.composition;if(!c)return;const keys=c.keys,tr=c.traces;if(!sel)sel=keys[0];
+let i=keys.findIndex(k=>k[0]==sel[0]&&k[1]==sel[1]);if(i<0)i=0;const ys=tr.swappable[i]||[];const x=ys.map((_,j)=>j*tr.stride);
+$("comptrkey").textContent=`replica (${keys[i][0]}, ${keys[i][1]})`;
+const t=[{x,y:ys,name:`${c.species}, swappable layers`,mode:"lines",line:{color:css("--accent"),width:1.2}}];
+if(tr.top)t.push({x,y:tr.top[i],name:`${c.species}, top layer`,mode:"lines",line:{color:css("--warn"),width:1.2}});
+Plotly.react("comptr",t,layout({xaxis:{title:"sample"},yaxis:{title:`${c.species} fraction`,range:[0,1]}}),cfg)}
 function drawHist(d){const lp=d.log?d.log.progress:[];const h=d.history||[];
 const tr=[];if(lp.length)tr.push({x:lp.map(p=>p[0]),y:lp.map(p=>p[2]),name:"log",mode:"lines+markers",line:{color:css("--accent")}});
 if(h.length)tr.push({x:h.map(p=>p[1]),y:h.map(p=>p[2]),name:"status (this monitor)",mode:"markers",marker:{color:css("--warn"),size:5}});
@@ -659,7 +754,7 @@ if(d.samples)extra+=`<p class="note">samples.npz: ${d.samples.keys.length} repli
 $("data").innerHTML=(rows?`<table><tr><th>file</th><th></th><th>size</th><th>modified</th></tr>${rows}</table>`:'<p class="note">Directory empty or not created yet.</p>')+extra}
 async function refresh(){try{const r=await fetch(`api/run/${cur}`);const d=await r.json();if(d.error)throw new Error(d.error);draw(d)}
 catch(e){$("badge").className="badge error";$("badge").textContent="monitor error";$("updated").textContent=String(e)}}
-$("gridq").onchange=()=>last&&drawGrid(last);
+$("gridq").onchange=()=>last&&drawGrid(last);$("compq").onchange=()=>last&&drawComp(last);
 (async()=>{if(typeof Plotly==="undefined"){document.body.insertAdjacentHTML("afterbegin",'<p style="padding:8px 20px;background:#d55e00;color:#fff">Plotly could not be loaded (from cdn.jsdelivr.net or cdnjs.cloudflare.com): give the browser internet access, or start the monitor with --plotly-js path/to/plotly.min.js.</p>');window.Plotly={react(){},purge(){}}}
 await loadRuns();await refresh();setInterval(()=>{if($("auto").checked)refresh()},5000)})();
 </script></body></html>"""

@@ -137,6 +137,109 @@ class ParticleSystem:
         self.substrate_species = (np.array([], dtype='<U2') if substrate_species is None
                                    else np.asarray(substrate_species))
         self.mass_of_species = dict(mass_of_species) if mass_of_species else {}
+        # semi-grand-canonical substrate (see `sgc_species`): off by default
+        self.sgc_species: Tuple[str, ...] = ()
+
+    # -- semi-grand-canonical substrate ------------------------------------------
+    def set_sgc_species(self, species: Sequence[str]) -> None:
+        """
+        Make the displaceable substrate semi-grand-canonical.
+
+        Substrate atoms of these species may change identity among them
+        (`Replica._move_identity`), at fixed total number, under the
+        chemical-potential differences `ThermoState.sgc_dmu`. Frozen atoms
+        keep their species. The first species is the reference (its
+        sgc_dmu entry is 0).
+
+        Parameters
+        ----------
+        species : sequence of str
+            At least two distinct labels; an empty sequence switches it off.
+
+        Raises
+        ------
+        ValueError
+            On one species, or repeated labels.
+        """
+        labels = tuple(str(s) for s in species)
+        if labels and (len(labels) < 2 or len(set(labels)) != len(labels)):
+            raise ValueError(f"sgc species must be two or more distinct labels, got {labels}")
+        self.sgc_species = labels
+        if labels:
+            # room for the longest label (a '<U2' array would truncate a 3-letter one)
+            width = max(len(s) for s in labels + tuple(map(str, self.substrate_species)) + ("",))
+            self.substrate_species = self.substrate_species.astype(f"<U{max(width, 2)}")
+
+    def sgc_candidates(self) -> np.ndarray:
+        """
+        Indices (into the substrate arrays) of the atoms that may change identity.
+
+        Returns
+        -------
+        numpy.ndarray
+            Substrate atoms whose species is one of `sgc_species`; empty
+            when the substrate is not semi-grand-canonical. Identity swaps
+            keep this set fixed, so a uniform pick from it is a symmetric
+            proposal.
+        """
+        if not self.sgc_species or self.n_substrate == 0:
+            return np.zeros(0, dtype=int)
+        return np.flatnonzero(np.isin(self.substrate_species, self.sgc_species))
+
+    def sgc_counts(self) -> np.ndarray:
+        """
+        Number of swappable substrate atoms of each `sgc_species`.
+
+        Returns
+        -------
+        numpy.ndarray
+            Integer array in `sgc_species` order (empty when off). Their
+            sum is constant along a run.
+        """
+        return np.array([int(np.count_nonzero(self.substrate_species == s))
+                         for s in self.sgc_species], dtype=int)
+
+    def generic_identity_dU(self, i: int, new_species: str) -> float:
+        """
+        Energy change of turning substrate atom `i` into `new_species`.
+
+        Via clone-mutate-recompute: correct for any calculator that sees
+        the substrate. Positions do not change, so the external field does
+        not either.
+
+        Parameters
+        ----------
+        i : int
+            Index into the substrate arrays.
+        new_species : str
+            The trial species.
+
+        Returns
+        -------
+        float
+            U(new) - U(old).
+        """
+        u0 = self.calculator.total_energy(self)
+        old = self.substrate_species[i]
+        self.substrate_species[i] = new_species
+        try:
+            u1 = self.calculator.total_energy(self)
+        finally:
+            self.substrate_species[i] = old
+        return u1 - u0
+
+    def apply_identity(self, i: int, new_species: str) -> None:
+        """
+        Commit an accepted identity swap of substrate atom `i`.
+
+        Parameters
+        ----------
+        i : int
+            Index into the substrate arrays.
+        new_species : str
+            Its new species.
+        """
+        self.substrate_species[i] = new_species
 
     @property
     def n(self) -> int:

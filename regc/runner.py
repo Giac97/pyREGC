@@ -95,7 +95,8 @@ def _available_cpus() -> int:
 
 _SECTIONS = {
     "structure": {"file", "build", "cluster", "geometry", "n_frozen_layers", "headroom_angstrom",
-                  "layer_tol", "frozen", "full_coordination"},
+                  "layer_tol", "frozen", "full_coordination", "alloy", "alloy_seed"},
+    "sgc": {"species", "dmu_eV", "attempts_per_step"},
     "gas": {"species", "mass_amu", "insertion_z_range_above_surface",
             "insertion_shell_around_cluster", "composition"},
     "reservoir": {"type", "d0", "D0_eV", "e_atom_eV", "bond_length_angstrom",
@@ -325,7 +326,7 @@ def _scheme(re_cfg: Dict[str, Any]) -> str:
     return scheme
 
 
-def _observables_from_config(config: Dict[str, Any]) -> list:
+def _observables_from_config(config: Dict[str, Any], geometry: Any = None) -> list:
     """
     The structural observables of the ``observables`` section.
 
@@ -333,7 +334,11 @@ def _observables_from_config(config: Dict[str, Any]) -> list:
     ----------
     config : dict
         The parsed config; ``observables`` is a list of
-        ``{type: coordination | coordination_histogram | rdf, name: ..., ...}``.
+        ``{type: coordination | coordination_histogram | rdf | layer_composition,
+        name: ..., ...}``.
+    geometry : SlabGeometry, optional
+        The structure, for ``layer_composition`` with ``layer_z: auto`` (its
+        layer heights). Default None (validation only: a placeholder).
 
     Returns
     -------
@@ -354,6 +359,13 @@ def _observables_from_config(config: Dict[str, Any]) -> list:
         e = dict(e)
         if "z_range" in e and e["z_range"] is not None:
             e["z_range"] = tuple(_floats(e["z_range"], f"observables.{e.get('name')}.z_range"))
+        if str(e.get("type", "")).lower() == "layer_composition":
+            if e.get("layer_z", "auto") == "auto":
+                # the slab's own layers; validation (no geometry yet) uses a placeholder
+                layers = getattr(geometry, "layer_z", None)
+                e["layer_z"] = [0.0] if layers is None else [float(z) for z in layers]
+            else:
+                e["layer_z"] = _floats(e["layer_z"], f"observables.{e.get('name')}.layer_z")
         out.append(observable_from_config(e))
     return check_observables(out)
 
@@ -425,6 +437,13 @@ def validate_config(config: Dict[str, Any]) -> None:
                          "potentials) or 'pressures' (gas-pressure ladder via the reservoir)")
     if "checkpoint" in config and scheme != "regc":
         raise ValueError("the checkpoint section needs replica_exchange.scheme: regc")
+    if "sgc" in config:
+        sgc = config["sgc"] or {}
+        if scheme != "regc":
+            raise ValueError("the sgc section (identity swaps) needs replica_exchange.scheme: regc")
+        if "species" not in sgc or "dmu_eV" not in sgc:
+            raise ValueError("sgc needs 'species' (reference first, e.g. [Pd, Pt]) and 'dmu_eV' "
+                             "(e.g. {Pt: -0.5}: mu_Pt - mu_Pd)")
     struct = config["structure"]
     sources = [k for k in ("file", "build", "cluster") if k in struct]
     if len(sources) != 1:
@@ -725,30 +744,119 @@ def _build_structure(struct_cfg: Dict[str, Any], calc_spec_of: Callable[[List[st
         is asked for a non-cubic crystal or a potential with no ASE
         counterpart, or ``ase.build``/``ase.cluster`` has no such function.
     """
+    alloy = _alloy_fractions(struct_cfg)
     if "file" in struct_cfg:
         from ase.io import read as ase_read
         atoms = ase_read(struct_cfg["file"])
+        if alloy:
+            _substitute(atoms, alloy, int(struct_cfg.get("alloy_seed", 0)))
         slab_species = list(dict.fromkeys(atoms.get_chemical_symbols()))
-        return atoms, calc_spec_of(slab_species), None
+        return atoms, calc_spec_of(slab_species + list(alloy)), None
     if "cluster" in struct_cfg:
-        return _build_cluster(dict(struct_cfg["cluster"]), calc_spec_of)
-
-    import ase.build
-    build = dict(struct_cfg["build"])
-    for key in ("surface", "symbol"):
-        if key not in build:
-            raise ValueError(f"structure.build needs {key!r} (e.g. surface: fcc111, symbol: Pd)")
-    surface, symbol = str(build.pop("surface")), str(build.pop("symbol"))
-    builder = getattr(ase.build, surface, None)
-    if builder is None:
-        raise ValueError(f"ase.build has no surface function {surface!r}")
-    calc_spec = calc_spec_of([symbol])
-    a = _lattice_constant(build.pop("a", None), build.pop("a_range", None), surface[:3], symbol,
-                          calc_spec, "structure.build")
-    if "size" in build:
-        build["size"] = tuple(int(n) for n in build["size"])
-    atoms = builder(symbol, a=a, **build) if a is not None else builder(symbol, **build)
+        atoms, calc_spec, a = _build_cluster(dict(struct_cfg["cluster"]), calc_spec_of, alloy)
+    else:
+        import ase.build
+        build = dict(struct_cfg["build"])
+        for key in ("surface", "symbol"):
+            if key not in build:
+                raise ValueError(f"structure.build needs {key!r} (e.g. surface: fcc111, symbol: Pd)")
+        surface, symbol = str(build.pop("surface")), str(build.pop("symbol"))
+        builder = getattr(ase.build, surface, None)
+        if builder is None:
+            raise ValueError(f"ase.build has no surface function {surface!r}")
+        calc_spec = calc_spec_of([symbol] + list(alloy))
+        a = _alloy_lattice_constant(build.pop("a", None), build.pop("a_range", None), surface[:3],
+                                    symbol, alloy, calc_spec, "structure.build")
+        if "size" in build:
+            build["size"] = tuple(int(n) for n in build["size"])
+        atoms = builder(symbol, a=a, **build) if a is not None else builder(symbol, **build)
+    if alloy:
+        _substitute(atoms, alloy, int(struct_cfg.get("alloy_seed", 0)))
     return atoms, calc_spec, a
+
+
+def _alloy_fractions(struct_cfg: Dict[str, Any]) -> Dict[str, float]:
+    """
+    The ``structure.alloy`` block: ``{species: fraction}`` substituted at random.
+
+    Parameters
+    ----------
+    struct_cfg : dict
+        The ``structure`` section.
+
+    Returns
+    -------
+    dict
+        ``{species: fraction}`` (empty without the block).
+
+    Raises
+    ------
+    ValueError
+        If it is not a mapping, or the fractions are not in (0, 1) with a sum below 1.
+    """
+    alloy = struct_cfg.get("alloy") or {}
+    if not isinstance(alloy, dict):
+        raise ValueError("structure.alloy must map species to fractions, e.g. {Pt: 0.5}")
+    out = {str(k): _as_float(v, f"structure.alloy.{k}") for k, v in alloy.items()}
+    if any(not 0.0 < f < 1.0 for f in out.values()) or sum(out.values()) >= 1.0:
+        raise ValueError(f"structure.alloy fractions must lie in (0, 1) and sum below 1, got {out}")
+    return out
+
+
+def _substitute(atoms, alloy: Dict[str, float], seed: int) -> None:
+    """
+    Random substitutional alloy: replace exact numbers of atoms, in place.
+
+    ``round(fraction * n_atoms)`` atoms per species, drawn uniformly
+    without replacement from the whole structure (frozen and displaceable
+    alike), so the composition is exact and uniform in space.
+
+    Parameters
+    ----------
+    atoms : ase.Atoms
+        The structure (all one host element, typically).
+    alloy : dict
+        ``{species: fraction}``.
+    seed : int
+        Random seed of the draw.
+    """
+    rng = np.random.default_rng(seed)
+    symbols = atoms.get_chemical_symbols()
+    order = rng.permutation(len(symbols))
+    start = 0
+    for sp, frac in alloy.items():
+        n = int(round(frac * len(symbols)))
+        for i in order[start:start + n]:
+            symbols[i] = sp
+        start += n
+    atoms.set_chemical_symbols(symbols)
+
+
+def _alloy_lattice_constant(a: Any, a_range: Any, crystal: str, symbol: str,
+                            alloy: Dict[str, float], calc_spec: _CalculatorSpec,
+                            where: str) -> Optional[float]:
+    """
+    `_lattice_constant`, with Vegard's law for ``a: auto`` on an alloy.
+
+    Parameters
+    ----------
+    a, a_range, crystal, symbol, calc_spec, where
+        As for `_lattice_constant` (`symbol` the host).
+    alloy : dict
+        ``{species: fraction}`` substituted into the host (may be empty).
+
+    Returns
+    -------
+    float or None
+        The host's lattice constant, or for ``a: auto`` on an alloy the
+        composition-weighted mean of every element's own fitted one.
+    """
+    a_host = _lattice_constant(a, a_range if not alloy else None, crystal, symbol, calc_spec, where)
+    if a != "auto" or not alloy:
+        return a_host
+    x_host = 1.0 - sum(alloy.values())
+    return x_host * a_host + sum(
+        f * _lattice_constant("auto", None, crystal, sp, calc_spec, where) for sp, f in alloy.items())
 
 
 #: Lattice of each ase.cluster function, for ``a: auto``.
@@ -756,7 +864,8 @@ _CLUSTER_CRYSTAL = {"Icosahedron": "fcc", "Octahedron": "fcc", "Decahedron": "fc
                     "FaceCenteredCubic": "fcc", "BodyCenteredCubic": "bcc"}
 
 
-def _build_cluster(cl: Dict[str, Any], calc_spec_of: Callable[[List[str]], _CalculatorSpec]
+def _build_cluster(cl: Dict[str, Any], calc_spec_of: Callable[[List[str]], _CalculatorSpec],
+                   alloy: Optional[Dict[str, float]] = None
                    ) -> Tuple[Any, _CalculatorSpec, Optional[float]]:
     """
     Build a cluster with an ``ase.cluster`` function.
@@ -770,6 +879,9 @@ def _build_cluster(cl: Dict[str, Any], calc_spec_of: Callable[[List[str]], _Calc
         (``noshells``, ``length``, ``cutoff``, ``p``, ``q``, ``r``, ...).
     calc_spec_of : callable
         ``calc_spec_of(cluster_species) -> _CalculatorSpec``.
+    alloy : dict, optional
+        ``{species: fraction}`` the caller substitutes afterwards: it sets
+        the calculator's species and, with ``a: auto``, Vegard's law.
 
     Returns
     -------
@@ -792,10 +904,11 @@ def _build_cluster(cl: Dict[str, Any], calc_spec_of: Callable[[List[str]], _Calc
     if builder is None or not callable(builder):
         raise ValueError(f"ase.cluster has no function {shape!r} (e.g. Icosahedron, Octahedron, "
                          "Decahedron)")
-    calc_spec = calc_spec_of([symbol])
-    a = _lattice_constant(cl.pop("a", None), cl.pop("a_range", None),
-                          _CLUSTER_CRYSTAL.get(shape, shape), symbol, calc_spec,
-                          "structure.cluster")
+    alloy = alloy or {}
+    calc_spec = calc_spec_of([symbol] + list(alloy))
+    a = _alloy_lattice_constant(cl.pop("a", None), cl.pop("a_range", None),
+                                _CLUSTER_CRYSTAL.get(shape, shape), symbol, alloy, calc_spec,
+                                "structure.cluster")
     atoms = builder(symbol, latticeconstant=a, **cl) if a is not None else builder(symbol, **cl)
     return atoms, calc_spec, a
 
@@ -1281,10 +1394,14 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
         lambda_cubed_of_T = SpeciesLambdaCubed([ThermalWavelengthCubed(masses[s]) for s in species])
 
     exchange = species[0] if len(species) == 1 else list(species)
+    sgc = _sgc_settings(config, geometry)
 
     def system_factory(rng):
-        return geometry.make_system(calc_spec.make(cell, pbc), exchange, mass_of_species=masses,
-                                    **region)
+        system = geometry.make_system(calc_spec.make(cell, pbc), exchange, mass_of_species=masses,
+                                      **region)
+        if sgc:
+            system.set_sgc_species(sgc["species"])
+        return system
 
     scheme = _scheme(re_cfg)
     sampling = {"scheme": scheme, "record_every": re_cfg.get("record_every"),
@@ -1307,6 +1424,8 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
     }
     if config.get("observables"):
         metadata["observables"] = config["observables"]
+    if sgc:
+        metadata["sgc"] = dict(sgc)
 
     if verbose:
         if a is not None:
@@ -1324,6 +1443,12 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
                     src = (r.calculator_info or {}).get("d0_source", "given")
                     d0 = f"D0 = {r.D0_eV:.4f} eV ({src}), "
                 print(f"{s} reservoir ({type(r).__name__}): {d0}e_atom = {r.e_atom_eV:.4f} eV")
+        if sgc:
+            field = ", ".join(f"{sp}: {d:+.4f}" for sp, d in zip(sgc["species"][1:], sgc["dmu"][1:]))
+            print(f"semi-grand-canonical substrate {sgc['species']}: {sgc['n_swappable']} "
+                  f"swappable atoms {dict(zip(sgc['species'], sgc['counts']))}, "
+                  f"dmu vs {sgc['species'][0]} = {{{field}}} eV, "
+                  f"{sgc['attempts_per_step']} identity attempts per step")
         n_mu = np.shape(mu_grid)[-1 if len(species) == 1 else -2]
         print(f"replica grid: {len(temperatures_K)} T x {n_mu} "
               f"{'p' if pressures is not None else 'mu'} = {len(temperatures_K) * n_mu} replicas")
@@ -1333,8 +1458,66 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
             "temperatures_K": temperatures_K, "mu_grid": mu_grid, "pressures": pressures,
             "pressure_unit": pressure_unit, "lambda_cubed_of_T": lambda_cubed_of_T,
             "insertion_z_range": insertion_z_range, "insertion_shell": insertion_shell,
-            "system_factory": system_factory,
+            "system_factory": system_factory, "sgc": sgc,
             "metadata": metadata}
+
+
+def _sgc_settings(config: Dict[str, Any], geometry: Any) -> Optional[Dict[str, Any]]:
+    """
+    The ``sgc`` section: a semi-grand-canonical (identity-swapping) substrate.
+
+    Parameters
+    ----------
+    config : dict
+        The parsed config; ``sgc`` has ``species`` (reference first),
+        ``dmu_eV`` (``{species: mu_species - mu_reference}``, eV; the
+        reference may be omitted) and ``attempts_per_step`` (default 1).
+    geometry : SlabGeometry or ClusterGeometry
+        The structure (its displaceable substrate is what swaps).
+
+    Returns
+    -------
+    dict or None
+        ``species``, ``dmu`` (list, reference 0), ``attempts_per_step``,
+        ``counts`` (initial swappable atoms per species) and
+        ``n_swappable``; None without the section.
+
+    Raises
+    ------
+    ValueError
+        If a species has no dmu, the reference's dmu is not 0, or the
+        substrate holds none of the species.
+    """
+    sec = config.get("sgc")
+    if not sec:
+        return None
+    species = [str(s) for s in sec["species"]]
+    if len(species) < 2 or len(set(species)) != len(species):
+        raise ValueError(f"sgc.species must be two or more distinct species, got {species}")
+    given = sec["dmu_eV"]
+    if not isinstance(given, dict):
+        if len(species) != 2:
+            raise ValueError("sgc.dmu_eV must map species to values with more than two species")
+        given = {species[1]: given}
+    unknown = sorted(set(map(str, given)) - set(species))
+    if unknown:
+        raise ValueError(f"sgc.dmu_eV has entries {unknown} not in sgc.species {species}")
+    given = {str(k): _as_float(v, f"sgc.dmu_eV.{k}") for k, v in given.items()}
+    if given.get(species[0], 0.0) != 0.0:
+        raise ValueError(f"sgc.dmu_eV.{species[0]} must be 0 (the reference) or omitted")
+    missing = [sp for sp in species[1:] if sp not in given]
+    if missing:
+        raise ValueError(f"sgc.dmu_eV needs a value for {missing}")
+    sub = np.asarray(geometry.substrate_species).astype(str)
+    counts = [int(np.count_nonzero(sub == sp)) for sp in species]
+    if sum(counts) == 0:
+        raise ValueError(f"no displaceable substrate atom is one of sgc.species {species}: "
+                         f"identity swaps only act on non-frozen atoms")
+    attempts = int(sec.get("attempts_per_step", 1))
+    if attempts < 1:
+        raise ValueError("sgc.attempts_per_step must be at least 1")
+    return {"species": species, "dmu": [0.0] + [given[sp] for sp in species[1:]],
+            "attempts_per_step": attempts, "counts": counts, "n_swappable": int(sum(counts))}
 
 
 # =============================================================================
@@ -1475,7 +1658,9 @@ def run_from_config(config: Dict[str, Any], verbose: bool = True, resume: bool =
                              hmc_leapfrog_steps=leapfrog, hmc_dt=hmc_dt,
                              adsorbed_cutoff=None if cutoff is None else _as_float(
                                  cutoff, "replica_exchange.adsorbed_cutoff"),
-                             observables=_observables_from_config(config),
+                             observables=_observables_from_config(config, setup["geometry"]),
+                             sgc_dmu=setup["sgc"]["dmu"] if setup["sgc"] else None,
+                             sgc_attempts=setup["sgc"]["attempts_per_step"] if setup["sgc"] else 1,
                              configurations_dir=conf_dir,
                              configurations_every=int(conf_cfg.get("every", 1)),
                              records_path=rec_path,
@@ -2212,6 +2397,34 @@ def analyze_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[st
             total = h.sum(axis=-1, keepdims=True)
             with np.errstate(invalid="ignore", divide="ignore"):
                 raw[f"cn_hist_{name}"] = np.where(total > 0, h / total, np.nan)
+        elif kind in ("LayerComposition", "SGCCounts"):
+            # fractions as ratios of reweighted counts: <N_k> / <N>
+            sp_list = list(m["species"])
+            h = analysis.observable_map(name, T_grid_eV, p_grid, pressure=True)
+            if kind == "LayerComposition":
+                h = h.reshape(h.shape[:2] + (len(m["layer_z"]), len(sp_list)))
+                where = "top layer"
+            else:
+                h = h[:, :, None, :]
+                where = "swappable substrate"
+            total = h.sum(axis=-1, keepdims=True)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                frac = np.where(total > 0, h / total, np.nan)   # (n_T, n_p, n_layers, n_species)
+            key = "layer_fraction" if kind == "LayerComposition" else "sgc_fraction"
+            raw[f"{key}_{name}"] = frac
+            raw[f"{key}_{name}_species"] = np.array(sp_list)
+            result[f"{key}_{name}"] = frac
+            for j, sp in enumerate(sp_list[1:] if len(sp_list) > 1 else sp_list):
+                j = sp_list.index(sp)
+                top = frac[:, :, -1, j]
+                plot_map(T_grid_K, p_grid, top,
+                         os.path.join(out_dir, f"{root}_{name}_{sp}{ext}"),
+                         valid=valid & np.isfinite(top), cmap="coolwarm", vmin=0.0, vmax=1.0,
+                         colorbar_label=f"{sp} fraction, {where}", xlabel=xlabel, ylabel=ylabel,
+                         title=f"{sp} fraction in the {where} (MBAR)", invalid_label=invalid)
+                if verbose:
+                    print(f"{sp} fraction in the {where}: {np.nanmin(top):.3f} to "
+                          f"{np.nanmax(top):.3f}")
         elif kind == "RadialDistribution" and pd_cfg.get("rdf_states"):
             curves = {}
             for T_K, p in pd_cfg["rdf_states"]:

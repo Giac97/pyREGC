@@ -492,6 +492,23 @@ class MBARSurfaceAnalysis:
             self.obs_all[name] = np.concatenate(
                 [np.asarray(sim.samples[key]['obs:' + name], dtype=float).reshape(
                     len(sim.samples[key]['U']), -1) for key in states])
+        # semi-grand-canonical substrate (regc.observables.SGCCounts): the field is
+        # part of the ensemble, u = beta (U - sum_k dmu_k N_k) - ...; with dmu the
+        # same at every state and T-independent it acts as an energy term, so it
+        # goes into U_all (the sampling energy every reweighting uses) and the
+        # physical energy stays in U_phys_all
+        self.U_phys_all = self.U_all
+        self.sgc = None
+        sgc_names = [n for n, m in self.observables_meta.items() if m.get("type") == "SGCCounts"]
+        if sgc_names:
+            name = sgc_names[0]
+            if name not in self.obs_all:
+                raise ValueError(f"semi-grand-canonical run without recorded {name!r} counts "
+                                 f"in every state: the reduced potential is undefined")
+            dmu = np.asarray(self.observables_meta[name]["dmu"], dtype=float)
+            self.sgc = {"name": name, "species": list(self.observables_meta[name]["species"]),
+                        "dmu": dmu}
+            self.U_all = self.U_phys_all - self.obs_all[name] @ dmu
         self.n_substrate = getattr(sim, "n_substrate", None)
         self.first_index = getattr(sim, "first_index", 0)
         self.potential = None        # the sampling potential (see `with_potential`)
@@ -619,6 +636,9 @@ class MBARSurfaceAnalysis:
         new.potential = name
         new._evaluated = ok
         new._parent = self
+        new.U_phys_all = np.where(ok, U_B, np.nan)
+        if self.sgc is not None:   # the same semi-grand-canonical field under the new potential
+            U_B = U_B - self.obs_all[self.sgc["name"]] @ self.sgc["dmu"]
         new.U_all = np.where(ok, U_B, U_B[ok].mean())  # placeholders get zero weight below
         new._log_den = np.where(ok, self._log_den, np.inf)
         new.mbar = _TargetMBAR(self.mbar, new._log_den)
