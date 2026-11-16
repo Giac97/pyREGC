@@ -137,7 +137,8 @@ class ReplicaExchangeGCMC:
                  configurations_dir: Optional[str] = None, configurations_every: int = 1,
                  skip_empty_swaps: bool = True, records_path: Optional[str] = None,
                  records_potential: str = "sampling", records_every: int = 1,
-                 sgc_dmu: Optional[Sequence[float]] = None, sgc_attempts: int = 1):
+                 sgc_dmu: Optional[Sequence[float]] = None, sgc_attempts: int = 1,
+                 sgc_log_ratio: Optional[Sequence[float]] = None):
         """
         Construct the replica-exchange ladder.
 
@@ -240,6 +241,13 @@ class ReplicaExchangeGCMC:
         sgc_attempts : int, optional
             Identity-swap attempts per replica per REGC step
             (`Replica._move_identity`). Default 1.
+        sgc_log_ratio : sequence of float, optional
+            Ideal-mixing part of the field, ln(x_k / x_ref) of the bulk
+            reservoir, one per species: the field at temperature T is then
+            ``sgc_dmu + T * sgc_log_ratio`` (docs Sec. 9). It is the same
+            for every grid point in units of kT, so it drops out of replica
+            exchange and MBAR and acts only in the identity moves. Default
+            None (zero: a 50-50 reservoir, or `sgc_dmu` the full field).
 
         Raises
         ------
@@ -301,8 +309,14 @@ class ReplicaExchangeGCMC:
                 raise ValueError(f"sgc_dmu needs {len(self.sgc_species)} values "
                                  f"({self.sgc_species}), got {dmu.size}")
             self.sgc_dmu = dmu - dmu[0]   # only differences matter: the reference is 0
+            lr = (np.zeros_like(dmu) if sgc_log_ratio is None
+                  else np.asarray(sgc_log_ratio, dtype=float).ravel())
+            if lr.size != dmu.size:
+                raise ValueError(f"sgc_log_ratio needs {dmu.size} values, got {lr.size}")
+            self.sgc_log_ratio = lr - lr[0]
             self.observables = check_observables(
-                self.observables + [SGCCounts(self.sgc_species, self.sgc_dmu)])
+                self.observables + [SGCCounts(self.sgc_species, self.sgc_dmu,
+                                              self.sgc_log_ratio)])
 
         self.grid: Dict[Tuple[int, int], Replica] = {}
         self.samples: Dict[Tuple[int, int], Dict[str, list]] = {}
@@ -318,7 +332,8 @@ class ReplicaExchangeGCMC:
                                      f"values, got shape {lam3.shape}")
                 lam3 = np.broadcast_to(lam3, (self.n_species,)).copy()
             state = ThermoState(T, mu, label=(it, imu), lambda_cubed=lam3,
-                                sgc_dmu=None if self.sgc_dmu is None else self.sgc_dmu.copy())
+                                sgc_dmu=None if self.sgc_dmu is None
+                                else self.sgc_dmu + T * self.sgc_log_ratio)
             self.grid[(it, imu)] = Replica(state, system, rng, max_disp=max_disp,
                                             hmc_enabled=hmc_enabled,
                                             hmc_leapfrog_steps=hmc_leapfrog_steps,

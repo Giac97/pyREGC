@@ -232,3 +232,42 @@ def test_status_and_monitor_report_the_composition(tmp_path):
 def test_no_composition_without_sgc(tmp_path):
     from regc.monitor import Run
     assert Run(str(tmp_path)).collect()["composition"] is None
+
+
+def test_bulk_composition_term_acts_in_the_identity_moves_only():
+    # reservoir with x_B / x_A = 1/3: the field at T is dmu + T ln(1/3), so
+    # x_B(T) = 1 / (1 + exp((h_B - h_A - dmu) / T - ln(1/3)))
+    c = np.log(1 / 3)
+    sim = ReplicaExchangeGCMC(list(LADDER), [-50.0], _slab, seed=4, sgc_dmu=[0.0, DMU],
+                              sgc_attempts=1, sgc_log_ratio=[0.0, c])
+    for it, T in enumerate(LADDER):
+        assert sim.grid[(it, 0)].state.sgc_dmu[1] == pytest.approx(DMU + T * c)
+    meta = sim.observables_meta[SGC_COUNTS_NAME]
+    assert meta["dmu"] == pytest.approx([0.0, DMU]) and meta["log_ratio"][1] == pytest.approx(c)
+    sim.run_regc(n_steps=30000, x0=0.1, diffusion="mc", diffusion_steps=1, record_every=5,
+                 burn_in_steps=500, verbose=False)
+
+    def exact(T):
+        return 1.0 / (1.0 + np.exp((H["B"] - H["A"] - DMU) / np.asarray(T) - c))
+    for it, T in enumerate(LADDER):
+        counts = np.asarray(sim.samples[(it, 0)]["obs:" + SGC_COUNTS_NAME])
+        xB = counts[:, 1].mean() / N_SUB
+        err = np.sqrt(exact(T) * (1 - exact(T)) / N_SUB / (len(counts) / 10))
+        assert xB == pytest.approx(exact(T), abs=4 * err), (T, xB, exact(T))
+    analysis = MBARSurfaceAnalysis(sim)   # the T ln(x) term is state-independent in u: cancels
+    for T in (0.9, 1.1):
+        xB = analysis.observable_mean(SGC_COUNTS_NAME, T, -50.0)[1] / N_SUB
+        assert xB == pytest.approx(exact(T), abs=0.02), (T, xB, exact(T))
+
+
+def test_per_layer_alloy_is_exact_in_every_layer():
+    from ase.build import fcc111
+    from regc.runner import _substitute
+    atoms = fcc111("Pd", size=(4, 4, 4), a=3.9)
+    _substitute(atoms, {"Pt": 0.25}, seed=2, per_layer=True)
+    sym = np.array(atoms.get_chemical_symbols())
+    z = np.round(atoms.positions[:, 2], 3)
+    for v in np.unique(z):
+        assert (sym[z == v] == "Pt").sum() == 4
+    with pytest.raises(ValueError, match="whole number"):
+        _substitute(fcc111("Pd", size=(4, 4, 4), a=3.9), {"Pt": 0.3}, seed=0, per_layer=True)

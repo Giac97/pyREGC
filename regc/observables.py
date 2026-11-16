@@ -625,10 +625,17 @@ class SGCCounts(Observable):
         The semi-grand-canonical species, reference first.
     dmu : sequence of float
         mu_k - mu_ref per species (energy units of the run, eV for real
-        potentials), the same for every grid point.
+        potentials), the same for every grid point: the energy part of
+        the field.
+    log_ratio : sequence of float, optional
+        Ideal-mixing part, ln(x_k / x_ref) of the bulk reservoir: the field
+        at T is dmu + T * log_ratio. State-independent in units of kT, so
+        the analysis does not need it; recorded for reference. Default
+        None (zeros).
     """
 
-    def __init__(self, species: Sequence[str], dmu: Sequence[float]):
+    def __init__(self, species: Sequence[str], dmu: Sequence[float],
+                 log_ratio: Optional[Sequence[float]] = None):
         """
         Set up the counter.
 
@@ -637,7 +644,9 @@ class SGCCounts(Observable):
         species : sequence of str
             The semi-grand-canonical species, reference first.
         dmu : sequence of float
-            mu_k - mu_ref per species.
+            mu_k - mu_ref per species (energy part).
+        log_ratio : sequence of float, optional
+            ln(x_k / x_ref) per species. Default None (zeros).
 
         Raises
         ------
@@ -649,6 +658,8 @@ class SGCCounts(Observable):
         self.dmu = [float(x) for x in dmu]
         if len(self.dmu) != len(self.species):
             raise ValueError(f"dmu needs one value per species {self.species}, got {self.dmu}")
+        self.log_ratio = ([0.0] * len(self.species) if log_ratio is None
+                          else [float(x) for x in log_ratio])
 
     def labels(self) -> List[str]:
         """
@@ -668,9 +679,13 @@ class SGCCounts(Observable):
         Returns
         -------
         dict
-            Type, labels, species and the field ``dmu``.
+            Type, labels, species, the field ``dmu`` and, if not zero,
+            ``log_ratio``.
         """
-        return dict(super().metadata(), species=self.species, dmu=self.dmu)
+        meta = dict(super().metadata(), species=self.species, dmu=self.dmu)
+        if any(self.log_ratio):
+            meta["log_ratio"] = self.log_ratio
+        return meta
 
     def __call__(self, system) -> np.ndarray:
         """

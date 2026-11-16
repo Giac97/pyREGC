@@ -628,7 +628,18 @@ $(m_k/m_1)^{3N_k/2}$, which is independent of $T$. $\Delta\mu_k$ is therefore *c
 i.e. mass-free, the quantity that sets alloy phase equilibria. For a random bulk alloy at
 $x = 1/2$ the ideal-mixing term $kT\ln[x/(1-x)]$ vanishes, so the $\Delta\mu$ of a 50-50
 reservoir is $\partial E/\partial N_k$ there and is independent of $T$ (regular solution;
-`examples/pdpt111_o_warp_nano/dmu_bulk.py`).
+`examples/pdpt111_o_warp_nano/dmu_bulk.py`). Away from $x = 1/2$ the random-alloy reservoir has
+
+$$
+\Delta\mu_k(T) = \frac{\partial E}{\partial N_k}\Big|_{\mathbf x}
++ kT\ln\frac{x_k}{x_1}
+\qquad (22a)
+$$
+
+(config `sgc.bulk_composition`, engine `sgc_log_ratio`). The second term is the same at every
+grid point in units of $kT$, so $\beta\Delta\mu_k = \beta\,\partial E/\partial N_k + \ln(x_k/x_1)$
+contributes a state-independent $-\ln(x_k/x_1) N_k$ to the reduced potential. That term cancels
+in (24) and in MBAR, so it only enters the identity move (23).
 
 **Identity move** (`Replica._move_identity`, `sgc.attempts_per_step` per replica per step). Pick a
 swappable atom uniformly from a set the move does not change, and a new species $k'$ uniformly

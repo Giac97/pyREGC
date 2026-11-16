@@ -95,8 +95,8 @@ def _available_cpus() -> int:
 
 _SECTIONS = {
     "structure": {"file", "build", "cluster", "geometry", "n_frozen_layers", "headroom_angstrom",
-                  "layer_tol", "frozen", "full_coordination", "alloy", "alloy_seed"},
-    "sgc": {"species", "dmu_eV", "attempts_per_step"},
+                  "layer_tol", "frozen", "full_coordination", "alloy", "alloy_seed", "alloy_per_layer"},
+    "sgc": {"species", "dmu_eV", "attempts_per_step", "bulk_composition"},
     "gas": {"species", "mass_amu", "insertion_z_range_above_surface",
             "insertion_shell_around_cluster", "composition"},
     "reservoir": {"type", "d0", "D0_eV", "e_atom_eV", "bond_length_angstrom",
@@ -749,7 +749,8 @@ def _build_structure(struct_cfg: Dict[str, Any], calc_spec_of: Callable[[List[st
         from ase.io import read as ase_read
         atoms = ase_read(struct_cfg["file"])
         if alloy:
-            _substitute(atoms, alloy, int(struct_cfg.get("alloy_seed", 0)))
+            _substitute(atoms, alloy, int(struct_cfg.get("alloy_seed", 0)),
+                        bool(struct_cfg.get("alloy_per_layer", False)))
         slab_species = list(dict.fromkeys(atoms.get_chemical_symbols()))
         return atoms, calc_spec_of(slab_species + list(alloy)), None
     if "cluster" in struct_cfg:
@@ -771,7 +772,11 @@ def _build_structure(struct_cfg: Dict[str, Any], calc_spec_of: Callable[[List[st
             build["size"] = tuple(int(n) for n in build["size"])
         atoms = builder(symbol, a=a, **build) if a is not None else builder(symbol, **build)
     if alloy:
-        _substitute(atoms, alloy, int(struct_cfg.get("alloy_seed", 0)))
+        if struct_cfg.get("alloy_per_layer") and "cluster" in struct_cfg:
+            raise ValueError("structure.alloy_per_layer needs a slab (layers along z)")
+        _substitute(atoms, alloy, int(struct_cfg.get("alloy_seed", 0)),
+                    bool(struct_cfg.get("alloy_per_layer", False)),
+                    _as_float(struct_cfg.get("layer_tol", 1e-3), "structure.layer_tol"))
     return atoms, calc_spec, a
 
 
@@ -803,13 +808,16 @@ def _alloy_fractions(struct_cfg: Dict[str, Any]) -> Dict[str, float]:
     return out
 
 
-def _substitute(atoms, alloy: Dict[str, float], seed: int) -> None:
+def _substitute(atoms, alloy: Dict[str, float], seed: int, per_layer: bool = False,
+                layer_tol: float = 1e-3) -> None:
     """
     Random substitutional alloy: replace exact numbers of atoms, in place.
 
-    ``round(fraction * n_atoms)`` atoms per species, drawn uniformly
-    without replacement from the whole structure (frozen and displaceable
-    alike), so the composition is exact and uniform in space.
+    ``round(fraction * n)`` atoms per species, drawn uniformly without
+    replacement, so the composition is exact and uniform in space. With
+    `per_layer`, n counts the atoms of each z layer and every layer gets the
+    exact composition (a slab whose frozen layers stand for the bulk);
+    otherwise n counts the whole structure (frozen and displaceable alike).
 
     Parameters
     ----------
@@ -819,16 +827,36 @@ def _substitute(atoms, alloy: Dict[str, float], seed: int) -> None:
         ``{species: fraction}``.
     seed : int
         Random seed of the draw.
+    per_layer : bool, optional
+        Exact composition in every layer. Default False.
+    layer_tol : float, optional
+        z tolerance (A) grouping atoms into layers. Default 1e-3.
+
+    Raises
+    ------
+    ValueError
+        If `per_layer` and a fraction does not give a whole number of atoms
+        in some layer.
     """
     rng = np.random.default_rng(seed)
     symbols = atoms.get_chemical_symbols()
-    order = rng.permutation(len(symbols))
-    start = 0
-    for sp, frac in alloy.items():
-        n = int(round(frac * len(symbols)))
-        for i in order[start:start + n]:
-            symbols[i] = sp
-        start += n
+    if per_layer:
+        z = np.round(atoms.positions[:, 2] / layer_tol)
+        groups = [np.flatnonzero(z == v) for v in np.unique(z)]
+    else:
+        groups = [np.arange(len(symbols))]
+    for idx in groups:
+        order = idx[rng.permutation(len(idx))]
+        start = 0
+        for sp, frac in alloy.items():
+            exact = frac * len(idx)
+            n = int(round(exact))
+            if per_layer and abs(exact - n) > 1e-9:
+                raise ValueError(f"structure.alloy {sp}: {frac} of a {len(idx)}-atom layer is "
+                                 f"not a whole number of atoms")
+            for i in order[start:start + n]:
+                symbols[i] = sp
+            start += n
     atoms.set_chemical_symbols(symbols)
 
 
@@ -1444,10 +1472,14 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
                     d0 = f"D0 = {r.D0_eV:.4f} eV ({src}), "
                 print(f"{s} reservoir ({type(r).__name__}): {d0}e_atom = {r.e_atom_eV:.4f} eV")
         if sgc:
-            field = ", ".join(f"{sp}: {d:+.4f}" for sp, d in zip(sgc["species"][1:], sgc["dmu"][1:]))
+            others = sgc["species"][1:]
+            field = "{" + ", ".join(f"{sp}: {d:+.4f}" for sp, d in zip(others, sgc["dmu"][1:])) + "} eV"
+            if any(sgc["log_ratio"]):
+                field += " + kT x {" + ", ".join(
+                    f"{sp}: {r:+.4f}" for sp, r in zip(others, sgc["log_ratio"][1:])) + "}"
             print(f"semi-grand-canonical substrate {sgc['species']}: {sgc['n_swappable']} "
                   f"swappable atoms {dict(zip(sgc['species'], sgc['counts']))}, "
-                  f"dmu vs {sgc['species'][0]} = {{{field}}} eV, "
+                  f"dmu vs {sgc['species'][0]} = {field}, "
                   f"{sgc['attempts_per_step']} identity attempts per step")
         n_mu = np.shape(mu_grid)[-1 if len(species) == 1 else -2]
         print(f"replica grid: {len(temperatures_K)} T x {n_mu} "
@@ -1471,16 +1503,22 @@ def _sgc_settings(config: Dict[str, Any], geometry: Any) -> Optional[Dict[str, A
     config : dict
         The parsed config; ``sgc`` has ``species`` (reference first),
         ``dmu_eV`` (``{species: mu_species - mu_reference}``, eV; the
-        reference may be omitted) and ``attempts_per_step`` (default 1).
+        reference may be omitted), ``attempts_per_step`` (default 1) and
+        optionally ``bulk_composition`` (``{species: x}`` of the bulk
+        reservoir: ``dmu_eV`` is then its energy part dE/dN at that
+        composition and the field at T is ``dmu_eV + kT ln(x_k / x_ref)``,
+        ideal mixing).
     geometry : SlabGeometry or ClusterGeometry
         The structure (its displaceable substrate is what swaps).
 
     Returns
     -------
     dict or None
-        ``species``, ``dmu`` (list, reference 0), ``attempts_per_step``,
-        ``counts`` (initial swappable atoms per species) and
-        ``n_swappable``; None without the section.
+        ``species``, ``dmu`` (list, reference 0), ``log_ratio``
+        (ln(x_k / x_ref), zeros without ``bulk_composition``),
+        ``bulk_composition``, ``attempts_per_step``, ``counts`` (initial
+        swappable atoms per species) and ``n_swappable``; None without the
+        section.
 
     Raises
     ------
@@ -1516,7 +1554,17 @@ def _sgc_settings(config: Dict[str, Any], geometry: Any) -> Optional[Dict[str, A
     attempts = int(sec.get("attempts_per_step", 1))
     if attempts < 1:
         raise ValueError("sgc.attempts_per_step must be at least 1")
+    log_ratio = [0.0] * len(species)
+    bulk = sec.get("bulk_composition")
+    if bulk:
+        if not isinstance(bulk, dict) or set(map(str, bulk)) != set(species):
+            raise ValueError(f"sgc.bulk_composition must give a fraction for each of {species}")
+        x = {str(k): _as_float(v, f"sgc.bulk_composition.{k}") for k, v in bulk.items()}
+        if any(v <= 0 for v in x.values()) or abs(sum(x.values()) - 1.0) > 1e-6:
+            raise ValueError(f"sgc.bulk_composition fractions must be positive and sum to 1, got {x}")
+        log_ratio = [float(np.log(x[sp] / x[species[0]])) for sp in species]
     return {"species": species, "dmu": [0.0] + [given[sp] for sp in species[1:]],
+            "log_ratio": log_ratio, "bulk_composition": bulk or None,
             "attempts_per_step": attempts, "counts": counts, "n_swappable": int(sum(counts))}
 
 
@@ -1661,6 +1709,7 @@ def run_from_config(config: Dict[str, Any], verbose: bool = True, resume: bool =
                              observables=_observables_from_config(config, setup["geometry"]),
                              sgc_dmu=setup["sgc"]["dmu"] if setup["sgc"] else None,
                              sgc_attempts=setup["sgc"]["attempts_per_step"] if setup["sgc"] else 1,
+                             sgc_log_ratio=setup["sgc"]["log_ratio"] if setup["sgc"] else None,
                              configurations_dir=conf_dir,
                              configurations_every=int(conf_cfg.get("every", 1)),
                              records_path=rec_path,
@@ -2419,7 +2468,9 @@ def analyze_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[st
                 top = frac[:, :, -1, j]
                 plot_map(T_grid_K, p_grid, top,
                          os.path.join(out_dir, f"{root}_{name}_{sp}{ext}"),
-                         valid=valid & np.isfinite(top), cmap="coolwarm", vmin=0.0, vmax=1.0,
+                         valid=valid & np.isfinite(top), cmap="coolwarm",
+                         vmin=float(np.nanmin(np.where(valid, top, np.nan))),
+                         vmax=float(np.nanmax(np.where(valid, top, np.nan))),
                          colorbar_label=f"{sp} fraction, {where}", xlabel=xlabel, ylabel=ylabel,
                          title=f"{sp} fraction in the {where} (MBAR)", invalid_label=invalid)
                 if verbose:
