@@ -628,7 +628,7 @@ $(m_k/m_1)^{3N_k/2}$, which is independent of $T$. $\Delta\mu_k$ is therefore *c
 i.e. mass-free, the quantity that sets alloy phase equilibria. For a random bulk alloy at
 $x = 1/2$ the ideal-mixing term $kT\ln[x/(1-x)]$ vanishes, so the $\Delta\mu$ of a 50-50
 reservoir is $\partial E/\partial N_k$ there and is independent of $T$ (regular solution;
-`examples/pdpt111_o_warp_nano/dmu_bulk.py`). Away from $x = 1/2$ the random-alloy reservoir has
+computed as the energy change of single swaps in a relaxed random 50-50 bulk cell). Away from $x = 1/2$ the random-alloy reservoir has
 
 $$
 \Delta\mu_k(T) = \frac{\partial E}{\partial N_k}\Big|_{\mathbf x}
