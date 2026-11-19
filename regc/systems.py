@@ -139,11 +139,12 @@ class ParticleSystem:
         self.mass_of_species = dict(mass_of_species) if mass_of_species else {}
         # semi-grand-canonical substrate (see `sgc_species`): off by default
         self.sgc_species: Tuple[str, ...] = ()
+        self.sgc_canonical = False
 
     # -- semi-grand-canonical substrate ------------------------------------------
-    def set_sgc_species(self, species: Sequence[str]) -> None:
+    def set_sgc_species(self, species: Sequence[str], canonical: bool = False) -> None:
         """
-        Make the displaceable substrate semi-grand-canonical.
+        Make the displaceable substrate semi-grand-canonical (or canonical).
 
         Substrate atoms of these species may change identity among them
         (`Replica._move_identity`), at fixed total number, under the
@@ -155,6 +156,11 @@ class ParticleSystem:
         ----------
         species : sequence of str
             At least two distinct labels; an empty sequence switches it off.
+        canonical : bool, optional
+            If True, identity moves exchange the species of two atoms
+            (`Replica._move_pair_swap`), so every species count stays fixed
+            and no chemical-potential field is needed: a canonical alloy,
+            e.g. a free nanoparticle of fixed composition. Default False.
 
         Raises
         ------
@@ -165,6 +171,7 @@ class ParticleSystem:
         if labels and (len(labels) < 2 or len(set(labels)) != len(labels)):
             raise ValueError(f"sgc species must be two or more distinct labels, got {labels}")
         self.sgc_species = labels
+        self.sgc_canonical = bool(canonical) and bool(labels)
         if labels:
             # room for the longest label (a '<U2' array would truncate a 3-letter one)
             width = max(len(s) for s in labels + tuple(map(str, self.substrate_species)) + ("",))
@@ -227,6 +234,43 @@ class ParticleSystem:
         finally:
             self.substrate_species[i] = old
         return u1 - u0
+
+    def generic_pair_swap_dU(self, i: int, j: int) -> float:
+        """
+        Energy change of exchanging the species of substrate atoms `i` and `j`.
+
+        Clone-mutate-recompute, as `generic_identity_dU`.
+
+        Parameters
+        ----------
+        i, j : int
+            Indices into the substrate arrays.
+
+        Returns
+        -------
+        float
+            U(swapped) - U(current).
+        """
+        u0 = self.calculator.total_energy(self)
+        si, sj = self.substrate_species[i], self.substrate_species[j]
+        self.substrate_species[i], self.substrate_species[j] = sj, si
+        try:
+            u1 = self.calculator.total_energy(self)
+        finally:
+            self.substrate_species[i], self.substrate_species[j] = si, sj
+        return u1 - u0
+
+    def apply_pair_swap(self, i: int, j: int) -> None:
+        """
+        Commit an accepted exchange of the species of substrate atoms `i` and `j`.
+
+        Parameters
+        ----------
+        i, j : int
+            Indices into the substrate arrays.
+        """
+        si, sj = self.substrate_species[i], self.substrate_species[j]
+        self.substrate_species[i], self.substrate_species[j] = sj, si
 
     def apply_identity(self, i: int, new_species: str) -> None:
         """

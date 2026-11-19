@@ -447,6 +447,9 @@ class Replica:
         species = getattr(sysm, 'sgc_species', ())
         if not species or self.state.sgc_dmu is None:
             return
+        if getattr(sysm, 'sgc_canonical', False):
+            self._move_pair_swap()
+            return
         candidates = sysm.sgc_candidates()
         if len(candidates) == 0:
             return
@@ -463,6 +466,39 @@ class Replica:
         self.n_attempts['identity'] = self.n_attempts.get('identity', 0) + 1
         if np.isfinite(log_arg) and (log_arg >= 0.0 or self.rng.random() < np.exp(log_arg)):
             sysm.apply_identity(i, new)
+            self.energy += du
+            self.n_accepts['identity'] = self.n_accepts.get('identity', 0) + 1
+
+    def _move_pair_swap(self) -> None:
+        """
+        Attempt one canonical identity move: exchange the species of two atoms.
+
+        Picks a swappable substrate atom i uniformly, then j uniformly among
+        the swappable atoms of a different species, and exchanges their
+        species. Every species count is unchanged, so the reverse move (j
+        then i, or i then j) has the same probability: the proposal is
+        symmetric and the acceptance is min(1, exp(-beta * dU)). Counted
+        under ``'identity'``; a no-op when all swappable atoms share one
+        species.
+
+        Returns
+        -------
+        None
+        """
+        sysm = self.system
+        candidates = sysm.sgc_candidates()
+        if len(candidates) < 2:
+            return
+        i = int(candidates[self.rng.integers(len(candidates))])
+        others = candidates[sysm.substrate_species[candidates] != sysm.substrate_species[i]]
+        if len(others) == 0:
+            return
+        j = int(others[self.rng.integers(len(others))])
+        du = sysm.generic_pair_swap_dU(i, j)
+        log_arg = -self.state.beta * du
+        self.n_attempts['identity'] = self.n_attempts.get('identity', 0) + 1
+        if np.isfinite(log_arg) and (log_arg >= 0.0 or self.rng.random() < np.exp(log_arg)):
+            sysm.apply_pair_swap(i, j)
             self.energy += du
             self.n_accepts['identity'] = self.n_accepts.get('identity', 0) + 1
 

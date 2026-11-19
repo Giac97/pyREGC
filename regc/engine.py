@@ -51,7 +51,8 @@ import numpy as np
 from .replica import Replica
 from .state import ThermoState
 from .systems import ParticleSystem
-from .observables import Observable, SGCCounts, check_observables, evaluate_observables
+from .observables import (LayerComposition, Observable, SGCCounts, check_observables,
+                          evaluate_observables)
 from .trajectory import snapshot
 from .units import SpeciesLambdaCubed
 
@@ -233,7 +234,8 @@ class ReplicaExchangeGCMC:
             Semi-grand-canonical substrate: the field mu_k - mu_ref, one
             value per ``system.sgc_species`` (reference first, 0), the same
             at every grid point (`ThermoState.sgc_dmu`). Required when the
-            systems have `sgc_species`, ignored otherwise. Each sample then
+            systems have `sgc_species`, ignored otherwise; with canonical
+            pair swaps (``system.sgc_canonical``) None or zeros. Each sample then
             also records the counts (`regc.observables.SGCCounts`, carrying
             the field for the analysis), and replica exchange includes
             the -(beta_a dmu_a - beta_b dmu_b) . (N_a - N_b) term
@@ -292,6 +294,7 @@ class ReplicaExchangeGCMC:
         # semi-grand-canonical substrate: same swappable species and total count everywhere
         self.sgc_species: Tuple[str, ...] = tuple(getattr(built[0][2], "sgc_species", ()))
         self.sgc_dmu = None
+        self.sgc_canonical = False
         if self.sgc_species:
             if any(tuple(getattr(sysm, "sgc_species", ())) != self.sgc_species
                    for _, _, sysm in built):
@@ -301,6 +304,19 @@ class ReplicaExchangeGCMC:
                 # the reference chemical potential cancels (docs Sec. 9)
                 raise ValueError("every system must hold the same number of swappable "
                                  "substrate atoms")
+            canonical = {bool(getattr(sysm, "sgc_canonical", False)) for _, _, sysm in built}
+            if len(canonical) != 1:
+                raise ValueError("every system must use the same identity move "
+                                 "(canonical pair swaps or semi-grand-canonical)")
+            self.sgc_canonical = canonical.pop()
+            if self.sgc_canonical:
+                if len({tuple(sysm.sgc_counts()) for _, _, sysm in built}) != 1:
+                    raise ValueError("canonical identity swaps need the same composition "
+                                     "in every system")
+                if sgc_dmu is not None and np.any(np.asarray(sgc_dmu, dtype=float) != 0.0):
+                    raise ValueError("canonical identity swaps keep every count fixed: "
+                                     "sgc_dmu must be None or zero")
+                sgc_dmu = np.zeros(len(self.sgc_species))
             if sgc_dmu is None:
                 raise ValueError(f"the systems are semi-grand-canonical in {self.sgc_species}: "
                                  f"pass sgc_dmu (one value per species, reference first)")
@@ -1514,7 +1530,7 @@ class ReplicaExchangeGCMC:
         from .observables import composition_fractions
         meta = self.observables_meta
         sizes = {o.name: o.size for o in self.observables
-                 if type(o).__name__ in ("SGCCounts", "LayerComposition")}
+                 if isinstance(o, (SGCCounts, LayerComposition))}
         names = list(sizes)
         mean_sw, mean_top, cur_sw, cur_top, acc, tr_sw, tr_top = [], [], [], [], [], [], []
         show = None

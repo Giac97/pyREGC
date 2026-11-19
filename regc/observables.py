@@ -804,6 +804,134 @@ class LayerComposition(Observable):
         return out.ravel()
 
 
+class ShellComposition(LayerComposition):
+    """
+    Number of atoms of each species in the core and on the surface of a cluster.
+
+    The cluster's atoms (frozen and displaceable substrate, never the
+    exchanged gas) are split by their coordination among themselves,
+    recomputed on every configuration: an atom with fewer than
+    `cn_surface` neighbours closer than `r_cut` is a surface atom, the
+    others are core atoms. Recorded as counts in the order (shell,
+    species), shell 0 the core and shell 1 the surface -- the same layout
+    as `LayerComposition`, the surface playing the top layer, so the
+    analysis and the monitor treat both alike.
+
+    Parameters
+    ----------
+    name : str
+        Observable name.
+    species : sequence of str
+        The species to count.
+    r_cut : float, optional
+        Metal-metal bond cutoff in Angstrom, between the first and second
+        neighbour shells. Default 3.3 (Au, Pt, Pd, Rh, Ir).
+    cn_surface : int, optional
+        Atoms with fewer neighbours are surface atoms. Default 10 (a
+        bulk atom has 12, a (100) facet atom 8, a (111) facet atom 9).
+    """
+
+    SHELLS = ("core", "surface")
+
+    def __init__(self, name: str, species: Sequence[str], r_cut: float = 3.3,
+                 cn_surface: int = 10):
+        """
+        Store the definition.
+
+        Parameters
+        ----------
+        name, species, r_cut, cn_surface
+            See the class docstring.
+
+        Raises
+        ------
+        ValueError
+            Without species, or on a non-positive cutoff.
+        """
+        self.name = name
+        self.species = [str(s) for s in species]
+        self.r_cut = float(r_cut)
+        self.cn_surface = int(cn_surface)
+        if not self.species:
+            raise ValueError("shell_composition needs species")
+        if self.r_cut <= 0:
+            raise ValueError(f"shell_composition r_cut must be positive, got {r_cut}")
+
+    @property
+    def n_layers(self) -> int:
+        """int: Number of shells (2: core, surface)."""
+        return len(self.SHELLS)
+
+    def labels(self) -> List[str]:
+        """
+        Names of the components.
+
+        Returns
+        -------
+        list of str
+            ``'<shell>:<species>'``, shell-major (core first).
+        """
+        return [f"{sh}:{s}" for sh in self.SHELLS for s in self.species]
+
+    def metadata(self) -> dict:
+        """
+        JSON-able description.
+
+        Returns
+        -------
+        dict
+            Type, labels, species, shells, cutoff and surface threshold.
+        """
+        return {"type": type(self).__name__, "labels": self.labels(), "species": self.species,
+                "shells": list(self.SHELLS), "r_cut": self.r_cut, "cn_surface": self.cn_surface}
+
+    def __call__(self, system) -> np.ndarray:
+        """
+        Evaluate on a configuration.
+
+        Parameters
+        ----------
+        system : ParticleSystem
+            The replica's current configuration.
+
+        Returns
+        -------
+        numpy.ndarray
+            The counts, length 2 * n_species.
+        """
+        pos, sp, groups = configuration_groups(system)
+        metal = groups != GROUP_MOBILE
+        p, sp = pos[metal], sp[metal]
+        d = np.linalg.norm(p[:, None, :] - p[None, :, :], axis=-1)
+        cn = np.count_nonzero(d < self.r_cut, axis=1) - 1      # minus the atom itself
+        shell = (cn < self.cn_surface).astype(int)              # 0 core, 1 surface
+        out = np.zeros((2, len(self.species)))
+        for j, s in enumerate(self.species):
+            out[:, j] = np.bincount(shell[sp == s], minlength=2)[:2]
+        return out.ravel()
+
+
+#: metadata types of the per-layer (or per-shell) composition observables
+COMPOSITION_TYPES = ("LayerComposition", "ShellComposition")
+
+
+def composition_layers(meta: dict) -> int:
+    """
+    Number of layers (or shells) of a composition observable, from its metadata.
+
+    Parameters
+    ----------
+    meta : dict
+        Metadata of a `LayerComposition` or `ShellComposition`.
+
+    Returns
+    -------
+    int
+        Its layer (shell) count; the last one is the top layer (surface).
+    """
+    return len(meta["layer_z"]) if "layer_z" in meta else len(meta["shells"])
+
+
 def composition_fractions(observables_meta: dict, values: Dict[str, np.ndarray],
                           species: Optional[str] = None) -> Optional[dict]:
     """
@@ -827,7 +955,8 @@ def composition_fractions(observables_meta: dict, values: Dict[str, np.ndarray],
         ``species`` (the one shown), ``sgc_species``, ``dmu``, ``swappable``
         (its fraction among the swappable substrate atoms, shape of the
         leading axes) and ``top`` (its fraction in the top layer of the
-        first `LayerComposition` observable that counts it, or None); None
+        first `LayerComposition` -- or on the surface of the first
+        `ShellComposition` -- observable that counts it, or None); None
         without semi-grand-canonical counts.
     """
     sgc = next((n for n, m in observables_meta.items() if m.get("type") == "SGCCounts"
@@ -843,8 +972,8 @@ def composition_fractions(observables_meta: dict, values: Dict[str, np.ndarray],
         swappable = np.where(total > 0, c[..., sgc_species.index(show)] / total, np.nan)
     top = None
     for n, m in observables_meta.items():
-        if m.get("type") == "LayerComposition" and n in values and show in m["species"]:
-            S, L = len(m["species"]), len(m["layer_z"])
+        if m.get("type") in COMPOSITION_TYPES and n in values and show in m["species"]:
+            S, L = len(m["species"]), composition_layers(m)
             a = np.asarray(values[n], dtype=float)
             a = a.reshape(a.shape[:-1] + (L, S))[..., -1, :]
             t = a.sum(axis=-1)
@@ -908,7 +1037,8 @@ def evaluate_observables(observables: Sequence[Observable], system) -> Dict[str,
 
 _TYPES = {"coordination": CoordinationNumber, "coordination_number": CoordinationNumber,
           "coordination_histogram": CoordinationHistogram, "rdf": RadialDistribution,
-          "radial_distribution": RadialDistribution, "layer_composition": LayerComposition}
+          "radial_distribution": RadialDistribution, "layer_composition": LayerComposition,
+          "shell_composition": ShellComposition}
 
 
 def observable_from_config(cfg: dict) -> Observable:
@@ -919,7 +1049,7 @@ def observable_from_config(cfg: dict) -> Observable:
     ----------
     cfg : dict
         ``{type: coordination | coordination_histogram | rdf |
-        layer_composition, name: ..., ...}`` with the class's keyword
+        layer_composition | shell_composition, name: ..., ...}`` with the class's keyword
         arguments (``z_range`` as a two-element list).
 
     Returns

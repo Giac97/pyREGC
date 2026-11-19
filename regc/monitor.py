@@ -39,6 +39,8 @@ from urllib.parse import unquote
 
 import numpy as np
 
+from .observables import COMPOSITION_TYPES
+
 STATUS_FILE = "status.json"
 STALE_S = 120.0          # no update for this long: the run is not progressing
 _SERVED = {".png": "image/png", ".svg": "image/svg+xml", ".json": "application/json",
@@ -156,7 +158,7 @@ def _samples_summary(path: str, trace_length: int = 400) -> Optional[dict]:
             keys = np.asarray(d["keys"], dtype=int)
             obs_meta = json.loads(str(d["observables_meta"])) if "observables_meta" in d else {}
             obs = {n: np.asarray(d["obs:" + n], dtype=float) for n, m in obs_meta.items()
-                   if m.get("type") in ("SGCCounts", "LayerComposition") and "obs:" + n in d}
+                   if m.get("type") in ("SGCCounts",) + COMPOSITION_TYPES and "obs:" + n in d}
     except (OSError, ValueError, KeyError):
         return None
     U, N = U.reshape(len(keys), -1), N.reshape(len(keys), -1)

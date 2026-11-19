@@ -75,6 +75,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .observables import COMPOSITION_TYPES, composition_layers
+
 #: One time unit of (Angstrom, amu, eV), in fs: HMC timesteps given in fs are divided by it.
 FS_PER_INTERNAL_TIME = 10.1805
 
@@ -96,7 +98,7 @@ def _available_cpus() -> int:
 _SECTIONS = {
     "structure": {"file", "build", "cluster", "geometry", "n_frozen_layers", "headroom_angstrom",
                   "layer_tol", "frozen", "full_coordination", "alloy", "alloy_seed", "alloy_per_layer"},
-    "sgc": {"species", "dmu_eV", "attempts_per_step", "bulk_composition"},
+    "sgc": {"species", "dmu_eV", "attempts_per_step", "bulk_composition", "ensemble"},
     "gas": {"species", "mass_amu", "insertion_z_range_above_surface",
             "insertion_shell_around_cluster", "composition"},
     "reservoir": {"type", "d0", "D0_eV", "e_atom_eV", "bond_length_angstrom",
@@ -441,9 +443,17 @@ def validate_config(config: Dict[str, Any]) -> None:
         sgc = config["sgc"] or {}
         if scheme != "regc":
             raise ValueError("the sgc section (identity swaps) needs replica_exchange.scheme: regc")
-        if "species" not in sgc or "dmu_eV" not in sgc:
-            raise ValueError("sgc needs 'species' (reference first, e.g. [Pd, Pt]) and 'dmu_eV' "
-                             "(e.g. {Pt: -0.5}: mu_Pt - mu_Pd)")
+        ens = str(sgc.get("ensemble", "semigrand")).lower()
+        if ens not in ("semigrand", "canonical"):
+            raise ValueError(f"sgc.ensemble must be 'semigrand' or 'canonical', got {ens!r}")
+        if "species" not in sgc:
+            raise ValueError("sgc needs 'species' (reference first, e.g. [Pd, Pt])")
+        if ens == "semigrand" and "dmu_eV" not in sgc:
+            raise ValueError("sgc needs 'dmu_eV' (e.g. {Pt: -0.5}: mu_Pt - mu_Pd), or "
+                             "ensemble: canonical (pair swaps at fixed composition)")
+        if ens == "canonical" and ("dmu_eV" in sgc or "bulk_composition" in sgc):
+            raise ValueError("sgc.ensemble: canonical keeps the composition fixed: "
+                             "drop dmu_eV and bulk_composition")
     struct = config["structure"]
     sources = [k for k in ("file", "build", "cluster") if k in struct]
     if len(sources) != 1:
@@ -1428,7 +1438,7 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
         system = geometry.make_system(calc_spec.make(cell, pbc), exchange, mass_of_species=masses,
                                       **region)
         if sgc:
-            system.set_sgc_species(sgc["species"])
+            system.set_sgc_species(sgc["species"], canonical=sgc["canonical"])
         return system
 
     scheme = _scheme(re_cfg)
@@ -1471,7 +1481,11 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
                     src = (r.calculator_info or {}).get("d0_source", "given")
                     d0 = f"D0 = {r.D0_eV:.4f} eV ({src}), "
                 print(f"{s} reservoir ({type(r).__name__}): {d0}e_atom = {r.e_atom_eV:.4f} eV")
-        if sgc:
+        if sgc and sgc["canonical"]:
+            print(f"canonical substrate alloy {sgc['species']}: {sgc['n_swappable']} "
+                  f"swappable atoms {dict(zip(sgc['species'], sgc['counts']))} (fixed), "
+                  f"{sgc['attempts_per_step']} pair-swap attempts per step")
+        elif sgc:
             others = sgc["species"][1:]
             field = "{" + ", ".join(f"{sp}: {d:+.4f}" for sp, d in zip(others, sgc["dmu"][1:])) + "} eV"
             if any(sgc["log_ratio"]):
@@ -1507,14 +1521,16 @@ def _sgc_settings(config: Dict[str, Any], geometry: Any) -> Optional[Dict[str, A
         optionally ``bulk_composition`` (``{species: x}`` of the bulk
         reservoir: ``dmu_eV`` is then its energy part dE/dN at that
         composition and the field at T is ``dmu_eV + kT ln(x_k / x_ref)``,
-        ideal mixing).
+        ideal mixing), or ``ensemble: canonical`` instead of the field:
+        pair swaps at fixed composition (a free nanoparticle).
     geometry : SlabGeometry or ClusterGeometry
         The structure (its displaceable substrate is what swaps).
 
     Returns
     -------
     dict or None
-        ``species``, ``dmu`` (list, reference 0), ``log_ratio``
+        ``species``, ``dmu`` (list, reference 0; zeros when canonical),
+        ``canonical`` (bool), ``log_ratio``
         (ln(x_k / x_ref), zeros without ``bulk_composition``),
         ``bulk_composition``, ``attempts_per_step``, ``counts`` (initial
         swappable atoms per species) and ``n_swappable``; None without the
@@ -1532,7 +1548,8 @@ def _sgc_settings(config: Dict[str, Any], geometry: Any) -> Optional[Dict[str, A
     species = [str(s) for s in sec["species"]]
     if len(species) < 2 or len(set(species)) != len(species):
         raise ValueError(f"sgc.species must be two or more distinct species, got {species}")
-    given = sec["dmu_eV"]
+    canonical = str(sec.get("ensemble", "semigrand")).lower() == "canonical"
+    given = {sp: 0.0 for sp in species[1:]} if canonical else sec["dmu_eV"]
     if not isinstance(given, dict):
         if len(species) != 2:
             raise ValueError("sgc.dmu_eV must map species to values with more than two species")
@@ -1564,6 +1581,7 @@ def _sgc_settings(config: Dict[str, Any], geometry: Any) -> Optional[Dict[str, A
             raise ValueError(f"sgc.bulk_composition fractions must be positive and sum to 1, got {x}")
         log_ratio = [float(np.log(x[sp] / x[species[0]])) for sp in species]
     return {"species": species, "dmu": [0.0] + [given[sp] for sp in species[1:]],
+            "canonical": canonical,
             "log_ratio": log_ratio, "bulk_composition": bulk or None,
             "attempts_per_step": attempts, "counts": counts, "n_swappable": int(sum(counts))}
 
@@ -2446,20 +2464,20 @@ def analyze_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[st
             total = h.sum(axis=-1, keepdims=True)
             with np.errstate(invalid="ignore", divide="ignore"):
                 raw[f"cn_hist_{name}"] = np.where(total > 0, h / total, np.nan)
-        elif kind in ("LayerComposition", "SGCCounts"):
+        elif kind in COMPOSITION_TYPES + ("SGCCounts",):
             # fractions as ratios of reweighted counts: <N_k> / <N>
             sp_list = list(m["species"])
             h = analysis.observable_map(name, T_grid_eV, p_grid, pressure=True)
-            if kind == "LayerComposition":
-                h = h.reshape(h.shape[:2] + (len(m["layer_z"]), len(sp_list)))
-                where = "top layer"
+            if kind in COMPOSITION_TYPES:
+                h = h.reshape(h.shape[:2] + (composition_layers(m), len(sp_list)))
+                where = "top layer" if kind == "LayerComposition" else "surface"
             else:
                 h = h[:, :, None, :]
                 where = "swappable substrate"
             total = h.sum(axis=-1, keepdims=True)
             with np.errstate(invalid="ignore", divide="ignore"):
                 frac = np.where(total > 0, h / total, np.nan)   # (n_T, n_p, n_layers, n_species)
-            key = "layer_fraction" if kind == "LayerComposition" else "sgc_fraction"
+            key = "layer_fraction" if kind in COMPOSITION_TYPES else "sgc_fraction"
             raw[f"{key}_{name}"] = frac
             raw[f"{key}_{name}_species"] = np.array(sp_list)
             result[f"{key}_{name}"] = frac

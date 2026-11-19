@@ -271,3 +271,97 @@ def test_per_layer_alloy_is_exact_in_every_layer():
         assert (sym[z == v] == "Pt").sum() == 4
     with pytest.raises(ValueError, match="whole number"):
         _substitute(fcc111("Pd", size=(4, 4, 4), a=3.9), {"Pt": 0.3}, seed=0, per_layer=True)
+
+
+# ---------------------------------------------------------------- canonical pair swaps
+class TwoSiteClassCalculator(Calculator):
+    """U = EPS for every B atom on an 'outer' site (the first N_OUT substrate atoms)."""
+
+    supports_incremental = False
+    EPS = 0.7
+
+    def total_energy(self, system) -> float:
+        return float(self.EPS * np.count_nonzero(np.asarray(system.substrate_species[:N_OUT]) == "B"))
+
+
+N_OUT, N_IN, N_B = 8, 12, 5
+
+
+def _canonical_slab(rng=None):
+    pos = np.random.default_rng(2).random((N_OUT + N_IN, 3)) * [8.0, 8.0, 1.0]
+    species = np.array(["B"] * N_B + ["A"] * (N_OUT + N_IN - N_B))   # B start outside
+    sysm = SlabSystem(8.0, 8.0, 3.0, TwoSiteClassCalculator(), exchange_species="X",
+                      substrate_positions=pos, substrate_species=species)
+    sysm.set_sgc_species(["A", "B"], canonical=True)
+    return sysm
+
+
+def _exact_outer_B(T):
+    from math import comb
+    k = np.arange(0, min(N_B, N_OUT) + 1)
+    w = np.array([comb(N_OUT, int(j)) * comb(N_IN, N_B - int(j)) for j in k], dtype=float)
+    w = w * np.exp(-TwoSiteClassCalculator.EPS * k / T)
+    return float((k * w).sum() / w.sum())
+
+
+def test_canonical_pair_swaps_are_exact():
+    sysm = _canonical_slab()
+    assert sysm.sgc_canonical
+    du = sysm.generic_pair_swap_dU(0, N_OUT)              # outer B <-> inner A
+    assert du == pytest.approx(-TwoSiteClassCalculator.EPS)
+    assert sysm.substrate_species[0] == "B"               # the trial left no trace
+    with pytest.raises(ValueError, match="zero"):
+        ReplicaExchangeGCMC([1.0], [-50.0], _canonical_slab, sgc_dmu=[0.0, 1.0])
+    temps = (0.3, 0.45, 0.7)
+    sim = ReplicaExchangeGCMC(list(temps), [-50.0], _canonical_slab, seed=5, sgc_attempts=1)
+    assert np.allclose(sim.sgc_dmu, 0.0) and sim.sgc_canonical
+    sim.run_regc(n_steps=20000, x0=0.5, diffusion="mc", diffusion_steps=1, record_every=5,
+                 burn_in_steps=500, verbose=False)
+    for it, T in enumerate(temps):
+        r = sim.grid[(it, 0)]
+        counts = np.asarray(sim.samples[(it, 0)]["obs:" + SGC_COUNTS_NAME])
+        assert np.all(counts == [N_OUT + N_IN - N_B, N_B])          # composition fixed
+        k = np.asarray(sim.samples[(it, 0)]["U"]) / TwoSiteClassCalculator.EPS
+        assert k.mean() == pytest.approx(_exact_outer_B(T), abs=0.08), (T, k.mean())
+        assert r.energy == pytest.approx(r.system.total_energy())
+    assert 0.0 < sim.grid[(1, 0)].acceptance_rates()["identity"] < 1.0
+
+
+def test_runner_canonical_section_validation():
+    from regc.runner import _sgc_settings, validate_config
+    base = {"structure": {"build": {}}, "gas": {"species": "O"},
+            "replica_exchange": {"temperatures_K": [300], "mu_eV": [-1.0], "scheme": "regc"}}
+    with pytest.raises(ValueError, match="drop dmu_eV"):
+        validate_config({**base, "sgc": {"species": ["Au", "Rh"], "ensemble": "canonical",
+                                         "dmu_eV": {"Rh": 0.1}}})
+    with pytest.raises(ValueError, match="ensemble"):
+        validate_config({**base, "sgc": {"species": ["Au", "Rh"], "ensemble": "grand"}})
+
+    class G:
+        substrate_species = np.array(["Au"] * 6 + ["Rh"] * 2)
+    s = _sgc_settings({"sgc": {"species": ["Au", "Rh"], "ensemble": "canonical"}}, G())
+    assert s["canonical"] and s["dmu"] == [0.0, 0.0] and s["counts"] == [6, 2]
+
+
+def test_shell_composition_splits_core_and_surface():
+    from ase.cluster import Icosahedron
+    from regc.observables import ShellComposition, composition_fractions, observable_from_config
+    atoms = Icosahedron("Au", noshells=3)                  # 55 atoms: 13 core, 42 surface
+    pos = atoms.positions - atoms.positions.mean(axis=0)
+    r = np.linalg.norm(pos, axis=1)
+    species = np.where(r < 1.0, "Rh", "Au")                # Rh at the centre
+    species[np.argmax(r)] = "Rh"                           # and one Rh vertex
+    sysm = SlabSystem(30.0, 30.0, 30.0, SiteCalculator(), exchange_species="X",
+                      substrate_positions=pos + 15.0, substrate_species=species,
+                      positions=np.array([[15.0, 15.0, 15.0 + r.max() + 2.0]]),
+                      species=np.array(["X"]))
+    obs = observable_from_config({"type": "shell_composition", "name": "shells",
+                                  "species": ["Au", "Rh"]})
+    assert isinstance(obs, ShellComposition)
+    assert obs.labels() == ["core:Au", "core:Rh", "surface:Au", "surface:Rh"]
+    counts = obs(sysm)                                     # the gas atom is not counted
+    assert counts.tolist() == [12.0, 1.0, 41.0, 1.0]
+    meta = {"shells": obs.metadata(), "sgc_counts": SGCCounts(["Au", "Rh"], [0.0, 0.0]).metadata()}
+    f = composition_fractions(meta, {"shells": counts[None], "sgc_counts": np.array([[53.0, 2.0]])},
+                              species="Rh")
+    assert f["top"][0] == pytest.approx(1 / 42)
