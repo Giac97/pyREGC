@@ -256,3 +256,24 @@ def test_runner_subsurface_end_to_end(tmp_path):
     for r in sim.grid.values():
         r.check_energy()
         assert abs(r.last_energy_drift) < 1e-8
+
+
+def test_engine_records_subsurface_counts_and_status(tmp_path):
+    """The subsurface count is recorded with every sample and published per replica in status.json."""
+    import json
+    from regc.observables import SUBSURFACE_COUNTS_NAME
+
+    def factory(rng):
+        return _slab(ncmc_steps=2, kernel_steps=0, weight=5.0)
+    sim = ReplicaExchangeGCMC([1.0, 1.5], np.array([[-1.0], [-1.5]]), factory, seed=0)
+    sim.save_status(str(tmp_path / "status.json"), interval_s=1e9)
+    sim.run_regc(300, x0=0.95, diffusion="mc", diffusion_steps=1, record_every=10,
+                 burn_in_steps=0, verbose=False)
+    counts = np.asarray(sim.samples[(0, 0)]["obs:" + SUBSURFACE_COUNTS_NAME])
+    assert counts.shape == (30, 1)
+    z = sim.grid[(0, 0)].system.positions[:, 2]
+    assert counts[-1, 0] == np.count_nonzero((z >= 1.5) & (z < 5.0))
+    reps = json.load(open(tmp_path / "status.json"))["replicas"]
+    for key in ("mean_N_sub", "current_N_sub", "sub_accepted", "sub_acceptance"):
+        assert key in reps and np.shape(reps[key]) == (2, 1)
+    assert sum(r.n_accepts.get("insert_sub:X", 0) for r in sim.grid.values()) > 0

@@ -773,8 +773,19 @@ One REGC step:
 3. **Record.** Every `record_every` steps after `burn_in_steps`, each
    replica records U, N, and `N_ads` / `N_s` where available.
 4. **Check convergence.** Every `convergence_every` steps, the run
-   compares the reduced-energy densities ρ(u) with the previous check.
-   It stops when the largest change is below `convergence_tol`.
+   checks the reduced-energy densities ρ(u).
+   - `convergence_mode="blocks"` (the API default): ρ(u) since the
+     previous check is compared with the interval before it, and the run
+     stops when the largest change is below `convergence_tol` (0.05).
+   - `convergence_mode="noise"` (the config default): the first and
+     second halves of all samples are compared, in units of the
+     distance a stationary chain would show. The run stops when the
+     largest ratio is below `convergence_tol` (3.0), the median below
+     `convergence_median_tol` (1.3), and every half holds at least
+     `convergence_min_neff` (10) independent samples.
+   Fixed blocks cannot pass when samples are strongly correlated: with
+   200-sample blocks and a statistical inefficiency of 60 the distance
+   stays near 0.4 however long the run.
 
 The return value is True if the run converged, otherwise False. [ZSG]
 use x0 = 0.99 for the LJ surface and 0.9 for Si clusters. 0.9 is a good
@@ -2615,7 +2626,11 @@ The ladder: give `temperatures_K` and **exactly one** of `pressures` or
 | `diffusion` | `mc` | `mc`, `mc_moves`, `hmc` or `md`. |
 | `diffusion_steps` | 10 | Units of diffusion per step. |
 | `burn_in_steps` | 0 | Steps before recording. Not allowed together with checkpoint chunks; use `phase_diagram.discard`. |
-| `convergence_every`, `convergence_tol` | off, 0.05 | ρ(u) convergence checks. |
+| `convergence_every` | off | ρ(u) convergence checks every this many steps. |
+| `convergence_mode` | `noise` | `noise`: halves of all samples, in units of the noise floor; `blocks`: consecutive blocks, absolute tolerance. |
+| `convergence_tol` | 3.0 (noise), 0.05 (blocks) | Largest replica ratio (noise) or largest change (blocks). |
+| `convergence_median_tol`, `convergence_min_neff`, `convergence_bins` | 1.3, 10, 10 | Noise mode: median ratio, independent samples per half, histogram bins (30 for blocks). |
+| `convergence_discard` | 0.2 | Noise mode: fraction of the earliest samples left out before halving (equilibration). |
 | `swap_types` | all four | Subset of `[T, mu, cross_left, cross_right]`. |
 | `displace_substrate` | false | With `mc`: move displaceable substrate atoms too. |
 | `md` | – | `{timestep_fs: 1.0, thermostat: bussi, taut_fs: 20.0, friction_per_fs: 0.01}` for `diffusion: md`. |
@@ -2956,7 +2971,7 @@ These are starting points; the convergence checks of §18 decide.
 | `max_disp` | 0.2–0.3 Å | Aim for 30–50% displacement acceptance. |
 | `record_every` | 10 | Samples closer than a few steps are strongly correlated. |
 | `n_steps` | 10⁴–10⁵ | Until the convergence checks pass. |
-| `convergence_every` | `n_steps / 10` | ρ(u) changes below `convergence_tol` = 0.05 stop the run. |
+| `convergence_every` | `n_steps / 10` | With `convergence_mode: noise`, the run stops once both halves agree within sampling noise everywhere. The check and its history are in `status.json` and on the monitor. |
 
 ### Timing
 

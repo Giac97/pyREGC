@@ -310,6 +310,39 @@ Two blocks of $n$ samples from one distribution still differ by roughly
 $\sqrt{\text{bins}/\pi n}$ from sampling noise, so `convergence_tol` must lie above that
 floor (fewer bins, or longer blocks). `n_steps` is a cap.
 `run_regc` returns whether the criterion was met, and `convergence_history` stores the values.
+
+**Noise-aware variant** (`convergence_mode="noise"`, the default in configs). Fixed blocks keep a
+constant noise floor however long the run, and correlated samples raise it further. With a
+statistical inefficiency $g$, a block of $n$ samples holds only $n/g$ independent ones. In the
+Pd(100) runs the median $g$ was about 60 samples, so a 200-sample block held about 3, and
+(15) stayed near 0.4 for 10 000 steps without any drift. The variant instead compares the
+**first and second half of all samples** of each replica (after dropping the earliest
+`convergence_discard` = 20% as equilibration), so the halves grow with the run. It
+measures their distance in units of the distance a stationary chain would show:
+
+$$
+r_k = \frac{\tfrac12\sum_b |\rho_k^{(1)}(b) - \rho_k^{(2)}(b)|}
+{\tfrac12\sqrt{2/\pi}\,\sum_b \sqrt{p_b(1-p_b)\,\big(g^{(1)}_b/N_1 + g^{(2)}_b/N_2\big)}},
+\qquad (15a)
+$$
+
+Here $p_b$ is the bin probability, $N_{1,2}$ are the sizes of the halves, and $g^{(1,2)}_b$ is the
+statistical inefficiency of bin $b$'s indicator series, estimated *within* each half about its own
+mean, so a shift between the halves is not absorbed as correlation
+(`diagnostics.rho_u_noise_tv`). For a stationary chain $r_k \approx 1$, with a 95th percentile of
+1.5 for independent samples and about 2 for correlated ones. A drift of 0.5 standard deviations
+over the run gives about 1.8, and a step of one standard deviation gives about 12. The run stops when
+
+$$
+\max_k r_k < \texttt{convergence\_tol}\ (3.0),\qquad
+\operatorname{median}_k r_k < \texttt{convergence\_median\_tol}\ (1.3),\qquad
+\min_k N/g \ge \texttt{convergence\_min\_neff}\ (10).
+$$
+
+The maximum catches strong drift in any replica: the largest of 64 stationary ratios is typically
+2.3–2.5. The median catches weak drift shared by many replicas. The last condition stops a run
+with very few independent samples from passing on a large floor
+(`ReplicaExchangeGCMC.rho_u_noise_check`, `tests/test_convergence.py`).
 `swap_acceptance()` reports the acceptance per pattern. [ZSG] tune the $(T,\mu)$ spacing to
 reach about 25%.
 

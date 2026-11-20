@@ -129,11 +129,13 @@ def _check_metadata(path: str, metadata: dict) -> None:
 def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
                          x0: float = 0.99, diffusion: str = "mc", diffusion_steps: int = 10,
                          record_every: int = 100, convergence_every: Optional[int] = None,
-                         convergence_tol: float = 0.05, time_limit: Optional[float] = None,
+                         convergence_tol: Optional[float] = None, time_limit: Optional[float] = None,
                          resume: bool = True, overwrite: bool = False,
                          metadata: Optional[dict] = None,
                          progress: Optional[Callable[[str], None]] = print,
-                         energy_tol: float = 1e-6,
+                         energy_tol: float = 1e-6, convergence_mode: str = "blocks",
+                         convergence_bins: Optional[int] = None, convergence_min_neff: float = 10.0,
+                         convergence_median_tol: float = 1.3, convergence_discard: float = 0.2,
                          **diffusion_kwargs) -> RunStatus:
     """
     Run `sim.run_regc` in checkpointed chunks.
@@ -157,10 +159,23 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
         Check rho(u) convergence every this many steps (rounded up to a
         multiple of `chunk`); also at the end. Default None: no checks.
     convergence_tol : float, optional
-        Converged when rho(u) of the samples since the last check and of
-        the interval before it differ (largest total-variation distance) by
-        less than this; see `ReplicaExchangeGCMC.rho_u_change` for the
-        noise floor. Default 0.05.
+        ``convergence_mode='blocks'``: converged when rho(u) of the samples
+        since the last check and of the interval before it differ (largest
+        total-variation distance) by less than this; see
+        `ReplicaExchangeGCMC.rho_u_change` for the noise floor. Default 0.05.
+        ``'noise'``: the largest ratio of the distance between the two
+        halves of all samples to its noise floor
+        (`ReplicaExchangeGCMC.rho_u_noise_check`). Default 3.0.
+    convergence_mode : str, optional
+        ``'blocks'`` (default) or ``'noise'``.
+    convergence_bins : int, optional
+        Histogram bins. Default 30 (blocks) or 10 (noise).
+    convergence_min_neff : float, optional
+        ``'noise'``: independent samples every half must hold. Default 10.
+    convergence_median_tol : float, optional
+        ``'noise'``: the median ratio over the grid must be below this. Default 1.3.
+    convergence_discard : float, optional
+        ``'noise'``: fraction of the earliest samples left out (equilibration). Default 0.2.
     time_limit : float, optional
         Seconds: stop (``finished=False``) before starting a chunk that is
         expected to end later than this, measured from the call. Default
@@ -217,6 +232,8 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
         done, n_at_last_check = extra["steps_done"], extra["n_at_last_check"]
         n_at_check_before = extra.get("n_at_check_before")
         changes, converged = list(extra["rho_u_changes"]), extra["converged"]
+        if changes and not sim.convergence_history:      # checkpoints written before the fix
+            sim.convergence_history = [float(c) for c in changes]
         if progress:
             progress(f"resumed from {ckpt} at step {done}")
     elif os.path.isfile(ckpt) and not overwrite:
@@ -226,8 +243,15 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
             json.dump(metadata, f, indent=1, default=float)
     resumed_from = done
 
+    mode, convergence_tol, convergence_bins = sim._convergence_defaults(
+        convergence_mode, convergence_tol, convergence_bins)
     if convergence_every is not None:
         convergence_every = max(chunk, -(-convergence_every // chunk) * chunk)
+        sim.convergence_settings = {"mode": mode, "tol": convergence_tol, "bins": convergence_bins,
+                                    "min_neff": float(convergence_min_neff),
+                                    "median_tol": float(convergence_median_tol),
+                                    "discard": float(convergence_discard),
+                                    "every": int(convergence_every)}
     t0, last_chunk = time.time(), 0.0
     while done < n_steps and not converged:
         if time_limit is not None and time.time() - t0 + 1.5 * last_chunk > time_limit:
@@ -248,14 +272,29 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
                           f"full recomputation (largest {d:.3g} at {k}); resynced. Persistent "
                           f"drift means the calculator's incremental and full energies disagree",
                           stacklevel=2)
-        if convergence_every is not None and (done % convergence_every == 0 or done >= n_steps):
+        detail = None
+        if (convergence_every is not None and mode == "noise"
+                and (done % convergence_every == 0 or done >= n_steps)):
+            detail = sim.rho_u_noise_check(convergence_bins, convergence_tol, convergence_min_neff,
+                                           convergence_median_tol, convergence_discard)
+            detail["step"] = int(done)
+            changes.append(detail["max_ratio"])
+            converged = detail["converged"]
+        elif convergence_every is not None and (done % convergence_every == 0 or done >= n_steps):
             n_now = len(next(iter(sim.samples.values()))['U'])
             if (n_at_check_before is not None and n_at_last_check - n_at_check_before >= 2
                     and n_now - n_at_last_check >= 2):
                 # disjoint blocks: since the last check vs the interval before it
-                changes.append(sim.rho_u_change(n_at_last_check, n_start=n_at_check_before))
+                changes.append(sim.rho_u_change(n_at_last_check, bins=convergence_bins,
+                                                n_start=n_at_check_before))
                 converged = changes[-1] < convergence_tol
+                detail = {"step": int(done), "max_change": changes[-1], "converged": converged}
             n_at_check_before, n_at_last_check = n_at_last_check, n_now
+        if detail is not None:
+            # publish the check: the engine's history (checkpoint) and status.json (monitor)
+            sim.convergence_history.append(float(changes[-1]))
+            sim.convergence_details.append(detail)
+            sim._maybe_write_status(n, n, "regc", force=True, converged=bool(converged))
         save_samples(sim, os.path.join(out_dir, SAMPLES_FILE))
         write_mixing(sim, os.path.join(out_dir, MIXING_FILE))
         sim.save_checkpoint(ckpt, extra={"steps_done": done, "n_at_last_check": n_at_last_check,
@@ -265,8 +304,16 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
         if progress:
             mean_n = sum(r.system.n for r in sim.grid.values()) / len(sim.grid)
             acc = ", ".join(f"{t} {a:.2f}" for t, a in sim.swap_acceptance().items())
+            conv = ""
+            if changes and mode == "noise" and sim.convergence_details:
+                d = sim.convergence_details[-1]
+                conv = (f"  rho(u) halves: TV/noise max {d['max_ratio']:.2f} (tol {convergence_tol:g})"
+                        f" median {d['median_ratio']:.2f} (tol {convergence_median_tol:g}),"
+                        f" min n_eff {d['min_neff']:.1f}")
+            elif changes:
+                conv = f"  rho(u) change {changes[-1]:.3f}"
             progress(f"{done:8d}/{n_steps} steps  {time.time() - t0:8.0f} s  mean N = {mean_n:7.2f}"
-                     f"  swap acc: {acc}" + (f"  rho(u) change {changes[-1]:.3f}" if changes else ""))
+                     f"  swap acc: {acc}" + conv)
     if converged and progress:
         progress("rho(u) converged; stopping")
     return RunStatus(done, True, converged, changes, resumed_from)

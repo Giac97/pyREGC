@@ -706,6 +706,84 @@ class SGCCounts(Observable):
 
 #: Reserved name under which the engine records the molecule counts.
 MOLECULE_COUNTS_NAME = "molecules"
+#: Reserved name under which the engine records the subsurface atom counts.
+SUBSURFACE_COUNTS_NAME = "subsurface"
+
+
+class SubsurfaceCounts(Observable):
+    """
+    Number of mobile atoms of each subsurface species inside the subsurface region.
+
+    Recorded automatically by `ReplicaExchangeGCMC` when the slab has
+    subsurface NCMC channels (`SlabSystem.set_subsurface`), under the reserved
+    name `SUBSURFACE_COUNTS_NAME`: the atoms with z_min <= z < z_cut,
+    whichever move put them there (subsurface insertions, or diffusion from
+    the surface). Reweighted like N, it gives subsurface coverage maps next
+    to the total adsorbed coverage.
+
+    Parameters
+    ----------
+    species : sequence of str
+        The subsurface species.
+    z_min, z_cut : float
+        The region (A).
+    """
+
+    def __init__(self, species: Sequence[str], z_min: float, z_cut: float):
+        """
+        Set up the counter.
+
+        Parameters
+        ----------
+        species : sequence of str
+            The subsurface species.
+        z_min, z_cut : float
+            The region (A).
+        """
+        self.name = SUBSURFACE_COUNTS_NAME
+        self.species = [str(s) for s in species]
+        self.z_min, self.z_cut = float(z_min), float(z_cut)
+
+    def labels(self) -> List[str]:
+        """
+        Names of the components.
+
+        Returns
+        -------
+        list of str
+            The species.
+        """
+        return list(self.species)
+
+    def metadata(self) -> dict:
+        """
+        JSON-able description.
+
+        Returns
+        -------
+        dict
+            Type, labels, species and the region.
+        """
+        return dict(super().metadata(), species=self.species, z_min=self.z_min, z_cut=self.z_cut)
+
+    def __call__(self, system) -> np.ndarray:
+        """
+        Evaluate on a configuration.
+
+        Parameters
+        ----------
+        system : ParticleSystem
+            The replica's current configuration.
+
+        Returns
+        -------
+        numpy.ndarray
+            One count per species, as floats.
+        """
+        z = system.positions[:, 2] if system.n else np.zeros(0)
+        inside = (z >= self.z_min) & (z < self.z_cut)
+        return np.array([np.count_nonzero(inside & (system.species == s)) for s in self.species],
+                        dtype=float)
 
 
 class MoleculeCounts(Observable):
@@ -1087,8 +1165,10 @@ def check_observables(observables: Optional[Sequence[Observable]]) -> List[Obser
             continue  # the engine's own record of the semi-grand-canonical counts
         if n == MOLECULE_COUNTS_NAME and isinstance(o, MoleculeCounts):
             continue  # the engine's own record of the molecule counts
-        if (n in RESERVED_NAMES or n in (SGC_COUNTS_NAME, MOLECULE_COUNTS_NAME) or ":" in n
-                or not n):
+        if n == SUBSURFACE_COUNTS_NAME and isinstance(o, SubsurfaceCounts):
+            continue  # the engine's own record of the subsurface counts
+        if (n in RESERVED_NAMES or n in (SGC_COUNTS_NAME, MOLECULE_COUNTS_NAME,
+                                         SUBSURFACE_COUNTS_NAME) or ":" in n or not n):
             raise ValueError(f"observable name {n!r} is reserved or invalid "
                              f"(reserved: {sorted(RESERVED_NAMES)}; no ':')")
     if len(set(names)) != len(names):

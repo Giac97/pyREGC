@@ -146,7 +146,10 @@ _RE_COMMON = {"temperatures_K", "mu_eV", "pressures", "pressure_unit", "scheme",
               "max_disp", "n_workers", "adsorbed_cutoff", "hmc", "record_every"}
 _RE_SCHEME = {
     "regc": {"n_steps", "x0", "diffusion", "diffusion_steps", "burn_in_steps",
-             "convergence_every", "convergence_tol", "swap_types", "displace_substrate", "md"},
+             "convergence_every", "convergence_tol", "convergence_mode", "convergence_bins",
+             "convergence_min_neff", "convergence_median_tol", "convergence_discard", "swap_types",
+             "displace_substrate",
+             "md"},
     "sweep": {"n_cycles", "sweeps_per_cycle", "exchange_every", "burn_in_cycles",
               "diagonal_swaps", "p_displace", "p_insert", "p_delete", "p_displace_substrate"},
 }
@@ -1939,6 +1942,56 @@ def _sgc_settings(config: Dict[str, Any], geometry: Any) -> Optional[Dict[str, A
 # =============================================================================
 # Sampling
 # =============================================================================
+def _convergence_settings(re_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    The rho(u) convergence keys of ``replica_exchange``.
+
+    ``convergence_mode`` defaults to ``noise`` in configs (the noise-aware
+    criterion, `ReplicaExchangeGCMC.rho_u_noise_check`); ``blocks`` is the
+    original fixed-block test. In ``noise`` mode ``convergence_tol`` bounds
+    the largest replica's ratio to the noise floor (default 3.0) and
+    ``convergence_median_tol`` the median one (default 1.3), so a value
+    below 1 can practically never be met; a warning says so.
+
+    Parameters
+    ----------
+    re_cfg : dict
+        The ``replica_exchange`` section.
+
+    Returns
+    -------
+    dict
+        ``convergence_mode``, ``convergence_tol``, ``convergence_bins``,
+        ``convergence_min_neff``, ``convergence_median_tol``, ``convergence_discard`` for
+        `run_with_checkpoints` / `run_regc`.
+
+    Raises
+    ------
+    ValueError
+        On an unknown mode.
+    """
+    mode = str(re_cfg.get("convergence_mode", "noise")).lower()
+    if mode not in ("noise", "blocks"):
+        raise ValueError(f"replica_exchange.convergence_mode must be noise or blocks, got {mode!r}")
+    tol = re_cfg.get("convergence_tol")
+    tol = None if tol is None else _as_float(tol, "replica_exchange.convergence_tol")
+    if mode == "noise" and tol is not None and tol < 1.0 and re_cfg.get("convergence_every"):
+        warnings.warn(f"replica_exchange.convergence_tol = {tol} with convergence_mode: noise is a "
+                      f"multiple of the sampling-noise floor (default 3 for the largest replica); "
+                      f"below 1 the run will "
+                      f"practically never stop early. Use convergence_mode: blocks for the old "
+                      f"absolute tolerance", stacklevel=2)
+    bins = re_cfg.get("convergence_bins")
+    return {"convergence_mode": mode, "convergence_tol": tol,
+            "convergence_bins": None if bins is None else int(bins),
+            "convergence_min_neff": _as_float(re_cfg.get("convergence_min_neff", 10.0),
+                                              "replica_exchange.convergence_min_neff"),
+            "convergence_median_tol": _as_float(re_cfg.get("convergence_median_tol", 1.3),
+                                                "replica_exchange.convergence_median_tol"),
+            "convergence_discard": _as_float(re_cfg.get("convergence_discard", 0.2),
+                                             "replica_exchange.convergence_discard")}
+
+
 def _hmc_settings(re_cfg: Dict[str, Any]) -> Tuple[bool, int, float]:
     """
     HMC options of the ``replica_exchange.hmc`` block.
@@ -2102,8 +2155,7 @@ def run_from_config(config: Dict[str, Any], verbose: bool = True, resume: bool =
                           diffusion=diffusion, diffusion_steps=int(re_cfg.get("diffusion_steps", 10)),
                           record_every=int(re_cfg.get("record_every", 100)),
                           convergence_every=re_cfg.get("convergence_every"),
-                          convergence_tol=_as_float(re_cfg.get("convergence_tol", 0.05),
-                                                    "replica_exchange.convergence_tol"))
+                          **_convergence_settings(re_cfg))
             burn_in = int(re_cfg.get("burn_in_steps", 0))
             if "checkpoint" in config:
                 ck = config["checkpoint"] or {}
@@ -2810,6 +2862,17 @@ def analyze_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[st
             total = h.sum(axis=-1, keepdims=True)
             with np.errstate(invalid="ignore", divide="ignore"):
                 raw[f"cn_hist_{name}"] = np.where(total > 0, h / total, np.nan)
+        elif kind == "SubsurfaceCounts":
+            h = analysis.observable_map(name, T_grid_eV, p_grid, pressure=True)
+            for j, sp in enumerate(m["species"]):
+                sub_map = h[:, :, j] / norm
+                result[f"subsurface_{sp}"] = raw[f"subsurface_{sp}"] = sub_map
+                plot_map(T_grid_K, p_grid, sub_map, os.path.join(out_dir, f"{root}_subsurface_{sp}{ext}"),
+                         valid=valid, cmap="viridis",
+                         colorbar_label=f"subsurface {sp} per {per.replace('_', ' ')}",
+                         xlabel=xlabel, ylabel=ylabel,
+                         title=f"Subsurface {sp} ({m['z_min']:.2f} <= z < {m['z_cut']:.2f} A)",
+                         invalid_label=invalid)
         elif kind in COMPOSITION_TYPES + ("SGCCounts",):
             # fractions as ratios of reweighted counts: <N_k> / <N>
             sp_list = list(m["species"])

@@ -76,6 +76,65 @@ def statistical_inefficiency(x, c: float = 5.0) -> float:
     return float(max(1.0, g[m]))
 
 
+def rho_u_noise_tv(u, bins: int = 10) -> Dict[str, float]:
+    """
+    Noise-aware comparison of the first and second half of a reduced-energy series.
+
+    The two halves of `u` (N1 and N2 samples) are histogrammed on common
+    bins and compared by their total-variation distance
+    TV = 0.5 sum_k |p1_k - p2_k|. For a stationary chain, the difference in
+    bin k is approximately normal with variance
+    p_k (1 - p_k) (g1_k / N1 + g2_k / N2), where p_k is the bin probability
+    and g_k the statistical inefficiency of the bin's indicator series
+    within each half (`statistical_inefficiency`). So the expected
+    distance -- the noise floor -- is
+    0.5 sqrt(2/pi) sum_k sqrt(p_k (1 - p_k) (g1_k / N1 + g2_k / N2)).
+    The inefficiencies are estimated inside each half, about its own mean,
+    so a shift between the halves is not mistaken for slow correlation.
+    TV / floor is about 1 for a stationary chain and well above 1 when the
+    halves differ (drift, or slow modes not yet sampled). The halves grow
+    with the run, so the floor falls as 1/sqrt(N), unlike a comparison of
+    fixed-length blocks.
+
+    Parameters
+    ----------
+    u : array_like
+        Reduced energies of one state, in recording order.
+    bins : int, optional
+        Histogram bins. Default 10.
+
+    Returns
+    -------
+    dict
+        ``tv``, ``floor``, ``ratio`` (tv / floor), ``g`` (statistical
+        inefficiency of u, mean of the two halves) and ``n_eff`` (the smaller
+        number of independent samples of the two halves, N / g). For fewer
+        than 8 samples or a constant series: ratio 0 and n_eff 0.
+    """
+    u = np.asarray(u, dtype=float)
+    n = u.size
+    if n < 8 or np.ptp(u) == 0.0:
+        return {"tv": 0.0, "floor": float("inf"), "ratio": 0.0, "g": 1.0, "n_eff": 0.0}
+    h = n // 2
+    halves = (u[:h], u[h:])
+    edges = np.histogram_bin_edges(u, bins=bins)
+    idx = [np.clip(np.searchsorted(edges, x, side="right") - 1, 0, bins - 1) for x in halves]
+    counts = [np.bincount(i, minlength=bins) for i in idx]
+    p1, p2 = counts[0] / len(halves[0]), counts[1] / len(halves[1])
+    tv = 0.5 * float(np.abs(p1 - p2).sum())
+    p = (counts[0] + counts[1]) / n
+    var = np.zeros(bins)
+    for k in np.flatnonzero((p > 0) & (p < 1)):
+        g1 = statistical_inefficiency((idx[0] == k).astype(float))
+        g2 = statistical_inefficiency((idx[1] == k).astype(float))
+        var[k] = p[k] * (1.0 - p[k]) * (g1 / len(halves[0]) + g2 / len(halves[1]))
+    floor = float(0.5 * np.sqrt(2.0 / np.pi) * np.sqrt(var).sum())
+    g = 0.5 * (statistical_inefficiency(halves[0]) + statistical_inefficiency(halves[1]))
+    n_eff = min(len(halves[0]), len(halves[1])) / g
+    ratio = tv / floor if floor > 0 else 0.0
+    return {"tv": tv, "floor": floor, "ratio": float(ratio), "g": float(g), "n_eff": float(n_eff)}
+
+
 def replica_inefficiencies(source, lambda_cubed_of_T: Optional[Callable] = None) -> Dict:
     """
     Statistical inefficiency of N, U and the reduced potential, per replica.

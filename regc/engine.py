@@ -51,8 +51,8 @@ import numpy as np
 from .replica import Replica
 from .state import ThermoState
 from .systems import ParticleSystem
-from .observables import (LayerComposition, MoleculeCounts, Observable, SGCCounts,
-                          check_observables, evaluate_observables)
+from .observables import (SUBSURFACE_COUNTS_NAME, LayerComposition, MoleculeCounts, Observable,
+                          SGCCounts, SubsurfaceCounts, check_observables, evaluate_observables)
 from .trajectory import snapshot
 from .units import SpeciesLambdaCubed
 
@@ -353,6 +353,9 @@ class ReplicaExchangeGCMC:
             raise ValueError("every system from system_factory must use the same subsurface "
                              "settings (SlabSystem.set_subsurface)")
         self.subsurface = sub
+        if sub is not None:
+            self.observables = check_observables(
+                self.observables + [SubsurfaceCounts(sub.species, sub.z_min, sub.z_cut)])
 
         self.grid: Dict[Tuple[int, int], Replica] = {}
         self.samples: Dict[Tuple[int, int], Dict[str, list]] = {}
@@ -386,6 +389,9 @@ class ReplicaExchangeGCMC:
         self.rng = np.random.default_rng(master_rng.integers(0, 2 ** 62))
         self.swap_stats = {t: [0, 0] for t in SWAP_TYPES}  # type -> [attempts, accepts]
         self.convergence_history: List[float] = []
+        # noise-aware checks: one summary dict per check (see rho_u_noise_check)
+        self.convergence_details: List[dict] = []
+        self.convergence_settings: Optional[dict] = None
         self._init_walkers()
     @staticmethod
     def _parse_mus(mus_arr: np.ndarray, n_T: int, n_species: int) -> np.ndarray:
@@ -909,8 +915,10 @@ class ReplicaExchangeGCMC:
     def run_regc(self, n_steps: int, x0: float = 0.99, diffusion: str = 'mc',
                  diffusion_steps: int = 10, record_every: int = 100, burn_in_steps: int = 0,
                  swap_types: Tuple[str, ...] = SWAP_TYPES,
-                 convergence_every: Optional[int] = None, convergence_tol: float = 0.05,
-                 convergence_bins: int = 30, verbose: bool = True,
+                 convergence_every: Optional[int] = None, convergence_tol: Optional[float] = None,
+                 convergence_bins: Optional[int] = None, verbose: bool = True,
+                 convergence_mode: str = "blocks", convergence_min_neff: float = 10.0,
+                 convergence_median_tol: float = 1.3, convergence_discard: float = 0.2,
                  trajectory_dir: Optional[str] = None, trajectory_every: Optional[int] = None,
                  **diffusion_kwargs) -> bool:
         """
@@ -968,15 +976,31 @@ class ReplicaExchangeGCMC:
             Check convergence every this many steps (rounded to a multiple
             of `record_every`). Default is None (no check; run `n_steps`).
         convergence_tol : float, optional
-            Converged when the largest total-variation distance between the
-            rho(u) of the two latest inter-check blocks, over all grid
-            points, is below this. Default is 0.05. Two blocks of n samples
-            from the same distribution still differ by roughly
-            sqrt(convergence_bins / (pi n)) from sampling noise alone, so the
-            tolerance must lie above that floor (fewer bins or longer blocks).
-            The first verdict needs three checks.
+            ``convergence_mode='blocks'``: converged when the largest
+            total-variation distance between the rho(u) of the two latest
+            inter-check blocks, over all grid points, is below this (default
+            0.05). Two blocks of n samples from the same distribution still
+            differ by roughly sqrt(convergence_bins / (pi n)) from sampling
+            noise alone, and correlated samples count less, so with short
+            blocks this can never be met; the first verdict needs three
+            checks. ``convergence_mode='noise'``: the largest ratio of that
+            distance (first vs second half of all samples) to its expected
+            noise floor (`rho_u_noise_check`); default 3.0.
         convergence_bins : int, optional
-            Histogram bins for rho(u). Default is 30.
+            Histogram bins for rho(u). Default 30 (blocks) or 10 (noise).
+        convergence_mode : str, optional
+            ``'blocks'`` ([ZSG]'s criterion on consecutive fixed blocks; the
+            default, unchanged) or ``'noise'`` (growing halves, tolerance in
+            units of the noise floor, see `rho_u_noise_check`).
+        convergence_min_neff : float, optional
+            ``'noise'`` only: every replica's halves must hold at least this
+            many independent samples before the run may stop. Default 10.
+        convergence_median_tol : float, optional
+            ``'noise'`` only: the median ratio over the grid must also be below
+            this. Default 1.3.
+        convergence_discard : float, optional
+            ``'noise'`` only: fraction of the earliest samples left out of the
+            halves (equilibration). Default 0.2.
         verbose : bool, optional
             Print progress about ten times over the run. Default is True.
         trajectory_dir : str, optional
@@ -996,8 +1020,8 @@ class ReplicaExchangeGCMC:
         Raises
         ------
         ValueError
-            If `x0` is outside [0, 1] or `swap_types` contains an unknown
-            pattern.
+            If `x0` is outside [0, 1], `swap_types` contains an unknown
+            pattern or `convergence_mode` is unknown.
         """
         if not 0.0 <= x0 <= 1.0:
             raise ValueError(f"x0 must be in [0, 1], got {x0}")
@@ -1008,6 +1032,15 @@ class ReplicaExchangeGCMC:
             trajectory_every = record_every
         if convergence_every is not None:
             convergence_every = max(record_every, (convergence_every // record_every) * record_every)
+        mode, convergence_tol, convergence_bins = self._convergence_defaults(
+            convergence_mode, convergence_tol, convergence_bins)
+        if convergence_every is not None:
+            self.convergence_settings = {"mode": mode, "tol": convergence_tol,
+                                         "bins": convergence_bins,
+                                         "min_neff": float(convergence_min_neff),
+                                         "median_tol": float(convergence_median_tol),
+                                         "discard": float(convergence_discard),
+                                         "every": int(convergence_every)}
         n_at_last_check = n_at_check_before = None
 
         def needs_main_process(step: int) -> bool:
@@ -1088,6 +1121,22 @@ class ReplicaExchangeGCMC:
             # check if a convergence check is set and terminate run if reached and at least the burn_in steps 
             # have already been performed
             if (convergence_every is not None and step > burn_in_steps
+                    and step % convergence_every == 0 and mode == "noise"):
+                res = self.rho_u_noise_check(convergence_bins, convergence_tol,
+                                             convergence_min_neff, convergence_median_tol,
+                                             convergence_discard)
+                res["step"] = int(self._status_offset + step)
+                self.convergence_history.append(res["max_ratio"])
+                self.convergence_details.append(res)
+                if verbose:
+                    print(f"step {step:7d} | rho(u) halves: TV/noise max {res['max_ratio']:.2f} "
+                          f"(tol {convergence_tol:g}), median {res['median_ratio']:.2f} "
+                          f"(tol {convergence_median_tol:g}), min n_eff {res['min_neff']:.1f}")
+                if res["converged"]:
+                    self._flush_records()
+                    self._maybe_write_status(step, n_steps, "regc", force=True, converged=True)
+                    return True
+            elif (convergence_every is not None and step > burn_in_steps
                     and step % convergence_every == 0):
                 n_now = len(next(iter(self.samples.values()))['U'])
                 if (n_at_check_before is not None and n_at_last_check - n_at_check_before >= 2
@@ -1104,6 +1153,119 @@ class ReplicaExchangeGCMC:
                 n_at_check_before, n_at_last_check = n_at_last_check, n_now
         self._flush_records()
         return False
+
+    @staticmethod
+    def _convergence_defaults(mode: str, tol: Optional[float], bins: Optional[int]
+                              ) -> Tuple[str, float, int]:
+        """
+        Resolve the convergence mode and its default tolerance and bins.
+
+        Parameters
+        ----------
+        mode : str
+            ``'blocks'`` or ``'noise'``.
+        tol : float or None
+            The tolerance (None: 0.05 for blocks, 3.0 for noise).
+        bins : int or None
+            Histogram bins (None: 30 for blocks, 10 for noise).
+
+        Returns
+        -------
+        tuple
+            ``(mode, tol, bins)``.
+
+        Raises
+        ------
+        ValueError
+            On an unknown mode.
+        """
+        mode = str(mode).lower()
+        if mode not in ("blocks", "noise"):
+            raise ValueError(f"convergence_mode must be 'blocks' or 'noise', got {mode!r}")
+        if tol is None:
+            tol = 0.05 if mode == "blocks" else 3.0
+        if bins is None:
+            bins = 30 if mode == "blocks" else 10
+        return mode, float(tol), int(bins)
+
+    def _reduced_energies(self, key: Tuple[int, int]) -> np.ndarray:
+        """
+        Reduced energies u = beta (U - mu . N) + N . ln Lambda^3 of a grid point's samples.
+
+        Parameters
+        ----------
+        key : tuple of int
+            The grid point.
+
+        Returns
+        -------
+        numpy.ndarray
+            One value per recorded sample.
+        """
+        r = self.grid[key]
+        U = np.asarray(self.samples[key]['U'], dtype=float)
+        if self.n_species == 1:
+            N = np.asarray(self.samples[key]['N'], dtype=float)
+            return r.state.beta * (U - r.state.mu * N) + N * np.log(r.state.lambda_cubed)
+        N_s = np.asarray(self.samples[key]['N_s'], dtype=float).reshape(-1, self.n_species)
+        return (r.state.beta * U
+                + N_s @ (np.log(r.state.lambda_cubed_vec) - r.state.beta * r.state.mu_vec))
+
+    def rho_u_noise_check(self, bins: int = 10, tol: float = 3.0, min_neff: float = 10.0,
+                          median_tol: float = 1.3, discard: float = 0.2) -> dict:
+        """
+        Noise-aware rho(u) convergence: both halves of every replica agree within sampling noise.
+
+        For every grid point the reduced energies of all recorded samples are
+        split into a first and a second half and compared by
+        `regc.diagnostics.rho_u_noise_tv`: the total-variation distance in
+        units of the distance two halves of a stationary chain with the same
+        statistical inefficiency would show. The halves grow with the run,
+        so the noise floor falls as 1/sqrt(n) (consecutive fixed blocks,
+        `rho_u_change`, keep a constant floor however long the run).
+
+        Parameters
+        ----------
+        bins : int, optional
+            Histogram bins. Default 10.
+        tol : float, optional
+            Converged when every ratio is below this (strong drift in any
+            replica). Default 3.0: for a stationary chain each ratio is about
+            1 with a 95th percentile near 2 when samples are correlated, so the
+            largest of 64 is typically 2.3-2.5.
+        min_neff : float, optional
+            ... every half holds at least this many independent samples
+            (otherwise the floor is so high that any chain passes). Default 10.
+        median_tol : float, optional
+            ... and the median ratio over the grid is below this (weak drift
+            shared by many replicas, which the maximum cannot resolve).
+            Default 1.3.
+        discard : float, optional
+            Fraction of the earliest samples left out before halving (the
+            equilibration transient). Default 0.2.
+
+        Returns
+        -------
+        dict
+            ``max_ratio``, ``median_ratio``, ``worst`` (grid point of the
+            largest ratio), ``min_neff``, ``n_samples``, ``converged`` and
+            ``ratios`` (one per grid point, in grid-key order).
+        """
+        from .diagnostics import rho_u_noise_tv
+        keys = sorted(self.grid)
+        res = {}
+        for k in keys:
+            u = self._reduced_energies(k)
+            res[k] = rho_u_noise_tv(u[int(discard * len(u)):], bins)
+        ratios = np.array([res[k]["ratio"] for k in keys])
+        neff = np.array([res[k]["n_eff"] for k in keys])
+        worst = keys[int(np.argmax(ratios))]
+        return {"max_ratio": float(ratios.max()), "median_ratio": float(np.median(ratios)),
+                "worst": list(worst), "min_neff": float(neff.min()),
+                "n_samples": int(len(self.samples[keys[0]]['U'])),
+                "converged": bool(ratios.max() < tol and np.median(ratios) < median_tol
+                                  and neff.min() >= min_neff),
+                "ratios": [float(x) for x in ratios]}
 
     def rho_u_change(self, n_prev: int, bins: int = 30, n_start: int = 0) -> float:
         """
@@ -1205,6 +1367,8 @@ class ReplicaExchangeGCMC:
                        "walker_last_end": self.walker_last_end,
                        "skip_empty_swaps": self.skip_empty_swaps,
                        "convergence_history": self.convergence_history,
+                       "convergence_details": self.convergence_details,
+                       "convergence_settings": self.convergence_settings,
                        "rng_state": self.rng.bit_generator.state, "extra": extra or {}}, path)
 
     def load_checkpoint(self, path: str) -> dict:
@@ -1278,6 +1442,8 @@ class ReplicaExchangeGCMC:
                           f"calculator's energies", stacklevel=2)
         self.grid, self.samples = st["grid"], st["samples"]
         self.swap_stats, self.convergence_history = st["swap_stats"], st["convergence_history"]
+        self.convergence_details = st.get("convergence_details", [])
+        self.convergence_settings = st.get("convergence_settings")
         self.rng.bit_generator.state = st["rng_state"]
         # keep the RE-move draw of the run being continued (bit-identical continuation)
         self.skip_empty_swaps = bool(st.get("skip_empty_swaps", False))
@@ -1483,8 +1649,11 @@ class ReplicaExchangeGCMC:
             return [[None if not np.isfinite(x) else float(x) for x in row] for row in out]
 
         n_samples, mean_N, std_N, mean_U = [], [], [], []
+        mean_N_ads, mean_N_sub, current_N_sub, sub_acc, sub_att = [], [], [], [], []
         traces_N, traces_U = [], []
         stride = 1
+        sub = getattr(self, "subsurface", None)
+        sub_moves = {"insert": [0, 0], "delete": [0, 0]}  # [attempts, accepts], whole grid
         for k in keys:
             v = self.samples[k]
             N = np.asarray(v["N"], dtype=float)
@@ -1494,10 +1663,30 @@ class ReplicaExchangeGCMC:
             std_N.append(N.std() if N.size > 1 else np.nan)
             mean_U.append(U.mean() if U.size else np.nan)
             stride = max(stride, int(np.ceil(N.size / self.TRACE_LENGTH)))
+            if "N_ads" in v:
+                a = np.asarray(v["N_ads"], dtype=float)
+                mean_N_ads.append(a.mean() if a.size else np.nan)
+            if sub is not None:
+                s = np.asarray(v.get("obs:" + SUBSURFACE_COUNTS_NAME, []), dtype=float)
+                mean_N_sub.append(s.reshape(len(s), -1).sum(1).mean() if len(s) else np.nan)
+                r = self.grid[k]
+                current_N_sub.append(float(np.count_nonzero(sub.in_region(r.system.positions)))
+                                     if r.system.n else 0.0)
+                sub_att.append(sum(n for m, n in r.n_attempts.items() if ":" in m and "sub:" in m))
+                sub_acc.append(sum(n for m, n in r.n_accepts.items() if ":" in m and "sub:" in m))
+                for move in ("insert", "delete"):
+                    pre = f"{move}_sub:"
+                    sub_moves[move][0] += sum(n for m, n in r.n_attempts.items() if m.startswith(pre))
+                    sub_moves[move][1] += sum(n for m, n in r.n_accepts.items() if m.startswith(pre))
+        traces_sub = []
         for k in keys:
             v = self.samples[k]
             traces_N.append([float(x) for x in np.asarray(v["N"], dtype=float)[::stride]])
             traces_U.append([float(x) for x in np.asarray(v["U"], dtype=float)[::stride]])
+            if sub is not None:
+                s = np.asarray(v.get("obs:" + SUBSURFACE_COUNTS_NAME, []), dtype=float)
+                traces_sub.append([float(x) for x in s.reshape(len(s), -1).sum(1)[::stride]]
+                                  if len(s) else [])
         total = self._status_total if self._status_total is not None else n_steps
         trips = self.round_trip_counts()
         att = {t: int(a) for t, (a, _) in self.swap_stats.items()}
@@ -1511,13 +1700,36 @@ class ReplicaExchangeGCMC:
             "replicas": {"n_samples": grid_of(n_samples), "mean_N": grid_of(mean_N),
                          "std_N": grid_of(std_N), "mean_U": grid_of(mean_U),
                          "current_N": grid_of([self.grid[k].system.n for k in keys]),
-                         "current_U": grid_of([self.grid[k].energy for k in keys])},
-            "traces": {"stride": stride, "N": traces_N, "U": traces_U},
+                         "current_U": grid_of([self.grid[k].energy for k in keys]),
+                         **({"mean_N_ads": grid_of(mean_N_ads)} if len(mean_N_ads) == len(keys)
+                            else {}),
+                         **({"mean_N_sub": grid_of(mean_N_sub),
+                             "current_N_sub": grid_of(current_N_sub),
+                             "sub_accepted": grid_of(sub_acc),
+                             "sub_acceptance": grid_of([a / t if t else np.nan
+                                                        for a, t in zip(sub_acc, sub_att)])}
+                            if sub is not None else {})},
+            "traces": {"stride": stride, "N": traces_N, "U": traces_U,
+                       **({"N_sub": traces_sub} if sub is not None else {})},
+            # whole-grid subsurface totals: atoms in the region now, NCMC moves so far
+            "subsurface": None if sub is None else {
+                "species": list(sub.species), "z_min": float(sub.z_min), "z_cut": float(sub.z_cut),
+                "n_now": int(sum(current_N_sub)),
+                "replicas_occupied": int(sum(1 for x in current_N_sub if x > 0)),
+                "insert_attempts": int(sub_moves["insert"][0]),
+                "inserted": int(sub_moves["insert"][1]),
+                "delete_attempts": int(sub_moves["delete"][0]),
+                "removed": int(sub_moves["delete"][1])},
             "swap_acceptance": self.swap_acceptance(), "swap_attempts": att,
             "pairs": [{"a": list(a), "b": list(b), "attempts": int(n), "acceptance": float(acc)}
                       for (a, b), (n, acc) in sorted(self.pair_acceptance().items())],
             "round_trips_T": trips["T"].tolist(), "round_trips_mu": trips["mu"].tolist(),
             "convergence_history": [float(c) for c in self.convergence_history],
+            "convergence": {"settings": self.convergence_settings,
+                            "checks": [{k: v for k, v in c.items() if k != "ratios"}
+                                       for c in self.convergence_details],
+                            "latest_ratios": (self.convergence_details[-1].get("ratios")
+                                              if self.convergence_details else None)},
             "records": None if self.records_path is None else {
                 "path": os.path.abspath(self.records_path), "potential": self.records_potential,
                 "every": self.records_every},

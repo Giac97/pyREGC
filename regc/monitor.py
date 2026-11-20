@@ -635,7 +635,10 @@ white-space:pre-wrap}.plot{width:100%;height:300px}.imgs{display:flex;flex-wrap:
 <section class="card"><h2>Replica grid</h2><div class="row"><select id="gridq">
 <option value="mean_N">mean N</option><option value="current_N">current N</option>
 <option value="std_N">std of N</option><option value="n_samples">samples</option>
-<option value="mean_U">mean U (eV)</option><option value="current_U">current U (eV)</option></select>
+<option value="mean_U">mean U (eV)</option><option value="current_U">current U (eV)</option>
+<option value="mean_N_ads">mean N adsorbed</option><option value="mean_N_sub">mean N subsurface</option>
+<option value="current_N_sub">current N subsurface</option><option value="sub_accepted">subsurface moves accepted</option>
+<option value="sub_acceptance">subsurface acceptance</option></select>
 <span class="note">click a cell to show its traces</span></div><div id="grid" class="plot"></div></section>
 <section class="card"><h2>Traces <span id="tracekey" class="muted"></span></h2><div id="traces" class="plot"></div></section>
 <section class="card" id="compcard" hidden><h2>Substrate composition</h2><div class="row"><select id="compq"></select>
@@ -646,7 +649,7 @@ white-space:pre-wrap}.plot{width:100%;height:300px}.imgs{display:flex;flex-wrap:
 <section class="card"><h2>Replica exchange</h2><div id="swaps" class="plot" style="height:220px"></div>
 <div id="pairs"></div></section>
 <section class="card"><h2>Round trips per walker</h2><div id="trips" class="plot"></div></section>
-<section class="card"><h2>Convergence: largest change of ρ(u)</h2><div id="conv" class="plot"></div></section>
+<section class="card"><h2>Convergence of ρ(u)</h2><div id="conv" class="plot"></div></section>
 <section class="card"><h2>Available data</h2><div id="data"></div></section>
 <section class="card wide" id="imgcard" hidden><h2>Plots</h2><div class="imgs" id="imgs"></div></section>
 <section class="card wide"><h2>Log <span id="logname" class="muted"></span></h2><pre id="log"></pre></section>
@@ -680,6 +683,9 @@ const k=[["step",d.step!=null?`${d.step.toLocaleString()} / ${d.n_steps.toLocale
 ["rate",d.rate?fmtN(d.rate,3)+" steps/s":"–"],["remaining",d.state=="running"||d.state=="quiet"?fmtT(d.eta_s):"–"],
 ["elapsed",st&&st.started?fmtT(st.time-st.started):"–"],["mean N now",fmtN(d.mean_N,3)],
 ["replicas",nrep??"–"],["samples / replica",ns??"–"]];
+const ss=st&&st.subsurface;if(ss){const sp=ss.species.join("+");k.push([`subsurface ${sp} now (all replicas)`,`${ss.n_now} in ${ss.replicas_occupied}`],
+["subsurface insertions accepted",`${ss.inserted.toLocaleString()} / ${ss.insert_attempts.toLocaleString()}`],
+["subsurface removals accepted",`${ss.removed.toLocaleString()} / ${ss.delete_attempts.toLocaleString()}`])}
 $("kpis").innerHTML=k.map(([a,b])=>`<div class="kpi"><b>${b}</b><span>${a}</span></div>`).join("");
 $("where").textContent=d.directory+(d.log?"  ·  log "+d.log.path:"")+(st?"":"  ·  no status.json: progress from the log only (run started without the heartbeat)");
 drawGrid(d);drawTraces(d);drawComp(d);drawHist(d);drawSwaps(d);drawConv(d);drawData(d);
@@ -691,7 +697,7 @@ const s=d.samples;if(!s||!d.metadata)return null;const nT=d.metadata.temperature
 nM=Math.max(...keys.map(k=>k[1]))+1;const q=$("gridq").value,src={mean_N:s.mean_N,std_N:s.std_N,mean_U:s.mean_U}[q];
 if(!src)return null;const z=[...Array(nT)].map(()=>Array(nM).fill(null));keys.forEach((k,i)=>z[k[0]][k[1]]=src[i]);
 return {st:{shape:[nT,nM],temperatures:d.metadata.temperatures_K,mu_grid:d.metadata.mu_grid_eV,labels:{}},z}}
-function drawGrid(d){const g=gridData(d);if(!g){Plotly.purge("grid");$("grid").innerHTML='<p class="note">Per-replica data appear with status.json (new runs) or samples.npz (checkpoints, end of run).</p>';return}
+function drawGrid(d){const g=gridData(d);if(!g||!g.z){Plotly.purge("grid");$("grid").innerHTML=g?'<p class="note">Not recorded in this run (adsorbed_cutoff / subsurface section).</p>':'<p class="note">Per-replica data appear with status.json (new runs) or samples.npz (checkpoints, end of run).</p>';return}
 const a=axes(g.st,d.metadata);const text=g.z.map(r=>r.map(v=>v==null?"":fmtN(v,3)));
 Plotly.react("grid",[{type:"heatmap",z:g.z,x:a.x,y:a.y,colorscale:"Viridis",text,texttemplate:"%{text}",
 hovertemplate:"%{y}, %{x}<br>%{z}<extra></extra>",colorbar:{thickness:10}}],
@@ -703,7 +709,8 @@ if(!tr){Plotly.purge("traces");$("tracekey").textContent="";return}if(!sel)sel=k
 let i=keys.findIndex(k=>k[0]==sel[0]&&k[1]==sel[1]);if(i<0)i=0;const x=tr.N[i].map((_,j)=>j*tr.stride);
 $("tracekey").textContent=`replica (${keys[i][0]}, ${keys[i][1]}) · ${tr.stride>1?"every "+tr.stride+"th sample":"all samples"}`;
 Plotly.react("traces",[{x,y:tr.N[i],name:"N",mode:"lines",line:{color:css("--accent"),width:1.2}},
-{x,y:tr.U[i],name:"U (eV)",yaxis:"y2",mode:"lines",line:{color:css("--warn"),width:1,dash:"dot"}}],
+{x,y:tr.U[i],name:"U (eV)",yaxis:"y2",mode:"lines",line:{color:css("--warn"),width:1,dash:"dot"}},
+...(tr.N_sub&&tr.N_sub[i]&&tr.N_sub[i].length?[{x,y:tr.N_sub[i],name:"N subsurface",mode:"lines",line:{color:css("--ok"),width:1.2}}]:[])],
 layout({xaxis:{title:"sample"},yaxis:{title:"N"},yaxis2:{title:"U (eV)",overlaying:"y",side:"right",showgrid:false},margin:{l:48,r:60,t:8,b:42}}),cfg)}
 function compSt(d,c){if(d.status)return d.status;const m=d.metadata||{},z=c.grids.mean_swappable;
 return {shape:[z.length,z[0].length],temperatures:m.temperatures_K||z.map((_,i)=>i),mu_grid:m.mu_grid_eV||[z[0]],labels:{}}}
@@ -746,7 +753,14 @@ Plotly.react("trips",[{type:"bar",x:w,y:T,name:"along T",marker:{color:css("--ac
 layout({barmode:"group",xaxis:{title:"walker"},yaxis:{title:"half round trips"}}),cfg)}
 function drawConv(d){const c=(d.status&&d.status.convergence_history)||[];if(!c.length){Plotly.purge("conv");
 $("conv").innerHTML='<p class="note">No convergence checks yet (replica_exchange.convergence_every).</p>';return}
-Plotly.react("conv",[{y:c,x:c.map((_,i)=>i+1),mode:"lines+markers",line:{color:css("--accent")}}],layout({xaxis:{title:"check"},yaxis:{title:"max |Δρ(u)|",rangemode:"tozero"}}),cfg)}
+const cv=(d.status&&d.status.convergence)||{},st=cv.settings||{},noise=st.mode==="noise";
+const tr=[{y:c,x:c.map((_,i)=>i+1),mode:"lines+markers",name:noise?"max TV / noise floor":"max |Δρ(u)|",line:{color:css("--accent")}}];
+if(st.tol!=null)tr.push({y:c.map(()=>st.tol),x:c.map((_,i)=>i+1),mode:"lines",name:noise?"tolerance (max)":"tolerance",line:{color:css("--ok"),dash:"dash"}});
+if(noise){const ch=cv.checks||[];if(ch.length){tr.push({y:ch.map(x=>x.median_ratio),x:ch.map((_,i)=>i+1),mode:"lines+markers",name:"median TV / noise floor",line:{color:css("--warn")||"#d08c00"}});
+if(st.median_tol!=null)tr.push({y:ch.map(()=>st.median_tol),x:ch.map((_,i)=>i+1),mode:"lines",name:"tolerance (median)",line:{color:css("--warn")||"#d08c00",dash:"dot"}})}}
+const last=(cv.checks||[]).slice(-1)[0];
+Plotly.react("conv",tr,layout({xaxis:{title:"check"},yaxis:{title:noise?"max TV / noise floor (halves)":"max |Δρ(u)| (blocks)",rangemode:"tozero"},
+title:last&&last.min_neff!=null?{text:`min n_eff ${last.min_neff.toFixed(1)}${st.min_neff!=null?" (need "+st.min_neff+")":""}`,font:{size:11}}:undefined}),cfg)}
 function drawData(d){const desc={"status.json":"live heartbeat","samples.npz":"samples (at the last checkpoint)",
 "checkpoint.pkl":"checkpoint","run_metadata.json":"setup","mixing.json":"swap statistics","records.h5":"per-sample records",
 "phase_diagram_data.npz":"analysis results"};
