@@ -1585,8 +1585,69 @@ theta_cl = analysis.phase_diagram_Tp(T_grid, p_grid, area=geometry.n_surface, ob
   separates an O-rich and a Cl-rich phase with the same total coverage.
 - **Coexistence:** `locate_coexistence_mu` is disabled with several
   species; scan `pN` along the path instead.
-- **Scope:** only atoms are exchanged. Molecules such as CO, and swaps
-  of substrate atoms, are not implemented.
+- **Molecules:** CO, CH4 and other molecules are inserted and deleted
+  as blocks of atoms; see §10.1.
+
+### 10.1 Molecules (CO, O2, CH4, ...)
+
+A pure CO gas fixes only μ_C + μ_O, so CO cannot be exchanged atom by
+atom. `MoleculeMove` inserts and deletes a molecule as a block of
+atoms. The atoms keep their elemental chemical potentials, so replica
+exchange, MBAR and the sample files work as in §10: `N_C` and `N_O` are
+recorded, and `obs:molecules` counts the intact molecules. The moves
+are exact (docs/REGC_algorithm.md §10). HMC or MD may stretch, break and
+re-form the bonds. A molecule whose atoms have drifted out of the
+bonding shell can no longer be deleted as a unit. Atomic moves, where
+they are enabled, can still exchange those atoms.
+
+`MolecularGas` is the reservoir. It relaxes the molecule with the
+simulation's potential and takes the vibrations from that potential's
+Hessian. Rotation (linear or not, symmetry number) and spin (3 for O2)
+are standard ideal-gas terms. `MolecularGasFeed` turns a gas mixture at
+fixed mole fractions into elemental μ's. Each gas g fixes ν_g · μ = μ_g.
+
+```python
+from regc import MolecularGas, MolecularGasFeed, MoleculeMove
+
+ase_calc = ...                                        # the simulation potential as an ASE calculator
+co = MolecularGas.from_calculator(ase_calc, "CO")     # relaxed, Hessian vibrations, sigma = 1
+o2 = MolecularGas.from_calculator(ase_calc, "O2")     # spin multiplicity 3, sigma = 2
+feed = MolecularGasFeed(["C", "O"], [co, o2], [0.5, 0.5])
+mus = feed.mu_grid(T_K, p_bar, unit="bar")            # (n_T, n_p, 2): mu_C, mu_O
+
+move = MoleculeMove("CO", co.symbols, co.positions_angstrom)   # anchor C, shell 0.75-1.25 x bond
+
+def factory(rng):
+    s = geometry.make_system(calc, ["C", "O"], insertion_z_range=zr)
+    s.set_molecules([move], atomic_exchange=["O"])    # CO as molecules, O also atom by atom
+    return s
+
+sim = ReplicaExchangeGCMC([kelvin_to_eV(T) for T in T_K], mus, factory,
+                          lambda_cubed_of_T=feed.lambda_cubed_of_T())
+analysis = MBARSurfaceAnalysis(samples, mu_of_Tp=functools.partial(feed.mu_at_T_eV, unit="bar"))
+```
+
+- **Channels:** each GC attempt picks a molecule (relative weight
+  `MoleculeMove(weight=...)`) or an atomically exchanged species
+  (weight 1), then inserts or deletes through it.
+- **Which μ's are fixed:** a pure CO feed fixes only μ_C + μ_O. That is
+  enough for CO moves but not for atomic C or O moves, and
+  `feed.check_moves` refuses those. Adding O2 fixes both.
+- **No linearly dependent gases:** CO, O2 and CO2 together share
+  elemental μ's only at gas-phase equilibrium, so `MolecularGasFeed`
+  refuses them. One gas per independent composition is the constrained
+  equilibrium of atomistic thermodynamics.
+- **Shape:** only star-shaped molecules are supported, with every atom
+  bonded to one anchor atom: CO, O2, N2, CO2, H2O, NH3, CH4. The shell
+  (default 0.75 to 1.25 times the bond lengths) defines both where
+  partners are proposed and what counts as an intact molecule.
+- **Proposal widths:** `bond_sigma` (0.05 Å) and `angle_sigma_deg`
+  (10°) only affect efficiency. Values near the potential's thermal
+  fluctuations give the best acceptance.
+- **Check the gas molecule:** many potentials describe gas-phase
+  molecules poorly. `from_calculator` refuses a geometry that is not a
+  minimum, as happens with EMT's CH4 and CO2. Compare `gas.energy_eV`
+  and `gas.vib_wavenumbers_cm` with experiment before a long run.
 
 ## 11. Worked examples
 
@@ -2354,7 +2415,8 @@ gas:
 | `mass_amu` | ASE tables | Atomic mass: a number, or a mapping per species. |
 | `insertion_z_range_above_surface` | whole box | Slab only: `[lo, hi]` in Å above the topmost slab atom. Insertions and deletions happen only there. It must lie inside the box; raise `headroom_angstrom` if not. |
 | `insertion_shell_around_cluster` | whole box | Cluster only: `[d_in, d_out]` in Å from the cluster radius (its outermost atom); negative values reach inside. Insertions and deletions happen only in that spherical shell. It must fit in the box; raise `headroom_angstrom` if not. |
-| `composition` | – | Feed mole fractions per species, e.g. `{O: 0.999, Cl: 0.001}`. Required with several species when pressures are used. |
+| `composition` | – | Feed mole fractions per species, e.g. `{O: 0.999, Cl: 0.001}`. Required with several species when pressures are used. Not used with a `molecules` section. |
+| `atomic_exchange` | none | With a `molecules` section: species that are also inserted and deleted atom by atom, e.g. `[O]` next to CO + O2. Their μ must be fixed by the gases. |
 
 ### 14.3 `calculator`
 
@@ -2411,6 +2473,41 @@ species, key the section by species: `reservoir: {O: {...}, Cl: {...}}`.
 
 The reservoir is built when the ladder uses `pressures`, or when there
 is a `phase_diagram` or `reservoir` section.
+
+### 14.4b `molecules`
+
+Gases of molecules, and optionally their molecular insertion and
+deletion moves (§10.1). This section replaces `reservoir` and
+`gas.composition`. `gas.species` lists the exchanged elements, such as
+`[C, O]`. The ladder's `pressures` and the phase diagram are in total
+pressure.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `template` | – | An `ase.build.molecule` name (`CO`, `O2`, `CH4`, `H2O`, ...) or a structure file. It is relaxed with the potential. |
+| `fraction` | 1 | Mole fraction in the feed. Fractions are normalised. |
+| `insert` | `true` | Use the gas as a molecular move. With `false` it only fixes μ, e.g. O2 next to `atomic_exchange: [O]`. |
+| `anchor` | element with the fewest atoms (alphabetical on a tie) | Element of the anchor atom. |
+| `shell_angstrom` | 0.75–1.25 × bond lengths | Partner distances from the anchor, both for proposals and for what counts as a molecule. |
+| `bond_sigma_angstrom` | 0.05 | Width of the bond-length proposal. |
+| `angle_sigma_deg` | 10 | Width of the direction proposals. |
+| `weight` | 1 | Relative frequency among the GC channels. Each atomic species has weight 1. |
+| `symmetry_number` | tabulated | Rotational symmetry number (CO 1, O2 2, H2O 2, NH3 3, CH4 12, ...). |
+| `spin_multiplicity` | 3 for O2, else 1 | Electronic ground-state degeneracy. |
+| `vibrational_wavenumbers_cm` | from the Hessian | Use these instead, e.g. experimental values. |
+| `energy_eV` | from the potential | Energy of the molecule. Required, with the vibrations, for `LJ` and `PairLJ`, which cannot relax a molecule. |
+
+```yaml
+gas:
+  species: [C, O]
+  atomic_exchange: [O]                    # O atoms too (dissociated O2)
+  insertion_z_range_above_surface: [0.5, 4.0]
+molecules:
+  CO: {template: CO, fraction: 0.5}
+  O2: {template: O2, fraction: 0.5, insert: false}
+phase_diagram:
+  observable: N_C                         # CO coverage; obs:molecules counts intact CO
+```
 
 ### 14.5 `replica_exchange`
 

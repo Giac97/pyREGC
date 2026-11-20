@@ -848,3 +848,629 @@ class DiatomicReservoir(Reservoir):
         return cls(D0, info["e_atom_eV"], mass_molecule_amu, bond_length_angstrom,
                    vib_wavenumber_cm, symmetry_number, int(electronic_degeneracy),
                    calculator_info=info)
+
+
+# =============================================================================
+# Polyatomic gases and the elemental chemical potentials of a gas feed
+# =============================================================================
+#: Rotational symmetry numbers of common gas molecules (point-group order of rotations).
+SYMMETRY_NUMBERS = {"H2": 2, "N2": 2, "O2": 2, "F2": 2, "Cl2": 2, "CO": 1, "NO": 1, "HCl": 1,
+                    "HF": 1, "CO2": 2, "H2O": 2, "H2S": 2, "SO2": 2, "NO2": 2, "N2O": 1,
+                    "NH3": 3, "CH4": 12, "C2H2": 2, "C2H4": 4, "C2H6": 6}
+#: Spin multiplicity (electronic ground-state degeneracy) of open-shell gas molecules.
+SPIN_MULTIPLICITIES = {"O2": 3, "NO": 2, "NO2": 2}
+
+
+def molecular_gas_mu_eV(T_kelvin: float, p_pascal: float, energy_eV: float, mass_amu: float,
+                        moments_amu_A2: Sequence[float], vib_wavenumbers_cm: Sequence[float],
+                        symmetry_number: int = 1, spin_multiplicity: int = 1) -> float:
+    """
+    Chemical potential of an ideal polyatomic gas on a potential's energy scale.
+
+    mu = E + ZPE + k_B T ln(p / p0) - k_B T ln(g q_rot q_vib), with p0 =
+    k_B T / Lambda^3 of the molecule, a classical rigid rotor (linear or
+    not) and harmonic vibrations counted from v = 0. For a diatomic this is
+    exactly `diatomic_gas_mu_eV` shifted by E + ZPE = 2 e_atom - D0.
+
+    Parameters
+    ----------
+    T_kelvin : float
+        Temperature, in Kelvin.
+    p_pascal : float
+        Partial pressure of the gas, in Pascal.
+    energy_eV : float
+        Energy of the relaxed molecule with the potential, in eV.
+    mass_amu : float
+        Molecular mass, in amu.
+    moments_amu_A2 : sequence of float
+        Principal moments of inertia, amu A^2 (all ~0 for an atom, one ~0
+        for a linear molecule).
+    vib_wavenumbers_cm : sequence of float
+        Vibrational wavenumbers, cm^-1 (3n - 5 or 3n - 6 of them).
+    symmetry_number : int, optional
+        Rotational symmetry number. Default 1.
+    spin_multiplicity : int, optional
+        Electronic ground-state degeneracy. Default 1.
+
+    Returns
+    -------
+    float
+        mu of the molecule, in eV.
+    """
+    p0, q_int, zpe = _molecular_p0_q_zpe(T_kelvin, mass_amu, moments_amu_A2, vib_wavenumbers_cm,
+                                        symmetry_number, spin_multiplicity)
+    return energy_eV + zpe + kelvin_to_eV(T_kelvin) * (math.log(p_pascal / p0) - math.log(q_int))
+
+
+def _molecular_p0_q_zpe(T_kelvin: float, mass_amu: float, moments_amu_A2: Sequence[float],
+                        vib_wavenumbers_cm: Sequence[float], symmetry_number: int,
+                        spin_multiplicity: int) -> Tuple[float, float, float]:
+    """
+    Reference pressure, internal partition function and zero-point energy.
+
+    Parameters
+    ----------
+    T_kelvin : float
+        Temperature, in Kelvin.
+    mass_amu : float
+        Molecular mass, in amu.
+    moments_amu_A2 : sequence of float
+        Principal moments of inertia, amu A^2.
+    vib_wavenumbers_cm : sequence of float
+        Vibrational wavenumbers, cm^-1.
+    symmetry_number : int
+        Rotational symmetry number.
+    spin_multiplicity : int
+        Electronic ground-state degeneracy.
+
+    Returns
+    -------
+    tuple of float
+        ``(p0_pascal, q_internal, zpe_eV)``.
+    """
+    lam = thermal_wavelength_angstrom(T_kelvin, mass_amu) * 1.0e-10
+    p0 = BOLTZMANN_K_SI * T_kelvin / lam ** 3
+    moments = np.sort(np.asarray(moments_amu_A2, dtype=float))
+    to_si = AMU * 1.0e-20
+    q_rot = 1.0
+    if moments[-1] > 1e-8:
+        theta = PLANCK_HBAR ** 2 / (2.0 * np.maximum(moments, 1e-30) * to_si * BOLTZMANN_K_SI)
+        if moments[0] < 1e-3 * moments[-1]:            # linear
+            q_rot = T_kelvin / (symmetry_number * theta[-1])
+        else:
+            q_rot = (math.sqrt(math.pi) / symmetry_number
+                     * math.sqrt(T_kelvin ** 3 / float(np.prod(theta))))
+    q_vib, zpe = 1.0, 0.0
+    for w in vib_wavenumbers_cm:
+        theta_v = PLANCK_H * float(w) * SPEED_OF_LIGHT_CM_PER_S / BOLTZMANN_K_SI
+        q_vib /= 1.0 - math.exp(-theta_v / T_kelvin)
+        zpe += 0.5 * PLANCK_H * float(w) * SPEED_OF_LIGHT_CM_PER_S / EV_IN_JOULES
+    return p0, spin_multiplicity * q_rot * q_vib, zpe
+
+
+@dataclass
+class MolecularGas(Reservoir):
+    """
+    An ideal polyatomic (or monatomic) gas, referenced to the simulation potential.
+
+    The molecule's energy is that of its relaxed geometry with the same
+    potential that evaluates the adsorbed atoms (the role D0 and e_atom
+    play for `DiatomicReservoir`); translation, rotation, vibration and
+    spin are standard ideal-gas statistical mechanics
+    (`molecular_gas_mu_eV`). The relaxed template also defines the shape
+    of the molecular insertion move (`regc.molecules.MoleculeMove`).
+
+    Parameters
+    ----------
+    name : str
+        Label, e.g. ``'CO'``.
+    symbols : sequence of str
+        Element of every atom.
+    positions_angstrom : sequence
+        Relaxed positions, shape (n, 3), Angstrom.
+    energy_eV : float
+        Energy of the relaxed molecule with the potential, eV.
+    vib_wavenumbers_cm : sequence of float
+        Vibrational wavenumbers, cm^-1.
+    symmetry_number : int
+        Rotational symmetry number.
+    spin_multiplicity : int, optional
+        Electronic ground-state degeneracy. Default 1.
+    masses_amu : sequence of float, optional
+        Atomic masses. Default None: ASE's table.
+    calculator_info : dict, optional
+        Diagnostics from `from_calculator`. Default None.
+    """
+
+    name: str
+    symbols: Tuple[str, ...]
+    positions_angstrom: Sequence
+    energy_eV: float
+    vib_wavenumbers_cm: Tuple[float, ...]
+    symmetry_number: int
+    spin_multiplicity: int = 1
+    masses_amu: Optional[Tuple[float, ...]] = None
+    calculator_info: Optional[dict] = field(default=None, repr=False)
+
+    def __post_init__(self):
+        """
+        Normalise the containers and fill in the masses.
+
+        Raises
+        ------
+        ValueError
+            If symbols and positions disagree in length.
+        """
+        from .units import default_mass_amu
+        self.symbols = tuple(str(s) for s in self.symbols)
+        self.positions_angstrom = np.asarray(self.positions_angstrom, dtype=float).reshape(-1, 3)
+        if len(self.positions_angstrom) != len(self.symbols):
+            raise ValueError(f"gas {self.name}: {len(self.symbols)} symbols for "
+                             f"{len(self.positions_angstrom)} positions")
+        self.vib_wavenumbers_cm = tuple(float(w) for w in self.vib_wavenumbers_cm)
+        self.masses_amu = (tuple(default_mass_amu(s) for s in self.symbols)
+                           if self.masses_amu is None else tuple(float(m) for m in self.masses_amu))
+        self.symmetry_number = int(self.symmetry_number)
+        self.spin_multiplicity = int(self.spin_multiplicity)
+
+    @property
+    def composition(self) -> Dict[str, int]:
+        """dict: Number of atoms of each element."""
+        out: Dict[str, int] = {}
+        for s in self.symbols:
+            out[s] = out.get(s, 0) + 1
+        return out
+
+    @property
+    def mass_exchanged_amu(self) -> float:
+        """float: Molecular mass, amu."""
+        return float(sum(self.masses_amu))
+
+    def principal_moments(self) -> np.ndarray:
+        """
+        Principal moments of inertia of the relaxed geometry.
+
+        Returns
+        -------
+        numpy.ndarray
+            Three moments, ascending, amu A^2.
+        """
+        m = np.asarray(self.masses_amu)
+        r = self.positions_angstrom - (m[:, None] * self.positions_angstrom).sum(0) / m.sum()
+        tensor = np.einsum("i,ij,ik->jk", m, r, r)
+        inertia = np.trace(tensor) * np.eye(3) - tensor
+        return np.sort(np.linalg.eigvalsh(inertia))
+
+    def mu_eV(self, T_kelvin: float, p_pascal: float) -> float:
+        """
+        Chemical potential of the molecule at (T, p).
+
+        Parameters
+        ----------
+        T_kelvin : float
+            Temperature, in Kelvin.
+        p_pascal : float
+            Partial pressure, in Pascal.
+
+        Returns
+        -------
+        float
+            mu, in eV on the potential's energy scale.
+        """
+        return molecular_gas_mu_eV(T_kelvin, p_pascal, self.energy_eV, self.mass_exchanged_amu,
+                                   self.principal_moments(), self.vib_wavenumbers_cm,
+                                   self.symmetry_number, self.spin_multiplicity)
+
+    def pressure_pascal(self, T_kelvin: float, mu_eV: float) -> float:
+        """
+        Partial pressure giving the molecular chemical potential `mu_eV`.
+
+        Parameters
+        ----------
+        T_kelvin : float
+            Temperature, in Kelvin.
+        mu_eV : float
+            Chemical potential of the molecule, in eV.
+
+        Returns
+        -------
+        float
+            Pressure, in Pascal.
+        """
+        p0, q_int, zpe = _molecular_p0_q_zpe(T_kelvin, self.mass_exchanged_amu,
+                                            self.principal_moments(), self.vib_wavenumbers_cm,
+                                            self.symmetry_number, self.spin_multiplicity)
+        return p0 * q_int * math.exp((mu_eV - self.energy_eV - zpe) / kelvin_to_eV(T_kelvin))
+
+    def to_dict(self) -> dict:
+        """
+        JSON-able form (diagnostics dropped).
+
+        Returns
+        -------
+        dict
+            The constructor arguments, plus ``type: molecular``.
+        """
+        return {"type": "molecular", "name": self.name, "symbols": list(self.symbols),
+                "positions_angstrom": self.positions_angstrom.tolist(),
+                "energy_eV": float(self.energy_eV),
+                "vib_wavenumbers_cm": list(self.vib_wavenumbers_cm),
+                "symmetry_number": self.symmetry_number,
+                "spin_multiplicity": self.spin_multiplicity, "masses_amu": list(self.masses_amu)}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MolecularGas":
+        """
+        Rebuild a gas written by `to_dict`.
+
+        Parameters
+        ----------
+        d : dict
+            The dict.
+
+        Returns
+        -------
+        MolecularGas
+            The gas.
+        """
+        d = {k: v for k, v in d.items() if k != "type"}
+        return cls(**d)
+
+    @classmethod
+    def from_calculator(cls, ase_calculator, template, name: Optional[str] = None,
+                        symmetry_number: Optional[int] = None,
+                        spin_multiplicity: Optional[int] = None,
+                        vib_wavenumbers_cm: Optional[Sequence[float]] = None,
+                        fmax: float = 1e-3, steps: int = 1000, delta: float = 0.005,
+                        cell: float = 20.0) -> "MolecularGas":
+        """
+        Relax a gas molecule with a potential and take its vibrations from the Hessian.
+
+        Parameters
+        ----------
+        ase_calculator : ase.calculators.calculator.Calculator
+            The simulation's potential, as an ASE calculator (forces needed).
+        template : str or ase.Atoms
+            A name of `ase.build.molecule` (``'CO'``, ``'CH4'``, ...) or a
+            starting geometry.
+        name : str, optional
+            Label. Default None: the template name or chemical formula.
+        symmetry_number : int, optional
+            Default None: from `SYMMETRY_NUMBERS`.
+        spin_multiplicity : int, optional
+            Default None: from `SPIN_MULTIPLICITIES` (3 for O2), else 1.
+        vib_wavenumbers_cm : sequence of float, optional
+            Use these instead of the potential's (e.g. experimental ones).
+            Default None.
+        fmax : float, optional
+            Force tolerance of the relaxation, eV/A. Default 1e-3.
+        steps : int, optional
+            Maximum relaxation steps. Default 1000.
+        delta : float, optional
+            Finite-difference displacement for the Hessian, A. Default 0.005.
+        cell : float, optional
+            Edge of the (non-periodic) box the molecule sits in, A. Default 20.
+
+        Returns
+        -------
+        MolecularGas
+            The gas, with ``calculator_info`` (relaxed energy, all
+            Hessian frequencies, the largest residual force).
+
+        Raises
+        ------
+        ValueError
+            If the symmetry number is unknown and not given, or the relaxed
+            geometry is not a minimum (imaginary vibrational modes).
+        """
+        from ase import Atoms
+        from ase.build import molecule
+        from ase.optimize import BFGS
+
+        if isinstance(template, str):
+            label = template
+            atoms = molecule(template)
+        else:
+            atoms = template.copy()
+            label = atoms.get_chemical_formula()
+        name = name or label
+        atoms.set_cell([cell] * 3)
+        atoms.set_pbc(False)
+        atoms.center()
+        atoms.calc = ase_calculator
+        if len(atoms) > 1:
+            BFGS(atoms, logfile=None).run(fmax=fmax, steps=steps)
+        energy = float(atoms.get_potential_energy())
+        if symmetry_number is None:
+            if len(atoms) == 1:
+                symmetry_number = 1
+            elif name in SYMMETRY_NUMBERS or label in SYMMETRY_NUMBERS:
+                symmetry_number = SYMMETRY_NUMBERS.get(name, SYMMETRY_NUMBERS.get(label))
+            else:
+                raise ValueError(f"no tabulated symmetry number for {name}: give symmetry_number")
+        if spin_multiplicity is None:
+            spin_multiplicity = SPIN_MULTIPLICITIES.get(name, SPIN_MULTIPLICITIES.get(label, 1))
+        masses = atoms.get_masses()
+        info = {"energy_eV": energy,
+                "max_force_eV_per_A": float(np.abs(atoms.get_forces()).max())}
+        if len(atoms) > 1:
+            n = len(atoms)
+            hess = np.zeros((3 * n, 3 * n))
+            x0 = atoms.get_positions()
+            for i in range(n):
+                for a in range(3):
+                    f = []
+                    for sgn in (1.0, -1.0):
+                        x = x0.copy()
+                        x[i, a] += sgn * delta
+                        atoms.set_positions(x)
+                        f.append(atoms.get_forces().ravel())
+                    hess[3 * i + a] = -(f[0] - f[1]) / (2.0 * delta)
+            atoms.set_positions(x0)
+            hess = 0.5 * (hess + hess.T)
+            m3 = np.repeat(masses, 3)
+            lam = np.linalg.eigvalsh(hess / np.sqrt(np.outer(m3, m3)))
+            omega = np.sign(lam) * np.sqrt(np.abs(lam) * EV_IN_JOULES / (1.0e-20 * AMU))
+            wn = omega / (2.0 * math.pi * SPEED_OF_LIGHT_CM_PER_S)
+            gas = cls(name, atoms.get_chemical_symbols(), x0, energy, (), symmetry_number,
+                      spin_multiplicity, tuple(masses))
+            linear = gas.principal_moments()[0] < 1e-3 * gas.principal_moments()[-1]
+            n_rigid = 5 if linear else 6
+            modes = wn[np.argsort(np.abs(wn))][n_rigid:]
+            info["all_wavenumbers_cm"] = wn.tolist()
+            if vib_wavenumbers_cm is None:
+                if np.any(modes <= 0.0):
+                    raise ValueError(f"{name} relaxed with this potential is not a minimum: "
+                                     f"vibrational modes {np.round(np.sort(modes), 1).tolist()} "
+                                     f"cm^-1 (negative = imaginary); give vib_wavenumbers_cm or "
+                                     f"another template")
+                vib_wavenumbers_cm = sorted(modes.tolist())
+        else:
+            x0 = atoms.get_positions()
+            vib_wavenumbers_cm = ()
+        return cls(name, atoms.get_chemical_symbols(), x0, energy, tuple(vib_wavenumbers_cm),
+                   int(symmetry_number), int(spin_multiplicity), tuple(masses),
+                   calculator_info=info)
+
+
+class MolecularGasFeed:
+    """
+    A gas mixture at fixed mole fractions, as elemental chemical potentials.
+
+    The simulation exchanges atoms with chemical potentials mu_e (one per
+    element); a gas g of composition nu_g fixes nu_g . mu = mu_g(T, x_g p).
+    With one gas per independent composition this is the constrained
+    equilibrium of atomistic thermodynamics (Reuter and Scheffler): the
+    surface is in equilibrium with every gas, the gases not necessarily
+    with each other. The mu_e are the minimum-norm solution; where fewer
+    gases than elements leave them underdetermined (pure CO fixes only
+    mu_C + mu_O), only combinations that the moves use -- checked by
+    `check_moves` -- enter the sampling, and those are unique.
+
+    Parameters
+    ----------
+    elements : sequence of str
+        The exchanged elements, in `ParticleSystem.exchange_species` order.
+    gases : sequence of MolecularGas
+        The gases.
+    fractions : sequence of float
+        Their mole fractions (normalised here).
+    element_masses_amu : dict, optional
+        Atomic masses for Lambda_e. Default None: ASE's table.
+
+    Raises
+    ------
+    ValueError
+        If a gas contains an element that is not exchanged, or the gas
+        compositions are linearly dependent (e.g. CO, O2 and CO2: their
+        chemical potentials agree only at gas-phase equilibrium).
+    """
+
+    def __init__(self, elements: Sequence[str], gases: Sequence[MolecularGas],
+                 fractions: Sequence[float], element_masses_amu: Optional[Dict[str, float]] = None):
+        """
+        Build the composition matrix and its pseudo-inverse.
+
+        Parameters
+        ----------
+        elements, gases, fractions, element_masses_amu
+            See the class docstring.
+
+        Raises
+        ------
+        ValueError
+            See the class docstring.
+        """
+        from .units import default_mass_amu
+        self.species = [str(e) for e in elements]
+        self.gases = list(gases)
+        x = np.asarray(fractions, dtype=float)
+        if len(x) != len(self.gases) or np.any(x <= 0):
+            raise ValueError("one positive mole fraction per gas is needed")
+        self.fractions = list(x / x.sum())
+        for g in self.gases:
+            foreign = sorted(set(g.composition) - set(self.species))
+            if foreign:
+                raise ValueError(f"gas {g.name} contains {foreign}, which are not exchanged "
+                                 f"species {self.species}")
+        self.A = np.array([[g.composition.get(e, 0) for e in self.species] for g in self.gases],
+                          dtype=float)
+        if np.linalg.matrix_rank(self.A) < len(self.gases):
+            raise ValueError(
+                f"the gas compositions {[g.name for g in self.gases]} are linearly dependent: a "
+                f"fixed feed of them has no common elemental chemical potentials unless the gases "
+                f"are in mutual equilibrium (e.g. CO + O2 <-> CO2). Keep one gas per independent "
+                f"composition (constrained equilibrium)")
+        self.pinv = np.linalg.pinv(self.A)
+        masses = dict(element_masses_amu or {})
+        self.element_masses_amu = {e: float(masses.get(e, default_mass_amu(e)))
+                                   for e in self.species}
+
+    @property
+    def reservoirs(self) -> List[MolecularGas]:
+        """list of MolecularGas: The gases (the name `GasFeed` uses)."""
+        return self.gases
+
+    def determines(self, composition: Dict[str, int]) -> bool:
+        """
+        Whether the feed fixes the chemical potential of a composition uniquely.
+
+        Parameters
+        ----------
+        composition : dict
+            ``{element: count}`` of a move (one atom, or a molecule).
+
+        Returns
+        -------
+        bool
+            True if the composition is a combination of the gases'.
+        """
+        v = np.array([composition.get(e, 0) for e in self.species], dtype=float)
+        return bool(np.allclose(v @ self.pinv @ self.A, v, atol=1e-9))
+
+    def check_moves(self, compositions: Dict[str, Dict[str, int]]) -> None:
+        """
+        Check that every exchange move's chemical potential is fixed by the gases.
+
+        Parameters
+        ----------
+        compositions : dict
+            ``{move label: {element: count}}``.
+
+        Raises
+        ------
+        ValueError
+            Naming the moves whose chemical potential the feed leaves
+            undetermined (e.g. atomic C with a pure CO feed).
+        """
+        bad = [k for k, c in compositions.items() if not self.determines(c)]
+        if bad:
+            raise ValueError(f"the gas feed {[g.name for g in self.gases]} does not fix the "
+                             f"chemical potential of the moves {bad}: add a gas containing them, "
+                             f"or drop those moves")
+
+    def gas_mus_eV(self, T_kelvin: float, p_pascal: float) -> np.ndarray:
+        """
+        Chemical potential of every gas at its partial pressure.
+
+        Parameters
+        ----------
+        T_kelvin : float
+            Temperature, in Kelvin.
+        p_pascal : float
+            Total pressure, in Pascal.
+
+        Returns
+        -------
+        numpy.ndarray
+            mu_g, one per gas, eV.
+        """
+        return np.array([g.mu_eV(T_kelvin, x * p_pascal)
+                         for g, x in zip(self.gases, self.fractions)])
+
+    def mu_elements_eV(self, T_kelvin: float, p_pascal: float) -> np.ndarray:
+        """
+        Elemental chemical potentials at (T, total p).
+
+        Parameters
+        ----------
+        T_kelvin : float
+            Temperature, in Kelvin.
+        p_pascal : float
+            Total pressure, in Pascal.
+
+        Returns
+        -------
+        numpy.ndarray
+            mu_e, one per element (minimum-norm solution), eV.
+        """
+        return self.pinv @ self.gas_mus_eV(T_kelvin, p_pascal)
+
+    def mu_at_T_eV(self, T_eV: float, p: float, unit: str = "Pa"):
+        """
+        Elemental chemical potential(s) at temperature k_B*T and total pressure p.
+
+        Parameters
+        ----------
+        T_eV : float
+            k_B * T, in eV.
+        p : float
+            Total pressure, in `unit`.
+        unit : str, optional
+            Pressure unit. Default ``'Pa'``.
+
+        Returns
+        -------
+        float or numpy.ndarray
+            mu (eV) for one element, an array of one per element otherwise.
+        """
+        mu = self.mu_elements_eV(eV_to_kelvin(T_eV), p * pascal_per(unit))
+        return float(mu[0]) if len(mu) == 1 else mu
+
+    def mu_grid(self, temperatures_K: Sequence[float], pressures: Sequence[float],
+                unit: str = "Pa") -> np.ndarray:
+        """
+        Elemental chemical potentials of a (temperature x pressure) ladder.
+
+        Parameters
+        ----------
+        temperatures_K : sequence of float
+            Temperatures, in Kelvin.
+        pressures : sequence of float
+            Total pressures, in `unit`.
+        unit : str, optional
+            Pressure unit. Default ``'Pa'``.
+
+        Returns
+        -------
+        numpy.ndarray
+            Shape (n_T, n_p) for one element, (n_T, n_p, n_elements) otherwise.
+        """
+        f = pascal_per(unit)
+        grid = np.array([[self.mu_elements_eV(T, p * f) for p in pressures]
+                         for T in temperatures_K])
+        return grid[..., 0] if len(self.species) == 1 else grid
+
+    def lambda_cubed_of_T(self):
+        """
+        Lambda^3(T) of every exchanged element (atoms are the sampled particles).
+
+        Returns
+        -------
+        ThermalWavelengthCubed or SpeciesLambdaCubed
+            For `ReplicaExchangeGCMC`'s ``lambda_cubed_of_T``.
+        """
+        from .units import SpeciesLambdaCubed
+        lams = [ThermalWavelengthCubed(self.element_masses_amu[e]) for e in self.species]
+        return lams[0] if len(lams) == 1 else SpeciesLambdaCubed(lams)
+
+    def to_dict(self) -> dict:
+        """
+        JSON-able form, for ``run_metadata.json``.
+
+        Returns
+        -------
+        dict
+            Elements, gases, fractions and element masses.
+        """
+        return {"type": "molecular_feed", "elements": self.species,
+                "gases": [g.to_dict() for g in self.gases], "fractions": self.fractions,
+                "element_masses_amu": self.element_masses_amu}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MolecularGasFeed":
+        """
+        Rebuild a feed written by `to_dict`.
+
+        Parameters
+        ----------
+        d : dict
+            The dict.
+
+        Returns
+        -------
+        MolecularGasFeed
+            The feed.
+        """
+        return cls(d["elements"], [MolecularGas.from_dict(g) for g in d["gases"]],
+                   d["fractions"], d.get("element_masses_amu"))

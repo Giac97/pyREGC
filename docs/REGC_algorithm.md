@@ -683,7 +683,99 @@ in $T$, at the grid points and reweighted between them. It uses a large $\Delta\
 swap-dominated sampling, so dropping the term (24) biases the composition visibly and fails the
 test.
 
-## 10. Summary of changes relative to [ZSG]
+## 10. Molecular insertion and deletion (an extension beyond [ZSG])
+
+CO, CH$_4$ or H$_2$O cannot be exchanged atom by atom: a pure CO gas fixes only
+$\mu_\text{C} + \mu_\text{O}$, not each, and an isolated C atom is almost never accepted.
+`regc.molecules` adds **molecular moves without changing the ensemble**: the state is still a set
+of atoms with elemental chemical potentials $\mu_e$, sampled from (16), and replica exchange (18),
+MBAR and the sample files are those of §8. A molecule is only a way of *proposing* several atoms
+at once (`ParticleSystem.set_molecules`, config section `molecules`).
+
+**Target, unlabelled.** For a set $S$ of mobile atoms (the $N_e!$ of (16) absorbed by counting
+each set once),
+
+$$
+\pi(S) \propto \prod_e z_e^{N_e}\, e^{-\beta E(S)}, \qquad z_e = \frac{e^{\beta\mu_e}}{\Lambda_e^3(T)} .
+\qquad (25)
+$$
+
+**Units.** A molecule type has an anchor element (C in CO, CO$_2$, CH$_4$; O in O$_2$, H$_2$O),
+partner roles $j = 1,\dots,k$ with their elements, a relaxed gas-phase template $\mathbf t_j$
+(anchor to partner $j$) and a shell $[r_\text{min}, r_\text{max}]$. A *unit* of a configuration is a
+set of atoms with the molecule's composition, its anchor inside $V_\text{ex}$, every partner within
+the shell of the anchor (minimum image). $M(S)$ is their number
+(`MoleculeMove.count_units`). Only star-shaped molecules (all partners bonded to the anchor) fit
+this definition.
+
+**Proposal.** An insertion draws the anchor uniformly in $V_\text{ex}$ (density $1/V_\text{ex}$) and
+then each partner from a density $q_j$ that can be evaluated (`MoleculeMove.propose`,
+`log_q_roles`): the distance $r_j$ from a normal around $|\mathbf t_j|$ truncated to the shell
+(density $f_j(r)/r^2$ per volume); the direction uniform for $j = 1$; for $j = 2$ with
+$u = \hat{\mathbf d}_2\cdot\hat{\mathbf d}_1$ from a normal around $\hat{\mathbf t}_1\cdot\hat{\mathbf t}_2$ truncated to
+$[-1, 1]$ and a uniform azimuth; for $j \ge 3$ von Mises-Fisher around the template direction expressed
+in the frame of $\hat{\mathbf d}_1, \hat{\mathbf d}_2$. The first out-of-plane role draws either mirror
+image with probability ½, so its density is the ½–½ mixture; later roles take the handedness of the
+actual position of that role. A deletion picks one of the $M(S)$ units uniformly.
+
+The same unit $u$ can come out of several insertions: every atom of the anchor element inside
+$V_\text{ex}$ as the anchor (both O of O$_2$), every assignment of the other atoms to the roles of their
+element (4! for the H of CH$_4$). Its proposal density is the sum
+
+$$
+Q(u) = \sum_{\text{anchor } a \in u}\;\sum_{\sigma}\; \frac{1}{V_\text{ex}}
+\prod_{j=1}^{k} q_j\big(\mathbf r_{\sigma(j)} - \mathbf r_a \,\big|\, \text{roles } < j\big)
+\qquad (26)
+$$
+
+(`MoleculeMove.log_unit_density`). Every $q_j$ is continuous and positive over the shell, so $Q(u) > 0$
+for every unit whatever HMC or MD has done to its bonds.
+
+**Acceptance.** With $\nu_e$ the molecule's composition, (25) and the proposal ratio give
+
+$$
+P_\text{acc}(S\to S\cup u) = \min\!\left[1,\;
+\frac{\prod_e z_e^{\nu_e}\; e^{-\beta\,(E_{S\cup u}-E_S)}}{M(S\cup u)\; Q(u)}\right],
+\qquad
+P_\text{acc}(S\to S\setminus u) = \min\!\left[1,\;
+\frac{M(S)\,Q(u)\; e^{-\beta\,(E_{S\setminus u}-E_S)}}{\prod_e z_e^{\nu_e}}\right]
+\qquad (27)
+$$
+
+(`Replica._move_insert_molecule`, `_move_delete_molecule`). For a single atom ($k = 0$,
+$Q = 1/V_\text{ex}$, $M = N_\text{ex}+1$) this is (17). GC attempts pick a channel -- every atomically
+exchanged species (weight 1) and every molecule (weight `weight`) -- independently of the
+configuration and alike for insertions and deletions, so each channel is in detailed balance on its
+own and they can be combined freely.
+
+**Elemental chemical potentials from gases** (`reservoir.MolecularGas`, `MolecularGasFeed`). A gas
+$g$ of composition $\boldsymbol\nu_g$ at partial pressure $x_g p$ has
+
+$$
+\mu_g = E_g + \text{ZPE}_g + k_BT\ln\frac{x_g p\,\Lambda_g^3}{k_BT} - k_BT\ln\!\big(g_\text{el}\, q_\text{rot}\, q_\text{vib}\big),
+\qquad
+\boldsymbol\nu_g\cdot\boldsymbol\mu = \mu_g \;\;\forall g,
+\qquad (28)
+$$
+
+$E_g$ the energy of the molecule relaxed with the simulation potential, a classical rigid rotor
+(linear or not, symmetry number $\sigma$), harmonic vibrations from the potential's Hessian, $q_\text{vib}$
+counted from $v = 0$. For a diatomic, (28) is (14) times two. The linear system is solved with the
+pseudo-inverse (minimum norm). The gas compositions must be linearly independent: CO, O$_2$ and CO$_2$
+together have common $\mu_e$ only at gas-phase equilibrium. One gas per independent composition is the
+*constrained equilibrium* of atomistic thermodynamics (Reuter and Scheffler, PRB 68, 045407 (2003)):
+the surface is in equilibrium with every gas, the gases not with each other. With fewer gases than
+elements (pure CO) the individual $\mu_e$ are not fixed. Only the combinations that the moves use
+enter (27), and those are unique if every move's composition is a combination of the gases'
+(`MolecularGasFeed.check_moves`: a pure CO feed allows CO moves, not atomic C).
+
+**Tests** (`tests/test_molecules.py`). The densities integrate to 1. In an ideal gas the molecule
+number follows $P(n) \propto (\prod_e z_e^{\nu_e} V^{\sum\nu})^n / \prod_e N_e!$ for CO, O$_2$ (anchor
+among the partners) and CH$_4$ (24 orderings and the mirror mixture). With atomic moves added, $N_\text{C}$
+and $N_\text{O}$ are independent Poisson variables. In an interacting gas, atomic and atomic + molecular
+exchange give the same averages. The running energy matches a recomputation with EMT.
+
+## 11. Summary of changes relative to [ZSG]
 
 | # | Item | Status |
 |---|---|---|
@@ -699,3 +791,4 @@ test.
 | 8 | Reservoir $\mu_\text{H}$ missing the calculator's isolated-atom energy | **Fixed:** Eq. (14), `e_atom_eV` in `reservoir.py` and the runner |
 | 9 | Several gas reservoirs at once (e.g. O + Cl) | **Implemented:** Eqs. (16)–(19), §8 |
 | 10 | Semi-grand-canonical substrate (identity swaps) with a gas | **Implemented:** Eqs. (22)–(24), §9 |
+| 11 | Molecular insertion/deletion (CO, O$_2$, CH$_4$, ...) with elemental $\mu$ from gas mixtures | **Implemented:** Eqs. (25)–(28), §10 |

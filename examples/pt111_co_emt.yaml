@@ -1,0 +1,66 @@
+# CO (+ O2) on Pt(111) with molecular insertion and deletion (regc.molecules).
+#
+# A pure CO gas fixes only mu_C + mu_O, so CO is exchanged as a molecule: the
+# move inserts C and O together (C uniformly in the insertion zone, O grown
+# from the relaxed gas-phase CO) and deletes intact C-O units. The atoms keep
+# elemental chemical potentials, so replica exchange, MBAR and the samples
+# (N_C, N_O, and obs:molecules = intact CO) work as with atomic exchange.
+#
+# EMT is only a test potential: it overbinds C and O atoms and dissociates CO
+# on Pt. Use a real potential (LAMMPS + an MLIP) for physics, and check the
+# printed gas-phase energies and vibrations against experiment first.
+#
+#   regc-run pt111_co_emt.yaml          (about 1 minute)
+
+structure:
+  build: {surface: fcc111, symbol: Pt, size: [2, 2, 3], a: auto, orthogonal: false}
+  n_frozen_layers: 2
+  headroom_angstrom: 6.0
+
+gas:
+  species: [C, O]                     # the exchanged elements
+  atomic_exchange: [O]                # O also atom by atom (O2 adsorbs dissociatively)
+  insertion_z_range_above_surface: [0.5, 4.0]
+
+molecules:                            # the gas feed; replaces reservoir and gas.composition
+  CO:
+    template: CO                      # ase.build.molecule name or a structure file
+    fraction: 0.5                     # mole fraction in the feed
+    # shell_angstrom: [0.85, 1.4]     # partner distances: proposals and "intact CO"
+    # bond_sigma_angstrom: 0.05       # proposal widths: efficiency only
+    # angle_sigma_deg: 10
+    # weight: 1                       # relative frequency among GC channels
+  O2:
+    template: O2                      # spin multiplicity 3 and sigma = 2 are tabulated
+    fraction: 0.5
+    insert: false                     # O2 only fixes mu_O; O enters through atomic_exchange
+
+calculator:
+  type: EMT
+
+replica_exchange:
+  temperatures_K: [400, 500, 600]
+  pressures: [1.0e-8, 1.0e-4, 1.0]    # total pressure of the CO + O2 feed
+  pressure_unit: bar
+  scheme: regc
+  n_steps: 1500
+  x0: 0.9
+  diffusion: mc
+  diffusion_steps: 2
+  record_every: 5
+  burn_in_steps: 300
+  max_disp: 0.2
+  seed: 1
+
+phase_diagram:
+  T_min_K: 400
+  T_max_K: 600
+  n_T: 11
+  p_min: 1.0e-8
+  p_max: 1.0
+  n_p: 17
+  observable: N_C                     # carbon (CO) coverage; N_O for oxygen
+  coverage_per: surface_atom
+
+output:
+  directory: output_pt111_co_emt

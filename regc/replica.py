@@ -283,6 +283,9 @@ class Replica:
         None
         """
         sysm = self.system
+        if getattr(sysm, 'molecules', ()):
+            self._move_gc_channel(insert=True)
+            return
         if sysm.n_exchange_species > 1:
             self._move_insert_species()
             return
@@ -320,6 +323,9 @@ class Replica:
         None
         """
         sysm = self.system
+        if getattr(sysm, 'molecules', ()):
+            self._move_gc_channel(insert=False)
+            return
         if sysm.n_exchange_species > 1:
             self._move_delete_species()
             return
@@ -379,8 +385,24 @@ class Replica:
         -------
         None
         """
+        self._insert_species_index(int(self.rng.integers(self.system.n_exchange_species)))
+
+    def _insert_species_index(self, s: int) -> None:
+        """
+        Attempt one single-atom insertion of exchanged species number `s`.
+
+        The body of `_move_insert_species` after the species draw.
+
+        Parameters
+        ----------
+        s : int
+            Index into `system.exchange_species_list`.
+
+        Returns
+        -------
+        None
+        """
         sysm = self.system
-        s = int(self.rng.integers(sysm.n_exchange_species))
         sp = sysm.exchange_species_list[s]
         pos = sysm.random_insertion_position(self.rng)
         du = (sysm.pair_energy_of(pos, species=sp) if sysm.calculator.supports_incremental
@@ -408,8 +430,24 @@ class Replica:
         -------
         None
         """
+        self._delete_species_index(int(self.rng.integers(self.system.n_exchange_species)))
+
+    def _delete_species_index(self, s: int) -> None:
+        """
+        Attempt one single-atom deletion of exchanged species number `s`.
+
+        The body of `_move_delete_species` after the species draw.
+
+        Parameters
+        ----------
+        s : int
+            Index into `system.exchange_species_list`.
+
+        Returns
+        -------
+        None
+        """
         sysm = self.system
-        s = int(self.rng.integers(sysm.n_exchange_species))
         sp = sysm.exchange_species_list[s]
         candidates = sysm.exchange_zone_indices(sp)
         n = len(candidates)
@@ -425,6 +463,135 @@ class Replica:
             sysm.apply_delete(i)
             self.energy += du
         self._count('delete', sp, accept)
+
+    # -- molecular insertion / deletion (regc.molecules) ---------------------------------
+    def _move_gc_channel(self, insert: bool) -> None:
+        """
+        One GC attempt when molecules are exchanged: pick a channel, then move.
+
+        The channels are every atomically exchanged species
+        (`ParticleSystem.atomic_exchange`, weight 1 each) and every molecule
+        (weight `MoleculeMove.weight`); the choice does not depend on the
+        configuration and is the same for insertions and deletions, so
+        each channel satisfies detailed balance on its own.
+
+        Parameters
+        ----------
+        insert : bool
+            Insertion (True) or deletion (False).
+
+        Returns
+        -------
+        None
+        """
+        sysm = self.system
+        atomic = tuple(getattr(sysm, 'atomic_exchange', ()))
+        mols = tuple(sysm.molecules)
+        w = np.array([1.0] * len(atomic) + [m.weight for m in mols])
+        c = int(self.rng.choice(len(w), p=w / w.sum()))
+        if c < len(atomic):
+            s = sysm.exchange_species_list.index(atomic[c])
+            (self._insert_species_index if insert else self._delete_species_index)(s)
+        elif insert:
+            self._move_insert_molecule(mols[c - len(atomic)])
+        else:
+            self._move_delete_molecule(mols[c - len(atomic)])
+
+    def _log_activity(self, mol) -> float:
+        """
+        log prod_e z_e^{nu_e} of a molecule, z_e = exp(beta mu_e) / Lambda_e^3.
+
+        Parameters
+        ----------
+        mol : MoleculeMove
+            The molecule.
+
+        Returns
+        -------
+        float
+            The log activity of its atoms at this replica's state.
+        """
+        species = self.system.exchange_species_list
+        mu, lam3, beta = self.state.mu_vec, self.state.lambda_cubed_vec, self.state.beta
+        return float(sum(n * (beta * mu[species.index(e)] - np.log(lam3[species.index(e)]))
+                         for e, n in mol.composition.items()))
+
+    def _move_insert_molecule(self, mol) -> None:
+        """
+        Attempt to insert one molecule (`regc.molecules`).
+
+        Anchor uniform in the exchange zone, partners from
+        `MoleculeMove.propose`; accepted with min(1, prod_e z_e^{nu_e}
+        exp(-beta dU) / (M' Q)), M' the number of deletable units after the
+        insertion and Q the proposal density of the inserted unit
+        (docs/REGC_algorithm.md, Sec. 10). Counted under ``'insert'`` and
+        ``'insert_mol:<name>'``.
+
+        Parameters
+        ----------
+        mol : MoleculeMove
+            The molecule.
+
+        Returns
+        -------
+        None
+        """
+        sysm = self.system
+        anchor = sysm.random_insertion_position(self.rng)
+        rel = mol.propose(self.rng)
+        pos = np.array([sysm.wrap_position(p) for p in np.vstack([anchor, anchor + rel])])
+        species = list(mol.symbols)
+        du = sysm.generic_insert_many_dU(pos, species)
+        accept = False
+        if np.isfinite(du):
+            P = np.vstack([sysm.positions, pos])
+            S = np.append(sysm.species, species)
+            Z = sysm.in_exchange_zone(P)
+            new = range(sysm.n, sysm.n + len(pos))
+            log_q = mol.log_unit_density(P, S, Z, new, sysm._min_image, sysm.volume)
+            m_after = mol.count_units(P, S, Z, sysm._min_image)
+            if np.isfinite(log_q) and m_after > 0:
+                log_arg = (self._log_activity(mol) - self.state.beta * du
+                           - np.log(m_after) - log_q)
+                accept = bool(log_arg >= 0.0 or self.rng.random() < np.exp(log_arg))
+        if accept:
+            sysm.apply_insert_many(pos, species)
+            self.energy += du
+        self._count('insert', f"mol:{mol.name}", accept)
+
+    def _move_delete_molecule(self, mol) -> None:
+        """
+        Attempt to delete one molecule (`regc.molecules`).
+
+        Picks one of the M deletable units uniformly and accepts with
+        min(1, prod_e z_e^{-nu_e} exp(-beta dU) M Q), the reverse of
+        `_move_insert_molecule`. A no-op without units. Counted under
+        ``'delete'`` and ``'delete_mol:<name>'``.
+
+        Parameters
+        ----------
+        mol : MoleculeMove
+            The molecule.
+
+        Returns
+        -------
+        None
+        """
+        sysm = self.system
+        P, S = sysm.positions, sysm.species
+        Z = sysm.in_exchange_zone(P)
+        unit, m_before = mol.random_unit(P, S, Z, sysm._min_image, self.rng)
+        if unit is None:
+            return
+        du = sysm.generic_delete_many_dU(unit)
+        log_q = mol.log_unit_density(P, S, Z, unit, sysm._min_image, sysm.volume)
+        log_arg = (-self._log_activity(mol) - self.state.beta * du + np.log(m_before) + log_q)
+        accept = bool(np.isfinite(log_arg)
+                      and (log_arg >= 0.0 or self.rng.random() < np.exp(log_arg)))
+        if accept:
+            sysm.apply_delete_many(unit)
+            self.energy += du
+        self._count('delete', f"mol:{mol.name}", accept)
 
     def _move_identity(self) -> None:
         """

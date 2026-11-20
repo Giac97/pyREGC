@@ -704,6 +704,83 @@ class SGCCounts(Observable):
         return np.asarray(system.sgc_counts(), dtype=float)
 
 
+#: Reserved name under which the engine records the molecule counts.
+MOLECULE_COUNTS_NAME = "molecules"
+
+
+class MoleculeCounts(Observable):
+    """
+    Number of intact molecules of each exchanged molecule type.
+
+    Recorded automatically by `ReplicaExchangeGCMC` when molecules are
+    exchanged (`ParticleSystem.set_molecules`), under the reserved name
+    `MOLECULE_COUNTS_NAME`. A molecule is a unit as the deletion move
+    defines it (`regc.molecules.MoleculeMove.count_units`): atoms with the
+    molecule's composition, all partners within the shell around the
+    anchor -- here anywhere in the system, not only in the exchange zone.
+    Comparing it with the element counts tells intact from dissociated
+    adsorbates (CO against C + O).
+
+    Parameters
+    ----------
+    molecules : sequence of MoleculeMove
+        The exchanged molecules.
+    """
+
+    def __init__(self, molecules: Sequence):
+        """
+        Set up the counter.
+
+        Parameters
+        ----------
+        molecules : sequence of MoleculeMove
+            The exchanged molecules.
+        """
+        self.name = MOLECULE_COUNTS_NAME
+        self.molecules = list(molecules)
+
+    def labels(self) -> List[str]:
+        """
+        Names of the components.
+
+        Returns
+        -------
+        list of str
+            The molecule names.
+        """
+        return [m.name for m in self.molecules]
+
+    def metadata(self) -> dict:
+        """
+        JSON-able description.
+
+        Returns
+        -------
+        dict
+            Type, labels and every molecule's definition.
+        """
+        return dict(super().metadata(), molecules=[m.metadata() for m in self.molecules])
+
+    def __call__(self, system) -> np.ndarray:
+        """
+        Evaluate on a configuration.
+
+        Parameters
+        ----------
+        system : ParticleSystem
+            The replica's current configuration.
+
+        Returns
+        -------
+        numpy.ndarray
+            One count per molecule, as floats.
+        """
+        zone = np.ones(system.n, dtype=bool)
+        return np.array([m.count_units(system.positions, system.species, zone,
+                                       system._min_image, zone_only=False)
+                         for m in self.molecules], dtype=float)
+
+
 class LayerComposition(Observable):
     """
     Number of atoms of each species in each atomic layer of a slab.
@@ -1008,7 +1085,10 @@ def check_observables(observables: Optional[Sequence[Observable]]) -> List[Obser
     for o, n in zip(obs, names):
         if n == SGC_COUNTS_NAME and isinstance(o, SGCCounts):
             continue  # the engine's own record of the semi-grand-canonical counts
-        if n in RESERVED_NAMES or n == SGC_COUNTS_NAME or ":" in n or not n:
+        if n == MOLECULE_COUNTS_NAME and isinstance(o, MoleculeCounts):
+            continue  # the engine's own record of the molecule counts
+        if (n in RESERVED_NAMES or n in (SGC_COUNTS_NAME, MOLECULE_COUNTS_NAME) or ":" in n
+                or not n):
             raise ValueError(f"observable name {n!r} is reserved or invalid "
                              f"(reserved: {sorted(RESERVED_NAMES)}; no ':')")
     if len(set(names)) != len(names):

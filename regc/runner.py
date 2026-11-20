@@ -24,7 +24,12 @@ surface phase diagram, all from one YAML or JSON file.
 3. **reservoir** -- a `DiatomicReservoir` (H2, O2, ...; D0 and the
    isolated-atom energy from the potential itself, from experiment, or
    given) or a `MonatomicIdealGasReservoir`; one per species for a gas
-   feed of several species (``gas.composition``).
+   feed of several species (``gas.composition``). Or a ``molecules``
+   section: gases of molecules (CO, O2, CH4, ...) relaxed with the
+   potential (`MolecularGas`), whose mixture fixes the elemental chemical
+   potentials (`MolecularGasFeed`), each optionally exchanged as a
+   molecule (`regc.molecules.MoleculeMove`), plus ``gas.atomic_exchange``
+   for species also exchanged atom by atom.
 4. **replica_exchange** -- a (T x p) ladder (``pressures``, mu from the
    reservoir) or an explicit (T x mu) one (``mu_eV``); the [ZSG] REGC
    scheme (``scheme: regc``, MC/HMC/MD diffusion) or the sweep scheme;
@@ -100,7 +105,7 @@ _SECTIONS = {
                   "layer_tol", "frozen", "full_coordination", "alloy", "alloy_seed", "alloy_per_layer"},
     "sgc": {"species", "dmu_eV", "attempts_per_step", "bulk_composition", "ensemble"},
     "gas": {"species", "mass_amu", "insertion_z_range_above_surface",
-            "insertion_shell_around_cluster", "composition"},
+            "insertion_shell_around_cluster", "composition", "atomic_exchange"},
     "reservoir": {"type", "d0", "D0_eV", "e_atom_eV", "bond_length_angstrom",
                   "vibrational_wavenumber_cm", "symmetry_number", "electronic_degeneracy",
                   "mass_molecule_amu", "mass_amu"},
@@ -116,7 +121,11 @@ _SECTIONS = {
     "output": {"directory", "plot_filename", "save_raw_data"},
 }
 _TOP_LEVEL = set(_SECTIONS) | {"calculator", "replica_exchange", "diatomic_reservoir",
-                                "observables"}
+                                "observables", "molecules"}
+#: Keys of one entry of the ``molecules`` section (a gas, and optionally an insertion move).
+_MOLECULE_KEYS = {"template", "fraction", "insert", "anchor", "shell_angstrom",
+                  "bond_sigma_angstrom", "angle_sigma_deg", "weight", "symmetry_number",
+                  "spin_multiplicity", "vibrational_wavenumbers_cm", "energy_eV"}
 _EXPORT_KEYS = {"mode", "n_T", "n_p", "min_cells", "tile"}
 _BOOTSTRAP_KEYS = {"n", "seed", "level", "min_agreement", "min_support"}
 _CALCULATOR_KEYS = {
@@ -210,6 +219,9 @@ def load_config(path: str) -> Dict[str, Any]:
                                      for c in calc["pair_commands"]]
         if isinstance(calc.get("kwargs"), dict):
             calc["kwargs"] = {k: _resolve_existing(v, base) for k, v in calc["kwargs"].items()}
+    for sec in (config.get("molecules") or {}).values():
+        if isinstance(sec, dict) and isinstance(sec.get("template"), str):
+            sec["template"] = _resolve_existing(sec["template"], base)
     return config
 
 
@@ -394,6 +406,8 @@ def validate_config(config: Dict[str, Any]) -> None:
     for name, allowed in _SECTIONS.items():
         if name in config and name != "reservoir":
             _check_keys(config[name], allowed, name)
+    if "molecules" in config:
+        _validate_molecules(config)
     for name in ("reservoir", "diatomic_reservoir"):
         if name in config:
             for sp, sec in _per_species_reservoir_cfg(config, _species_list(config)).items():
@@ -474,6 +488,48 @@ def validate_config(config: Dict[str, Any]) -> None:
             and config["phase_diagram"].get("coverage_per") == "area"):
         raise ValueError("phase_diagram.coverage_per: area needs a slab; for a cluster use "
                          "surface_atom, atom or none")
+
+
+def _validate_molecules(config: Dict[str, Any]) -> None:
+    """
+    Check the ``molecules`` section against the rest of the config.
+
+    Parameters
+    ----------
+    config : dict
+        The parsed config.
+
+    Raises
+    ------
+    ValueError
+        On unknown keys, a missing template, a reservoir section or
+        ``gas.composition`` next to it (the molecules are the reservoir), or
+        atomically exchanged species that are not exchanged.
+    """
+    mols = config["molecules"]
+    if not isinstance(mols, dict) or not mols:
+        raise ValueError("molecules must map names to gas definitions, e.g. "
+                         "{CO: {template: CO}}")
+    for name, sec in mols.items():
+        if not isinstance(sec, dict):
+            raise ValueError(f"molecules.{name} must be a mapping (at least template: ...)")
+        _check_keys(sec, _MOLECULE_KEYS, f"molecules.{name}")
+        if "template" not in sec:
+            raise ValueError(f"molecules.{name} needs a template (an ase.build.molecule name "
+                             f"such as CO, or a structure file)")
+    for key in ("reservoir", "diatomic_reservoir"):
+        if key in config:
+            raise ValueError(f"with a molecules section the gases are the reservoir: drop {key}")
+    gas = config["gas"]
+    if "composition" in gas:
+        raise ValueError("with a molecules section give each gas's mole fraction as "
+                         "molecules.<name>.fraction instead of gas.composition")
+    species = set(_species_list(config))
+    atomic = gas.get("atomic_exchange") or []
+    atomic = [atomic] if isinstance(atomic, str) else [str(a) for a in atomic]
+    if set(atomic) - species:
+        raise ValueError(f"gas.atomic_exchange {sorted(set(atomic) - species)} are not "
+                         f"exchanged species {sorted(species)}")
 
 
 def _geometry_kind(struct_cfg: Dict[str, Any]) -> str:
@@ -1301,6 +1357,178 @@ def _feed_fractions(gas_cfg: Dict[str, Any], species: Sequence[str]) -> List[flo
     return list(x / x.sum())
 
 
+def _build_molecular_feed(config: Dict[str, Any], species: Sequence[str],
+                          masses: Dict[str, float], calc_spec: "_CalculatorSpec",
+                          ase_calc_getter: Callable[[], Any], base: str = "."
+                          ) -> Tuple[Any, list, Tuple[str, ...]]:
+    """
+    The gases of the ``molecules`` section, their insertion moves and the atomic species.
+
+    Parameters
+    ----------
+    config : dict
+        The parsed config.
+    species : sequence of str
+        The exchanged elements (``gas.species``).
+    masses : dict
+        Their atomic masses.
+    calc_spec : _CalculatorSpec
+        The calculator.
+    ase_calc_getter : callable
+        Returns the potential as an ASE calculator (or None).
+    base : str, optional
+        Directory that relative template files are resolved against.
+        Default ``'.'``.
+
+    Returns
+    -------
+    tuple
+        ``(feed, moves, atomic_exchange)``: a `MolecularGasFeed`, the
+        `MoleculeMove` list and the atomically exchanged species.
+
+    Raises
+    ------
+    ValueError
+        If an exchanged species is in no gas, a move's chemical potential
+        is not fixed by the gases, or a gas has to be described without an
+        ASE calculator but lacks ``energy_eV`` or vibrations.
+    """
+    from .molecules import MoleculeMove
+    from .reservoir import SPIN_MULTIPLICITIES, SYMMETRY_NUMBERS, MolecularGas, MolecularGasFeed
+
+    gases, fractions, moves = [], [], []
+    for name, sec in config["molecules"].items():
+        tmpl = str(sec["template"])
+        path = _resolve_existing(tmpl, base)
+        if os.path.isfile(path):
+            import ase.io
+            template = ase.io.read(path)
+        else:
+            template = tmpl
+        vib = sec.get("vibrational_wavenumbers_cm")
+        vib = None if vib is None else _floats(vib, f"molecules.{name}.vibrational_wavenumbers_cm")
+        sym, spin = sec.get("symmetry_number"), sec.get("spin_multiplicity")
+        calc = ase_calc_getter() if "energy_eV" not in sec else None
+        if calc is not None:
+            gas = MolecularGas.from_calculator(calc, template, name=str(name),
+                                               symmetry_number=None if sym is None else int(sym),
+                                               spin_multiplicity=None if spin is None else int(spin),
+                                               vib_wavenumbers_cm=vib)
+        else:
+            from ase.build import molecule
+            atoms = molecule(template) if isinstance(template, str) else template
+            if "energy_eV" not in sec or (vib is None and len(atoms) > 1):
+                raise ValueError(f"molecules.{name}: calculator.type {calc_spec.type} has no ASE "
+                                 f"counterpart to relax the molecule with; give energy_eV (and "
+                                 f"vibrational_wavenumbers_cm)")
+            if sym is None and len(atoms) > 1 and str(name) not in SYMMETRY_NUMBERS:
+                raise ValueError(f"molecules.{name}: give symmetry_number")
+            gas = MolecularGas(str(name), atoms.get_chemical_symbols(), atoms.get_positions(),
+                               _as_float(sec["energy_eV"], f"molecules.{name}.energy_eV"),
+                               tuple(vib or ()),
+                               int(sym) if sym is not None else SYMMETRY_NUMBERS.get(str(name), 1),
+                               int(spin) if spin is not None
+                               else SPIN_MULTIPLICITIES.get(str(name), 1))
+        gases.append(gas)
+        fractions.append(_as_float(sec.get("fraction", 1.0), f"molecules.{name}.fraction"))
+        if sec.get("insert", True) and len(gas.symbols) > 1:
+            shell = sec.get("shell_angstrom")
+            moves.append(MoleculeMove(
+                gas.name, gas.symbols, gas.positions_angstrom, anchor=sec.get("anchor"),
+                shell=None if shell is None else tuple(_floats(shell, f"molecules.{name}.shell_angstrom")),
+                bond_sigma=_as_float(sec.get("bond_sigma_angstrom", 0.05),
+                                     f"molecules.{name}.bond_sigma_angstrom"),
+                angle_sigma_deg=_as_float(sec.get("angle_sigma_deg", 10.0),
+                                          f"molecules.{name}.angle_sigma_deg"),
+                weight=_as_float(sec.get("weight", 1.0), f"molecules.{name}.weight")))
+    feed = MolecularGasFeed(species, gases, fractions, masses)
+    covered = set().union(*(g.composition for g in gases))
+    missing = [s for s in species if s not in covered]
+    if missing:
+        raise ValueError(f"exchanged species {missing} are in no gas of the molecules section, "
+                         f"so their chemical potential is undefined")
+    atomic = config["gas"].get("atomic_exchange") or []
+    atomic = tuple([atomic] if isinstance(atomic, str) else [str(a) for a in atomic])
+    feed.check_moves({**{f"atomic {a}": {a: 1} for a in atomic},
+                      **{f"molecule {m.name}": m.composition for m in moves}})
+    if not moves and not atomic:
+        raise ValueError("no GC moves: set insert: true on a molecule or list "
+                         "gas.atomic_exchange")
+    return feed, moves, atomic
+
+
+def _feed_to_meta(feed) -> Dict[str, Any]:
+    """
+    The metadata entries describing a gas feed.
+
+    Parameters
+    ----------
+    feed : GasFeed or MolecularGasFeed
+        The feed.
+
+    Returns
+    -------
+    dict
+        ``composition``, ``reservoirs`` and, for molecules, ``gas_feed``.
+    """
+    if hasattr(feed, "gases"):
+        return {"composition": {g.name: x for g, x in zip(feed.gases, feed.fractions)},
+                "reservoirs": {g.name: g.to_dict() for g in feed.gases},
+                "gas_feed": feed.to_dict()}
+    return {"composition": dict(zip(feed.species, feed.fractions)),
+            "reservoirs": {s: _reservoir_to_dict(r) for s, r in zip(feed.species, feed.reservoirs)}}
+
+
+def _feed_from_meta(meta: Dict[str, Any], stored: Optional[Dict[str, Any]] = None):
+    """
+    Rebuild the gas feed of a run from its metadata.
+
+    Parameters
+    ----------
+    meta : dict
+        ``run_metadata.json``.
+    stored : dict, optional
+        Reservoirs stored for another potential (`reevaluate_from_config`):
+        a feed dict, or ``{species: reservoir dict}``. Default None: the
+        run's own.
+
+    Returns
+    -------
+    GasFeed or MolecularGasFeed
+        The feed.
+    """
+    from .reservoir import MolecularGasFeed
+    if stored is not None:
+        if stored.get("type") == "molecular_feed":
+            return MolecularGasFeed.from_dict(stored)
+        return GasFeed(meta["species"], [_reservoir_from_dict(stored[s]) for s in meta["species"]],
+                       [meta["composition"][s] for s in meta["species"]])
+    if meta.get("gas_feed"):
+        return MolecularGasFeed.from_dict(meta["gas_feed"])
+    return GasFeed(meta["species"], [_reservoir_from_dict(meta["reservoirs"][s])
+                                     for s in meta["species"]],
+                   [meta["composition"][s] for s in meta["species"]])
+
+
+def _feed_record(feed) -> Dict[str, Any]:
+    """
+    The reservoirs of a feed as stored with a re-evaluated potential.
+
+    Parameters
+    ----------
+    feed : GasFeed or MolecularGasFeed
+        The feed.
+
+    Returns
+    -------
+    dict
+        What `_feed_from_meta` takes as ``stored``.
+    """
+    if hasattr(feed, "gases"):
+        return feed.to_dict()
+    return {s: _reservoir_to_dict(r) for s, r in zip(feed.species, feed.reservoirs)}
+
+
 # =============================================================================
 # Setup
 # =============================================================================
@@ -1406,13 +1634,17 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
     needs_reservoir = (pressures is not None or "phase_diagram" in config
                        or "reservoir" in config or "diatomic_reservoir" in config)
     feed = None
-    if needs_reservoir:
-        cache = {}
+    molecule_moves, atomic_exchange = [], None
+    cache = {}
 
-        def ase_calc():
-            if "c" not in cache:
-                cache["c"] = calc_spec.ase_calculator()
-            return cache["c"]
+    def ase_calc():
+        if "c" not in cache:
+            cache["c"] = calc_spec.ase_calculator()
+        return cache["c"]
+    if "molecules" in config:
+        feed, molecule_moves, atomic_exchange = _build_molecular_feed(
+            config, species, masses, calc_spec, ase_calc)
+    elif needs_reservoir:
         res_cfgs = _per_species_reservoir_cfg(config, species)
         reservoirs = [_build_reservoir(s, res_cfgs[s], masses[s], calc_spec, ase_calc)
                       for s in species]
@@ -1439,6 +1671,8 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
                                       **region)
         if sgc:
             system.set_sgc_species(sgc["species"], canonical=sgc["canonical"])
+        if atomic_exchange is not None:
+            system.set_molecules(molecule_moves, atomic_exchange=atomic_exchange)
         return system
 
     scheme = _scheme(re_cfg)
@@ -1451,15 +1685,18 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
         "species": species, "masses_amu": masses,
         "temperatures_K": temperatures_K, "mu_grid_eV": np.asarray(mu_grid).tolist(),
         "pressures": pressures, "pressure_unit": pressure_unit,
-        "composition": dict(zip(species, feed.fractions)) if feed else None,
-        "reservoirs": ({s: _reservoir_to_dict(r) for s, r in zip(species, feed.reservoirs)}
-                       if feed else None),
+        "composition": None, "reservoirs": None,
         "structure": struct_cfg, "calculator": calc_cfg, "lattice_constant_angstrom": a,
         "geometry": kind, "n_surface": geometry.n_surface, "area_angstrom2": geometry.area,
         "n_atoms": len(geometry.frozen_positions) + len(geometry.substrate_positions),
         "insertion_z_range": insertion_z_range, "insertion_shell": insertion_shell,
         "sampling": sampling,
     }
+    if feed is not None:
+        metadata.update(_feed_to_meta(feed))
+    if atomic_exchange is not None:
+        metadata["molecules"] = [m.metadata() for m in molecule_moves]
+        metadata["atomic_exchange"] = list(atomic_exchange)
     if config.get("observables"):
         metadata["observables"] = config["observables"]
     if sgc:
@@ -1474,7 +1711,16 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
         if insertion_shell is not None:
             print(f"insertions in the shell {insertion_shell[0]:.2f} <= r < "
                   f"{insertion_shell[1]:.2f} A around the cluster centre")
-        if feed is not None:
+        if feed is not None and hasattr(feed, "gases"):
+            for g, x in zip(feed.gases, feed.fractions):
+                print(f"gas {g.name} (x = {x:.4g}): E = {g.energy_eV:.4f} eV, vibrations "
+                      f"{[round(w) for w in g.vib_wavenumbers_cm]} cm^-1, sigma = "
+                      f"{g.symmetry_number}, spin multiplicity {g.spin_multiplicity}")
+            for m in molecule_moves:
+                print(f"molecule move {m.name}: anchor {m.anchor} + {list(m.partners)}, shell "
+                      f"[{m.shell[0]:.2f}, {m.shell[1]:.2f}] A, weight {m.weight:g}")
+            print(f"atomic exchange: {list(atomic_exchange) or 'none'}")
+        elif feed is not None:
             for s, r in zip(species, feed.reservoirs):
                 d0 = ""
                 if hasattr(r, "D0_eV"):
@@ -1505,6 +1751,7 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
             "pressure_unit": pressure_unit, "lambda_cubed_of_T": lambda_cubed_of_T,
             "insertion_z_range": insertion_z_range, "insertion_shell": insertion_shell,
             "system_factory": system_factory, "sgc": sgc,
+            "molecules": molecule_moves, "atomic_exchange": atomic_exchange,
             "metadata": metadata}
 
 
@@ -1797,7 +2044,7 @@ def run_from_config(config: Dict[str, Any], verbose: bool = True, resume: bool =
             save_samples(sim, os.path.join(out_dir, SAMPLES_FILE))
 
     feed = setup["feed"]
-    if feed is None:
+    if feed is None or hasattr(feed, "gases"):
         D0 = e_atom = None
     else:
         D0 = {s: getattr(r, "D0_eV", None) for s, r in zip(feed.species, feed.reservoirs)}
@@ -1912,8 +2159,7 @@ def reevaluate_from_config(config: Dict[str, Any], potential: Dict[str, Any], na
     if feed is not None:
         import h5py
         with h5py.File(path, "a") as f:
-            f.attrs["reservoirs:" + name] = json.dumps(
-                {s: _reservoir_to_dict(r) for s, r in zip(feed.species, feed.reservoirs)})
+            f.attrs["reservoirs:" + name] = json.dumps(_feed_record(feed))
     if verbose:
         print(f"{n} configurations evaluated with {name!r} in {path}")
     return n
@@ -1975,9 +2221,7 @@ def _potential_maps(analysis, samples, config: Dict[str, Any], meta: Dict[str, A
     for name in names:
         kw = {}
         if stored[name] is not None:
-            res = json.loads(stored[name])
-            feed = GasFeed(meta["species"], [_reservoir_from_dict(res[s]) for s in meta["species"]],
-                           [meta["composition"][s] for s in meta["species"]])
+            feed = _feed_from_meta(meta, json.loads(stored[name]))
             kw["mu_of_Tp"] = functools.partial(feed.mu_at_T_eV, unit=unit)
         B = analysis.with_potential(name, **kw)
         theta = B.phase_diagram_Tp(T_grid_eV, p_grid, area=norm, observable=observable)
@@ -2344,8 +2588,7 @@ def analyze_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[st
         raise ValueError("the run had no gas reservoir, so pressures are undefined; add a "
                          "reservoir section (or a pressure ladder) to the config and rerun")
     species = meta["species"]
-    feed = GasFeed(species, [_reservoir_from_dict(meta["reservoirs"][s]) for s in species],
-                   [meta["composition"][s] for s in species])
+    feed = _feed_from_meta(meta)
 
     T_grid_K, p_grid, unit = _phase_diagram_grid(pd_cfg, meta.get("pressure_unit"))
     observable = str(pd_cfg.get("observable", "N"))

@@ -285,6 +285,183 @@ class ParticleSystem:
         """
         self.substrate_species[i] = new_species
 
+    # -- molecular insertion / deletion (regc.molecules) ---------------------------------
+    def set_molecules(self, molecules: Sequence, atomic_exchange: Optional[Sequence[str]] = None
+                      ) -> None:
+        """
+        Exchange molecules as blocks of atoms (`regc.molecules.MoleculeMove`).
+
+        GC moves then pick a channel -- one per molecule (relative weight
+        ``molecule.weight``) and one per atomically exchanged species
+        (weight 1) -- and insert or delete through it. The atoms keep their
+        elemental chemical potentials (`ThermoState.mu`), so every element
+        of every molecule must be an exchanged species.
+
+        Parameters
+        ----------
+        molecules : sequence of MoleculeMove
+            The molecular moves; an empty sequence switches them off (and
+            atomic exchange of every species is restored).
+        atomic_exchange : sequence of str, optional
+            Exchanged species that also get single-atom insertions and
+            deletions. Default None: none (with molecules).
+
+        Raises
+        ------
+        ValueError
+            On a molecule element or atomic species that is not exchanged,
+            repeated molecule names, or a shell beyond the minimum-image
+            radius.
+        """
+        mols = tuple(molecules)
+        species = set(self.exchange_species_list)
+        names = [m.name for m in mols]
+        if len(set(names)) != len(names):
+            raise ValueError(f"molecule names must be unique, got {names}")
+        for m in mols:
+            missing = sorted(set(m.composition) - species)
+            if missing:
+                raise ValueError(f"molecule {m.name} contains {missing}, which are not exchanged "
+                                 f"species {sorted(species)}")
+            if m.shell[1] >= self.min_image_radius:
+                raise ValueError(f"molecule {m.name}: shell r_max {m.shell[1]} A reaches the "
+                                 f"minimum-image radius {self.min_image_radius:.3f} A")
+        atomic = tuple(str(s) for s in (atomic_exchange or ()))
+        if set(atomic) - species:
+            raise ValueError(f"atomic_exchange {sorted(set(atomic) - species)} are not exchanged "
+                             f"species {sorted(species)}")
+        self.molecules = mols
+        self.atomic_exchange = atomic if mols else self.exchange_species_list
+
+    def in_exchange_zone(self, positions: np.ndarray) -> np.ndarray:
+        """
+        Whether positions lie in the insertion/deletion zone.
+
+        The same region `random_insertion_position` samples and
+        `exchange_zone_indices` tests; the base-class zone is everything.
+
+        Parameters
+        ----------
+        positions : numpy.ndarray
+            Positions, shape (n, 3).
+
+        Returns
+        -------
+        numpy.ndarray
+            Boolean array, shape (n,).
+        """
+        return np.ones(len(positions), dtype=bool)
+
+    def wrap_position(self, pos: np.ndarray) -> np.ndarray:
+        """
+        A position mapped into the primary cell, as `apply_insert` stores it.
+
+        Parameters
+        ----------
+        pos : numpy.ndarray
+            The (3,) position.
+
+        Returns
+        -------
+        numpy.ndarray
+            The wrapped position (unchanged without periodicity).
+        """
+        wrap = getattr(self, "_wrap", None)
+        return np.asarray(pos, dtype=float) if wrap is None else wrap(np.asarray(pos, dtype=float))
+
+    def generic_insert_many_dU(self, positions: np.ndarray, species: Sequence[str]) -> float:
+        """
+        Energy change of inserting several mobile atoms at once.
+
+        Parameters
+        ----------
+        positions : numpy.ndarray
+            Their positions, shape (m, 3).
+        species : sequence of str
+            Their species.
+
+        Returns
+        -------
+        float
+            The total energy change (calculator + external field);
+            ``numpy.inf`` if any position is forbidden (the calculator is
+            then not called).
+        """
+        positions = np.asarray(positions, dtype=float).reshape(-1, 3)
+        ext = float(sum(self.external_energy(p) for p in positions))
+        if not np.isfinite(ext):
+            return np.inf
+        u0 = self.calculator.total_energy(self)
+        old_pos, old_sp = self.positions, self.species
+        self.positions = np.vstack([old_pos, positions])
+        self.species = np.append(old_sp, np.asarray(species))
+        try:
+            u1 = self.calculator.total_energy(self)
+        finally:
+            self.positions, self.species = old_pos, old_sp
+        return (u1 - u0) + ext
+
+    def generic_delete_many_dU(self, indices: Sequence[int]) -> float:
+        """
+        Energy change of deleting several mobile atoms at once.
+
+        Parameters
+        ----------
+        indices : sequence of int
+            Their indices into `positions`.
+
+        Returns
+        -------
+        float
+            The total energy change (calculator + external field).
+        """
+        idx = np.asarray(indices, dtype=int)
+        ext = float(sum(self.external_energy(p) for p in self.positions[idx]))
+        u0 = self.calculator.total_energy(self)
+        old_pos, old_sp = self.positions, self.species
+        self.positions = np.delete(old_pos, idx, axis=0)
+        self.species = np.delete(old_sp, idx)
+        try:
+            u1 = self.calculator.total_energy(self)
+        finally:
+            self.positions, self.species = old_pos, old_sp
+        return (u1 - u0) - ext
+
+    def apply_insert_many(self, positions: np.ndarray, species: Sequence[str]) -> None:
+        """
+        Commit the insertion of several mobile atoms (appended in order).
+
+        Parameters
+        ----------
+        positions : numpy.ndarray
+            Their positions, shape (m, 3).
+        species : sequence of str
+            Their species.
+
+        Returns
+        -------
+        None
+        """
+        for p, s in zip(np.asarray(positions, dtype=float).reshape(-1, 3), species):
+            self.apply_insert(p, species=str(s))
+
+    def apply_delete_many(self, indices: Sequence[int]) -> None:
+        """
+        Commit the deletion of several mobile atoms.
+
+        Parameters
+        ----------
+        indices : sequence of int
+            Their indices into `positions`.
+
+        Returns
+        -------
+        None
+        """
+        idx = np.asarray(indices, dtype=int)
+        self.positions = np.delete(self.positions, idx, axis=0)
+        self.species = np.delete(self.species, idx)
+
     @property
     def n(self) -> int:
         """
@@ -1357,6 +1534,24 @@ class SlabSystem(ParticleSystem):
             inside &= self.species == species
         return np.flatnonzero(inside)
 
+    def in_exchange_zone(self, positions: np.ndarray) -> np.ndarray:
+        """
+        Whether positions have ``z_lo <= z < z_hi`` (the insertion range).
+
+        Parameters
+        ----------
+        positions : numpy.ndarray
+            Positions, shape (n, 3).
+
+        Returns
+        -------
+        numpy.ndarray
+            Boolean array, shape (n,).
+        """
+        z_lo, z_hi = self.insertion_z_range
+        z = np.asarray(positions, dtype=float).reshape(-1, 3)[:, 2]
+        return (z >= z_lo) & (z < z_hi)
+
     @property
     def volume(self) -> float:
         """
@@ -1716,6 +1911,26 @@ class ClusterSystem(ParticleSystem):
         if species is not None:
             inside &= self.species == species
         return np.flatnonzero(inside)
+
+    def in_exchange_zone(self, positions: np.ndarray) -> np.ndarray:
+        """
+        Whether positions lie in the insertion shell (everywhere without one).
+
+        Parameters
+        ----------
+        positions : numpy.ndarray
+            Positions, shape (n, 3).
+
+        Returns
+        -------
+        numpy.ndarray
+            Boolean array, shape (n,).
+        """
+        positions = np.asarray(positions, dtype=float).reshape(-1, 3)
+        if self.insertion_shell is None:
+            return np.ones(len(positions), dtype=bool)
+        r = self._radius(positions)
+        return (r >= self.insertion_shell[0]) & (r < self.insertion_shell[1])
 
     def md_z_bounds(self) -> Optional[Tuple[float, float]]:
         """

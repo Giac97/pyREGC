@@ -21,8 +21,10 @@ pressure     simple (reduced-units) mu <-> p conventions
 
 Real units, potentials and gas reservoirs
 -----------------------------------------
-reservoir       MonatomicIdealGasReservoir, DiatomicReservoir (e.g. H2), and the
+reservoir       MonatomicIdealGasReservoir, DiatomicReservoir (e.g. H2), MolecularGas
+                (CO, CH4, ...), MolecularGasFeed (elemental mu of a gas mixture), and the
                 low-level diatomic functions
+molecules       MoleculeMove -- molecular insertion/deletion on top of atomic exchange
 structures      cubic_lattice_constant, slab_geometry_from_atoms, SlabGeometry,
                 cluster_geometry_from_atoms, ClusterGeometry, coordination_numbers,
                 insertion_energy_scan  (needs ase)
@@ -65,7 +67,8 @@ from .pressure import (
 )
 from .analysis import MBARSurfaceAnalysis, export_phase_configurations, heat_capacity_ridges
 from .observables import (CoordinationHistogram, CoordinationNumber, FunctionObservable,
-                          Observable, RadialDistribution)
+                          MoleculeCounts, Observable, RadialDistribution)
+from .molecules import MoleculeMove
 from .plotting import plot_map, plot_phase_diagram, plot_radial_distribution
 from .records import RecordWriter, Records, attach_energies, reevaluate
 from .units import (
@@ -86,6 +89,8 @@ from .reservoir import (
     H2_VIBRATIONAL_WAVENUMBER_CM,
     H_MASS_AMU,
     DiatomicReservoir,
+    MolecularGas,
+    MolecularGasFeed,
     MonatomicIdealGasReservoir,
     Reservoir,
     diatomic_dissociation_energy_eV,
@@ -120,7 +125,8 @@ __all__ = [
     "p0_reduced_units", "p0_ideal_gas_wavelength",
     "mu_from_pressure", "pressure_from_mu", "mu_grid_from_pressures", "invert_mu_of_Tp",
     # reservoirs
-    "Reservoir", "MonatomicIdealGasReservoir", "DiatomicReservoir",
+    "Reservoir", "MonatomicIdealGasReservoir", "DiatomicReservoir", "MolecularGas",
+    "MolecularGasFeed", "MoleculeMove", "MoleculeCounts",
     "diatomic_dissociation_energy_eV", "diatomic_gas_mu_eV",
     "mu_atomic_from_diatomic_reservoir_eV", "pressure_from_atomic_mu_reservoir_pascal",
     "H2_BOND_LENGTH_ANGSTROM", "H2_VIBRATIONAL_WAVENUMBER_CM", "H_MASS_AMU", "H2_MASS_AMU",

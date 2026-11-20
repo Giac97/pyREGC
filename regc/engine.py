@@ -51,8 +51,8 @@ import numpy as np
 from .replica import Replica
 from .state import ThermoState
 from .systems import ParticleSystem
-from .observables import (LayerComposition, Observable, SGCCounts, check_observables,
-                          evaluate_observables)
+from .observables import (LayerComposition, MoleculeCounts, Observable, SGCCounts,
+                          check_observables, evaluate_observables)
 from .trajectory import snapshot
 from .units import SpeciesLambdaCubed
 
@@ -333,6 +333,18 @@ class ReplicaExchangeGCMC:
             self.observables = check_observables(
                 self.observables + [SGCCounts(self.sgc_species, self.sgc_dmu,
                                               self.sgc_log_ratio)])
+
+        # molecular insertion/deletion: the same moves in every system
+        self.molecules = tuple(getattr(built[0][2], "molecules", ()))
+        sig = (tuple(m.signature() for m in self.molecules),
+               tuple(getattr(built[0][2], "atomic_exchange", species)))
+        if any((tuple(m.signature() for m in getattr(sysm, "molecules", ())),
+                tuple(getattr(sysm, "atomic_exchange", species))) != sig for _, _, sysm in built):
+            raise ValueError("every system from system_factory must exchange the same molecules "
+                             "and atomic species (ParticleSystem.set_molecules)")
+        if self.molecules:
+            self.observables = check_observables(self.observables
+                                                 + [MoleculeCounts(self.molecules)])
 
         self.grid: Dict[Tuple[int, int], Replica] = {}
         self.samples: Dict[Tuple[int, int], Dict[str, list]] = {}
