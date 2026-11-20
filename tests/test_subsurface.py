@@ -122,9 +122,31 @@ def test_ncmc_work_without_relaxation_is_the_energy_change():
     assert w2 == pytest.approx(-w)
 
 
+def test_langevin_shadow_work_is_the_energy_drift_without_friction():
+    """At gamma = 0 the shadow work is the integrator's energy error, and it vanishes as dt^2."""
+    from regc.subsurface import _Alchemy, _kernel_langevin
+    drift = []
+    for dt in (0.1, 0.05):
+        s = _slab(kernel="langevin", leapfrog_steps=20, dt=dt, friction=0.0)
+        for p in ([1.0, 1.0, 2.6], [3.0, 3.0, 3.4], [5.0, 1.0, 2.9]):
+            s.apply_insert(np.array(p), species="X")
+        alch, rng = _Alchemy(s, 0), np.random.default_rng(0)
+        m = np.concatenate([s.substrate_masses(), s.masses()])[:, None]
+        v = rng.standard_normal((len(m), 3)) / np.sqrt(m)
+        e0, lam = alch.energies(), 0.5
+        h0 = 0.5 * np.sum(m * v * v) + (1 - lam) * e0[1] + lam * e0[0]
+        e1, v1, shadow = _kernel_langevin(alch, lam, e0, v, s.subsurface, 1.0, rng)
+        h1 = 0.5 * np.sum(m * v1 * v1) + (1 - lam) * e1[1] + lam * e1[0]
+        assert shadow == pytest.approx(h1 - h0, abs=1e-12)
+        drift.append(abs(shadow))
+    assert drift[1] < drift[0] / 2.5            # ~ dt^2
+
+
 # ---------------------------------------------------------------- exact statistics
 @pytest.mark.parametrize("sub", [dict(ncmc_steps=1),
                                  dict(ncmc_steps=4, kernel="hmc", leapfrog_steps=4, dt=0.05),
+                                 dict(ncmc_steps=4, kernel="langevin", leapfrog_steps=4, dt=0.05,
+                                      friction=2.0),
                                  dict(ncmc_steps=4, kernel="mc", max_disp=0.3)])
 def test_one_body_well_exact_region_averages(sub):
     mu = -4.0

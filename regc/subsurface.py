@@ -66,16 +66,22 @@ class Subsurface:
         Number T of lambda steps of the switching protocol. Default 10.
     kernel : str, optional
         Propagation at fixed lambda between steps: ``'hmc'`` (one HMC
-        trajectory of all displaceable atoms, full momentum refresh) or
-        ``'mc'`` (single-atom Metropolis displacements). Default ``'hmc'``.
+        trajectory of all displaceable atoms, full momentum refresh),
+        ``'langevin'`` (BAOAB Langevin dynamics whose momenta persist
+        through the whole switch; the shadow work enters the acceptance)
+        or ``'mc'`` (single-atom Metropolis displacements). Default
+        ``'hmc'``.
     kernel_steps : int, optional
-        HMC trajectories, or MC displacement attempts per displaceable
-        atom, per lambda step. Default 1.
+        HMC trajectories, Langevin segments, or MC displacement attempts
+        per displaceable atom, per lambda step. Default 1.
     leapfrog_steps : int, optional
-        Leapfrog steps per HMC trajectory. Default 5.
+        Integration steps per HMC trajectory or Langevin segment. Default 5.
     dt : float, optional
-        HMC time step in internal units (A sqrt(amu/eV); 1 fs = 0.0982).
-        Default 0.0982 (1 fs).
+        HMC/Langevin time step in internal units (A sqrt(amu/eV); 1 fs =
+        0.0982). Default 0.0982 (1 fs).
+    friction : float, optional
+        Langevin friction gamma in inverse internal time units (0.05 /fs =
+        0.509). Default 0.509.
     max_disp : float, optional
         MC kernel displacement per axis (A). Default 0.1.
     weight : float, optional
@@ -99,6 +105,7 @@ class Subsurface:
     kernel_steps: int = 1
     leapfrog_steps: int = 5
     dt: float = 0.0982
+    friction: float = 0.509
     max_disp: float = 0.1
     weight: float = 1.0
     site_min_distance: float = 1.0
@@ -118,8 +125,11 @@ class Subsurface:
             raise ValueError(f"subsurface region needs z_min < z_cut, got {self.z_min}, {self.z_cut}")
         if not self.species:
             raise ValueError("subsurface needs at least one species")
-        if self.kernel not in ("hmc", "mc"):
-            raise ValueError(f"subsurface kernel must be 'hmc' or 'mc', got {self.kernel!r}")
+        if self.kernel not in ("hmc", "langevin", "mc"):
+            raise ValueError(f"subsurface kernel must be 'hmc', 'langevin' or 'mc', "
+                             f"got {self.kernel!r}")
+        if self.friction < 0:
+            raise ValueError("subsurface friction must be >= 0")
         if (self.delta <= 0 or self.ncmc_steps < 1 or self.kernel_steps < 0 or self.weight <= 0
                 or self.leapfrog_steps < 1 or self.dt <= 0 or self.max_disp <= 0):
             raise ValueError("subsurface: delta, dt, max_disp, weight must be positive and "
@@ -141,7 +151,7 @@ class Subsurface:
         """
         return (round(self.z_cut, 9), round(self.z_min, 9), self.species, self.delta,
                 self.ncmc_steps, self.kernel, self.kernel_steps, self.leapfrog_steps, self.dt,
-                self.max_disp, self.weight, self.site_min_distance)
+                self.friction, self.max_disp, self.weight, self.site_min_distance)
 
     def metadata(self) -> dict:
         """
@@ -155,7 +165,7 @@ class Subsurface:
         return {"z_cut": self.z_cut, "z_min": self.z_min, "species": list(self.species),
                 "delta": self.delta, "ncmc_steps": self.ncmc_steps, "kernel": self.kernel,
                 "kernel_steps": self.kernel_steps, "leapfrog_steps": self.leapfrog_steps,
-                "dt": self.dt, "max_disp": self.max_disp, "weight": self.weight,
+                "dt": self.dt, "friction": self.friction, "max_disp": self.max_disp, "weight": self.weight,
                 "site_min_distance": self.site_min_distance}
 
     # -- region and sites --------------------------------------------------------------------
@@ -456,6 +466,78 @@ def _kernel_mc(alch: _Alchemy, lam: float, energies: Tuple[float, float], settin
     return energies
 
 
+def _kernel_langevin(alch: _Alchemy, lam: float, energies: Tuple[float, float], v: np.ndarray,
+                     settings: Subsurface, beta: float, rng: np.random.Generator
+                     ) -> Tuple[Tuple[float, float], np.ndarray, float]:
+    """
+    A BAOAB Langevin segment at fixed lambda, returning its shadow work.
+
+    Each step is V R O R V (half kick, half drift, Ornstein-Uhlenbeck
+    velocity update, half drift, half kick) on every displaceable atom.
+    The shadow work is the change of K + U_lambda over the deterministic
+    substeps, (K1 - K0) + (K3 - K2) + U_lambda(x') - U_lambda(x): the
+    heat exchanged in the O substep is excluded. For this palindromic
+    splitting the protocol work plus the shadow work obeys the Crooks
+    fluctuation theorem exactly at any time step (Sivak, Chodera, Crooks,
+    Phys. Rev. X 3, 011007 (2013)), which makes the NCMC acceptance exact.
+
+    Parameters
+    ----------
+    alch : _Alchemy
+        The switched system.
+    lam : float
+        The coupling.
+    energies : tuple of float
+        ``(U_with, U_without)`` of the current configuration.
+    v : numpy.ndarray
+        Velocities, shape (n_substrate + n_mobile, 3), substrate rows first.
+    settings : Subsurface
+        Steps, time step and friction.
+    beta : float
+        Inverse temperature.
+    rng : numpy.random.Generator
+        Random number generator.
+
+    Returns
+    -------
+    tuple
+        ``(energies, v, shadow_work)`` after the segment; the shadow work
+        is inf if a configuration was forbidden.
+    """
+    s = alch.system
+    n_sub = s.n_substrate
+    m = np.concatenate([s.substrate_masses(), s.masses()])[:, None]
+    dt, a = settings.dt, math.exp(-settings.friction * settings.dt)
+    noise = np.sqrt((1.0 - a * a) / (beta * m))
+    pos = np.vstack([s.substrate_positions, s.positions])
+    u = (1.0 - lam) * energies[1] + lam * energies[0]
+    f = alch.forces(lam)
+    shadow = 0.0
+    for _ in range(settings.leapfrog_steps):
+        k0 = 0.5 * np.sum(m * v * v)
+        v = v + 0.5 * dt * f / m
+        k1 = 0.5 * np.sum(m * v * v)
+        pos = pos + 0.5 * dt * v
+        v = a * v + noise * rng.standard_normal(v.shape)
+        k2 = 0.5 * np.sum(m * v * v)
+        pos = pos + 0.5 * dt * v
+        s.substrate_positions, s.positions = pos[:n_sub], pos[n_sub:]
+        energies = alch.energies()
+        u_new = (1.0 - lam) * energies[1] + lam * energies[0]
+        if not np.isfinite(u_new):
+            return energies, v, math.inf
+        f = alch.forces(lam)
+        v = v + 0.5 * dt * f / m
+        k3 = 0.5 * np.sum(m * v * v)
+        shadow += (k1 - k0) + (k3 - k2) + (u_new - u)
+        u = u_new
+    for k in range(n_sub):
+        s.apply_move_substrate(k, pos[k])
+    for k in range(s.n):
+        s.apply_move(k, pos[n_sub + k])
+    return energies, v, float(shadow)
+
+
 def ncmc(system, i: int, insert: bool, settings: Subsurface, beta: float,
          rng: np.random.Generator) -> Tuple[float, Tuple[float, float]]:
     """
@@ -466,7 +548,9 @@ def ncmc(system, i: int, insert: bool, settings: Subsurface, beta: float,
     configuration, and for t < T the configuration is propagated at
     lambda_t (`kernel_steps` applications of the kernel). The reversed
     schedule uses the kernels in the reversed order, as detailed balance of
-    the pair of moves requires.
+    the pair of moves requires. With the Langevin kernel, velocities are
+    drawn from Maxwell-Boltzmann at the start, carried through the whole
+    protocol and discarded at the end, and W includes the shadow work.
 
     Parameters
     ----------
@@ -486,21 +570,32 @@ def ncmc(system, i: int, insert: bool, settings: Subsurface, beta: float,
     Returns
     -------
     tuple
-        ``(W, (U_with, U_without))``: the protocol work and the two
-        energies of the final configuration (W is inf for a forbidden
-        configuration).
+        ``(W, (U_with, U_without))``: the work entering the acceptance
+        (protocol work, plus the shadow work with the Langevin kernel) and
+        the two energies of the final configuration (W is inf for a
+        forbidden configuration).
     """
     alch = _Alchemy(system, i)
-    kernel = _kernel_hmc if settings.kernel == "hmc" else _kernel_mc
     T = settings.ncmc_steps
     lams = np.linspace(0.0, 1.0, T + 1) if insert else np.linspace(1.0, 0.0, T + 1)
     energies = alch.energies()
     work = 0.0
+    if settings.kernel == "langevin":
+        m = np.concatenate([system.substrate_masses(), system.masses()])[:, None]
+        v = rng.standard_normal((len(m), 3)) / np.sqrt(beta * m)
+    kernel = _kernel_hmc if settings.kernel == "hmc" else _kernel_mc
     for t in range(1, T + 1):
         if not np.all(np.isfinite(energies)):
             return math.inf, energies
         work += (lams[t] - lams[t - 1]) * (energies[0] - energies[1])
         if t < T:
             for _ in range(settings.kernel_steps):
-                energies = kernel(alch, float(lams[t]), energies, settings, beta, rng)
+                if settings.kernel == "langevin":
+                    energies, v, shadow = _kernel_langevin(alch, float(lams[t]), energies, v,
+                                                           settings, beta, rng)
+                    work += shadow
+                    if not np.isfinite(shadow):
+                        return math.inf, energies
+                else:
+                    energies = kernel(alch, float(lams[t]), energies, settings, beta, rng)
     return float(work), energies

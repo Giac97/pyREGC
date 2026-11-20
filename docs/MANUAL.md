@@ -1689,9 +1689,15 @@ def factory(rng):
   `ncmc_steps × kernel_steps × (leapfrog_steps + 1) × 2` force
   evaluations. `weight` sets how often a GC attempt is a subsurface
   one; each atomic gas channel has weight 1.
-- **Kernels:** HMC, or single-atom MC (`kernel="mc"`). Thermostatted MD
-  is not in detailed balance, so it is not offered as an NCMC kernel.
-  The REGC diffusion steps between GC attempts can still use MD.
+- **Kernels:** HMC, Langevin (`kernel="langevin"`) or single-atom MC
+  (`kernel="mc"`).
+  - Langevin uses the BAOAB integrator. Its momenta persist through the
+    switch, and the friction carries the released strain energy away
+    as heat, so it usually dissipates less work than full-refresh HMC.
+    The integrator's shadow work enters the acceptance, so the moves
+    stay exact at any time step.
+  - Velocity-rescaling MD is not offered as a kernel.
+  - The REGC diffusion steps between GC attempts can still use MD.
 - **Region:** z_min should stay above the frozen layers, whose sites
   cannot relax. Watch `insert_sub:<species>` in the acceptance rates.
   If it is near zero, use more `ncmc_steps`, a smaller `delta` or a
@@ -2534,9 +2540,10 @@ other insertions and deletions to z ≥ z_c.
 | `species` | see §10.2 | Species with a subsurface channel. The default is every exchanged species; with `molecules`, the atomic-exchange species plus the elements of homonuclear diatomic gases. |
 | `delta_angstrom` | 0.3 | Radius of the insertion ball around a site. |
 | `ncmc_steps` | 10 | λ steps of the switching protocol. |
-| `kernel` | `hmc` | `hmc` or `mc` propagation at fixed λ. |
-| `kernel_steps` | 1 | HMC trajectories, or MC sweeps, per λ step. |
-| `leapfrog_steps`, `timestep_fs` | 5, 1.0 | HMC kernel. |
+| `kernel` | `hmc` | `hmc`, `langevin` or `mc` propagation at fixed λ. |
+| `kernel_steps` | 1 | HMC trajectories, Langevin segments, or MC sweeps per λ step. |
+| `leapfrog_steps`, `timestep_fs` | 5, 1.0 | Integration steps per HMC trajectory or Langevin segment, and their time step. |
+| `friction_per_fs` | 0.05 | Langevin friction γ (1/fs). |
 | `max_disp` | 0.1 | MC kernel displacement, Å. |
 | `weight` | 1 | Frequency of each subsurface channel; each atomic gas channel has weight 1. |
 | `site_min_distance` | 1.0 | Drop sites closer than this to a metal atom (Å). |

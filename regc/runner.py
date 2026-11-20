@@ -109,7 +109,7 @@ _SECTIONS = {
     "sgc": {"species", "dmu_eV", "attempts_per_step", "bulk_composition", "ensemble"},
     "subsurface": {"z_cut_below_surface", "depth_angstrom", "species", "delta_angstrom",
                    "ncmc_steps", "kernel", "kernel_steps", "leapfrog_steps", "timestep_fs",
-                   "max_disp", "weight", "site_min_distance"},
+                   "friction_per_fs", "max_disp", "weight", "site_min_distance"},
     "gas": {"species", "mass_amu", "insertion_z_range_above_surface",
             "insertion_shell_around_cluster", "composition", "atomic_exchange"},
     "reservoir": {"type", "d0", "D0_eV", "e_atom_eV", "bond_length_angstrom",
@@ -1537,6 +1537,8 @@ def _subsurface_settings(config: Dict[str, Any], geometry: Any, species: Sequenc
         kernel_steps=int(sec.get("kernel_steps", 1)),
         leapfrog_steps=int(sec.get("leapfrog_steps", 5)),
         dt=_as_float(sec.get("timestep_fs", 1.0), "subsurface.timestep_fs") / FS_PER_INTERNAL_TIME,
+        friction=_as_float(sec.get("friction_per_fs", 0.05), "subsurface.friction_per_fs")
+        * FS_PER_INTERNAL_TIME,
         max_disp=_as_float(sec.get("max_disp", 0.1), "subsurface.max_disp"),
         weight=_as_float(sec.get("weight", 1.0), "subsurface.weight"),
         site_min_distance=_as_float(sec.get("site_min_distance", 1.0),

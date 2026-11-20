@@ -816,7 +816,25 @@ where $K_\lambda$ is a kernel in detailed balance with $e^{-\beta U_\lambda}$: a
 every displaceable atom (substrate and mobile, the switched one included, with full momentum
 refresh and a Metropolis test), or single-atom Metropolis displacements. A removal runs the reversed
 schedule $\lambda_t = 1 - t/T$, so its kernels are those of the insertion in the reverse order.
-Thermostatted MD is not in detailed balance and is not offered as a kernel.
+
+The third kernel is Langevin dynamics with the palindromic BAOAB splitting (V R O R V; `kernel:
+langevin`). Velocities are drawn from Maxwell–Boltzmann at the start of the switch, carried through
+every $\lambda$ step and discarded at the end. A discrete Langevin step is not in detailed balance,
+but for this splitting the total work
+
+$$
+W = W_\text{prot} + W_\text{shad}, \qquad
+W_\text{shad} = \sum_\text{steps}\big[(K_1 - K_0) + (K_3 - K_2) + U_\lambda(\mathbf x') - U_\lambda(\mathbf x)\big]
+\qquad (30a)
+$$
+
+obeys the Crooks fluctuation theorem exactly at any time step (Sivak, Chodera, Crooks, PRX 3, 011007
+(2013)). Here $W_\text{prot}$ is (30), $K_0 \dots K_3$ are the kinetic energies around the two kicks,
+and the heat exchanged in the O substep is excluded. Using this $W$ in (31) makes the moves exact.
+The friction carries the strain energy released by the relaxing lattice into the bath as heat, so
+it does not count against acceptance. GCNCMC (Melling et al., JCTC 19, 1050 (2023)) uses Langevin
+propagation in the same way. Thermostatted MD with velocity rescaling has no such work accounting
+and is not offered as a kernel.
 
 **Acceptance.** With $z_s = e^{\beta\mu_s}/\Lambda_s^3$ and $N_\text{sub}$ the number of atoms of
 species $s$ in the region,
@@ -850,7 +868,8 @@ surface.
 **Tests** (`tests/test_subsurface.py`). For fcc(100) the sites are exactly the octahedral and
 tetrahedral holes. The proposal density integrates to the probability of landing in the region. In a
 one-body potential well $f(z)$ the mean number of atoms in the subsurface and gas regions equals
-$zA\int e^{-\beta f}dz$ for $T = 1$, HMC and MC kernels. The running energy stays exact with a
+$zA\int e^{-\beta f}dz$ for $T = 1$ and for the HMC, Langevin and MC kernels. At zero friction the
+shadow work equals the integrator's energy error. The running energy stays exact with a
 displaceable substrate.
 
 ## 12. Summary of changes relative to [ZSG]
