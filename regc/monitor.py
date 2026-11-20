@@ -34,7 +34,7 @@ import time
 import warnings
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote
 
 import numpy as np
@@ -425,6 +425,71 @@ def discover(paths: List[str]) -> List[Run]:
     return runs
 
 
+def _json_bytes(data) -> bytes:
+    """
+    JSON with NaN and infinities as null.
+
+    Parameters
+    ----------
+    data : object
+        Payload.
+
+    Returns
+    -------
+    bytes
+        UTF-8 JSON.
+    """
+    return json.dumps(data, default=float).replace("NaN", "null").replace(
+        "-Infinity", "null").replace("Infinity", "null").encode()
+
+
+def route(path: str, runs: List[Run], plotly_js: Optional[str] = None) -> Tuple[bytes, str, int]:
+    """
+    Answer one monitor GET request (also mounted under ``/monitor/`` by `regc.gui`).
+
+    Parameters
+    ----------
+    path : str
+        Unquoted request path without the query: ``/``, ``/plotly.min.js``,
+        ``/api/runs``, ``/api/run/<i>`` or ``/file/<i>/<name>``.
+    runs : list of Run
+        The monitored runs (the list may grow while the server runs).
+    plotly_js : str, optional
+        Local ``plotly.min.js``. Default None.
+
+    Returns
+    -------
+    tuple
+        ``(body, content type, HTTP status)``.
+    """
+    if path in ("/", "/index.html"):
+        return PAGE.encode(), "text/html; charset=utf-8", 200
+    if path == "/plotly.min.js":
+        if plotly_js and os.path.isfile(plotly_js):
+            with open(plotly_js, "rb") as f:
+                return f.read(), "text/javascript", 200
+        return b"", "text/javascript", 404
+    if path == "/api/runs":
+        return _json_bytes([{"id": i, "name": r.name, "directory": r.directory,
+                             "log": r._log_path()} for i, r in enumerate(runs)]), \
+            "application/json", 200
+    m = re.match(r"^/api/run/(\d+)$", path)
+    if m and int(m.group(1)) < len(runs):
+        try:
+            return _json_bytes(runs[int(m.group(1))].collect()), "application/json", 200
+        except Exception as err:  # noqa: BLE001 - report, keep serving
+            return _json_bytes({"error": f"{type(err).__name__}: {err}"}), "application/json", 500
+    m = re.match(r"^/file/(\d+)/([^/]+)$", path)
+    if m and int(m.group(1)) < len(runs):
+        name = os.path.basename(m.group(2))
+        ext = os.path.splitext(name)[1].lower()
+        full = os.path.join(runs[int(m.group(1))].directory, name)
+        if ext in _SERVED and os.path.isfile(full):
+            with open(full, "rb") as f:
+                return f.read(), _SERVED[ext], 200
+    return b"not found", "text/plain", 404
+
+
 def make_handler(runs: List[Run], plotly_js: Optional[str] = None):
     """
     The HTTP request handler class for a list of runs.
@@ -470,49 +535,10 @@ def make_handler(runs: List[Run], plotly_js: Optional[str] = None):
             self.end_headers()
             self.wfile.write(body)
 
-        def _json(self, data, code: int = 200) -> None:
-            """
-            Send JSON (NaN as null).
-
-            Parameters
-            ----------
-            data : object
-                Payload.
-            code : int, optional
-                Status. Default 200.
-            """
-            text = json.dumps(data, default=float).replace("NaN", "null").replace(
-                "-Infinity", "null").replace("Infinity", "null")
-            self._send(text.encode(), "application/json", code)
-
         def do_GET(self) -> None:  # noqa: N802 - http.server API
             """Serve one request."""
-            path = unquote(self.path.split("?", 1)[0])
-            if path in ("/", "/index.html"):
-                return self._send(PAGE.encode(), "text/html; charset=utf-8")
-            if path == "/plotly.min.js":
-                if plotly_js and os.path.isfile(plotly_js):
-                    with open(plotly_js, "rb") as f:
-                        return self._send(f.read(), "text/javascript")
-                return self._send(b"", "text/javascript", 404)
-            if path == "/api/runs":
-                return self._json([{"id": i, "name": r.name, "directory": r.directory,
-                                    "log": r._log_path()} for i, r in enumerate(runs)])
-            m = re.match(r"^/api/run/(\d+)$", path)
-            if m and int(m.group(1)) < len(runs):
-                try:
-                    return self._json(runs[int(m.group(1))].collect())
-                except Exception as err:  # noqa: BLE001 - report, keep serving
-                    return self._json({"error": f"{type(err).__name__}: {err}"}, 500)
-            m = re.match(r"^/file/(\d+)/([^/]+)$", path)
-            if m and int(m.group(1)) < len(runs):
-                name = os.path.basename(m.group(2))
-                ext = os.path.splitext(name)[1].lower()
-                full = os.path.join(runs[int(m.group(1))].directory, name)
-                if ext in _SERVED and os.path.isfile(full):
-                    with open(full, "rb") as f:
-                        return self._send(f.read(), _SERVED[ext])
-            self._send(b"not found", "text/plain", 404)
+            body, ctype, code = route(unquote(self.path.split("?", 1)[0]), runs, plotly_js)
+            self._send(body, ctype, code)
 
     return Handler
 
@@ -669,7 +695,9 @@ legend:{orientation:"h",y:1.12},hovermode:"closest"},extra||{})}
 const cfg={displaylogo:false,responsive:true,modeBarButtonsToRemove:["lasso2d","select2d"]};
 async function loadRuns(){runs=await (await fetch("api/runs")).json();
 $("run").innerHTML=runs.map(r=>`<option value="${r.id}">${r.name}</option>`).join("");
-$("run").onchange=()=>{cur=+$("run").value;sel=null;refresh()};}
+$("run").onchange=()=>{cur=+$("run").value;sel=null;refresh()};fromHash()}
+function fromHash(){const m=location.hash.match(/run=(\d+)/);if(m&&runs.some(r=>r.id==+m[1])){cur=+m[1];$("run").value=cur;sel=null}}
+window.addEventListener("hashchange",async()=>{await loadRuns();refresh()});
 function axes(st,meta){const lab=st&&st.labels||{};const nT=st?st.shape[0]:0,nM=st?st.shape[1]:0;
 const TK=lab.temperatures_K||(meta&&meta.temperatures_K);let y=TK?TK.map(t=>t+" K"):st.temperatures.map(t=>"T="+fmtN(t,4));
 const P=lab.pressures||(meta&&meta.pressures),u=lab.pressure_unit||(meta&&meta.pressure_unit)||"";

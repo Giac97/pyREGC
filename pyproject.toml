@@ -48,6 +48,7 @@ regc-run = "regc.runner:main"
 gcmc-re-run = "regc.runner:main"          # former name, kept for existing batch scripts
 regc-reevaluate = "regc.runner:reevaluate_main"
 regc-monitor = "regc.monitor:main"
+regc-gui = "regc.gui:main"
 
 [tool.setuptools_scm]
 # The version comes from git: a tag vX.Y.Z gives X.Y.Z; commits after it give

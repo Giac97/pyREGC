@@ -935,6 +935,52 @@ port: `ssh -L 8050:localhost:8050 user@node`. The page loads Plotly from
 a CDN, so the browser needs internet access but the node does not. For an
 offline browser, pass `--plotly-js path/to/plotly.min.js`.
 
+With a subsurface section, the monitor also shows subsurface atoms. The
+progress card holds whole-grid totals: atoms in the subsurface region now,
+and accepted NCMC insertions and removals. The grid can show the mean or
+current subsurface N per replica and its acceptance, and the traces include
+N_sub.
+
+### 7.2 Building, running and monitoring from a browser: `regc-gui`
+
+```bash
+regc-gui examples/                 # then open http://127.0.0.1:8060
+python -m regc.gui . --port 8061 --pythonpath /path/to/other/worktree
+```
+
+`regc-gui` serves a local page over a workspace directory. It finds every
+config (`*.yaml` with a `replica_exchange` section, up to four levels
+deep; output directories are skipped). The page has three tabs.
+
+- **Build**: edit a config as YAML, or through a form of the common keys
+  (structure, gas and reservoir, calculator, ladder, sampling,
+  convergence, subsurface, output). Helpers fill a geometric T ladder and
+  a log-spaced pressure ladder. *Form → YAML* rewrites the text without
+  its comments. *Validate* runs `validate_config` and shows the grid size.
+  *Save* writes the file, only inside the workspace, and replaces an
+  existing file only when *overwrite* is ticked. *Check setup* runs
+  `regc-run --check` and shows its output. Built-in templates: a
+  one-minute EMT test and a slab + O2 MLIP skeleton.
+- **Runs**: every config with its output directory, state, progress, latest
+  convergence check and subsurface totals. The states are new, starting,
+  running, stalled, finished, converged, stopped (a checkpoint to resume
+  from) and error. The actions are *Start* (refused over an existing
+  checkpoint), *Resume* (`--resume`), *Start over* (`--overwrite`),
+  *Analyze* (`--analyze-only`), *Stop* (SIGTERM to the run's process group,
+  so the last checkpoint stays), *Monitor* and *Log*.
+- **Monitor**: the §7.1 page for the chosen run, mounted under `/monitor/`.
+
+Runs are launched the same way as the examples' `run_monitor.sh` scripts:
+detached (`setsid`), in the config's directory, logging to
+`<output>/run.log`, with the process id in `<output>/run.pid`. They outlive
+the GUI, and the GUI and the scripts see each other's runs. They use the
+GUI's interpreter (`--python`) and `PYTHONPATH` = `--pythonpath`. By
+default that is the directory holding the `regc` package the GUI imported;
+it can be changed on the Runs tab, e.g. to another git worktree. The
+server listens on 127.0.0.1. Requests that write files or start or stop
+processes need a token that only the served page holds, so other pages
+open in the same browser cannot send them.
+
 ## 8. Saving and loading samples
 
 ```python
