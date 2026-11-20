@@ -283,7 +283,7 @@ class Replica:
         None
         """
         sysm = self.system
-        if getattr(sysm, 'molecules', ()):
+        if getattr(sysm, 'molecules', ()) or getattr(sysm, 'subsurface', None) is not None:
             self._move_gc_channel(insert=True)
             return
         if sysm.n_exchange_species > 1:
@@ -323,7 +323,7 @@ class Replica:
         None
         """
         sysm = self.system
-        if getattr(sysm, 'molecules', ()):
+        if getattr(sysm, 'molecules', ()) or getattr(sysm, 'subsurface', None) is not None:
             self._move_gc_channel(insert=False)
             return
         if sysm.n_exchange_species > 1:
@@ -470,9 +470,11 @@ class Replica:
         One GC attempt when molecules are exchanged: pick a channel, then move.
 
         The channels are every atomically exchanged species
-        (`ParticleSystem.atomic_exchange`, weight 1 each) and every molecule
-        (weight `MoleculeMove.weight`); the choice does not depend on the
-        configuration and is the same for insertions and deletions, so
+        (`ParticleSystem.atomic_exchange`, weight 1 each), every molecule
+        (weight `MoleculeMove.weight`) and, with subsurface sites
+        (`SlabSystem.set_subsurface`), every subsurface species (weight
+        ``Subsurface.weight``, NCMC moves); the choice does not depend on
+        the configuration and is the same for insertions and deletions, so
         each channel satisfies detailed balance on its own.
 
         Parameters
@@ -485,17 +487,23 @@ class Replica:
         None
         """
         sysm = self.system
-        atomic = tuple(getattr(sysm, 'atomic_exchange', ()))
-        mols = tuple(sysm.molecules)
-        w = np.array([1.0] * len(atomic) + [m.weight for m in mols])
+        atomic = tuple(getattr(sysm, 'atomic_exchange', sysm.exchange_species_list))
+        mols = tuple(getattr(sysm, 'molecules', ()))
+        sub = getattr(sysm, 'subsurface', None)
+        sub_species = tuple(sub.species) if sub is not None else ()
+        w = np.array([1.0] * len(atomic) + [m.weight for m in mols]
+                     + [sub.weight] * len(sub_species) if sub is not None
+                     else [1.0] * len(atomic) + [m.weight for m in mols])
         c = int(self.rng.choice(len(w), p=w / w.sum()))
         if c < len(atomic):
             s = sysm.exchange_species_list.index(atomic[c])
             (self._insert_species_index if insert else self._delete_species_index)(s)
-        elif insert:
-            self._move_insert_molecule(mols[c - len(atomic)])
+        elif c < len(atomic) + len(mols):
+            m = mols[c - len(atomic)]
+            (self._move_insert_molecule if insert else self._move_delete_molecule)(m)
         else:
-            self._move_delete_molecule(mols[c - len(atomic)])
+            sp = sub_species[c - len(atomic) - len(mols)]
+            (self._move_insert_subsurface if insert else self._move_delete_subsurface)(sp)
 
     def _log_activity(self, mol) -> float:
         """
@@ -592,6 +600,162 @@ class Replica:
             sysm.apply_delete_many(unit)
             self.energy += du
         self._count('delete', f"mol:{mol.name}", accept)
+
+    # -- subsurface insertion / removal with NCMC (regc.subsurface) ----------------------
+    def _subsurface_count(self, sp: str) -> int:
+        """
+        Number of mobile atoms of species `sp` in the subsurface region.
+
+        Parameters
+        ----------
+        sp : str
+            The species.
+
+        Returns
+        -------
+        int
+            The count.
+        """
+        sysm = self.system
+        sub = sysm.subsurface
+        return int(np.count_nonzero(sub.in_region(sysm.positions) & (sysm.species == sp)))
+
+    def _log_z(self, sp: str) -> float:
+        """
+        log z_s = beta mu_s - ln Lambda_s^3 of an exchanged species.
+
+        Parameters
+        ----------
+        sp : str
+            The species.
+
+        Returns
+        -------
+        float
+            The log activity.
+        """
+        k = self.system.exchange_species_list.index(sp)
+        return float(self.state.beta * self.state.mu_vec[k] - np.log(self.state.lambda_cubed_vec[k]))
+
+    def _save_state(self) -> tuple:
+        """
+        Copies of everything an NCMC move may change.
+
+        Returns
+        -------
+        tuple
+            Mobile positions and species, substrate positions.
+        """
+        sysm = self.system
+        return sysm.positions.copy(), sysm.species.copy(), sysm.substrate_positions.copy()
+
+    def _restore_state(self, saved: tuple) -> None:
+        """
+        Undo an NCMC move.
+
+        Parameters
+        ----------
+        saved : tuple
+            Output of `_save_state`.
+
+        Returns
+        -------
+        None
+        """
+        sysm = self.system
+        sysm.positions, sysm.species, sysm.substrate_positions = (saved[0].copy(), saved[1].copy(),
+                                                                  saved[2].copy())
+
+    def _move_insert_subsurface(self, sp: str) -> None:
+        """
+        Attempt to insert an atom of species `sp` at a subsurface site, with NCMC.
+
+        A site of the current metal configuration is drawn uniformly, the
+        atom placed uniformly in its delta-ball and switched on (lambda 0 ->
+        1) while the system relaxes (`regc.subsurface.ncmc`); accepted with
+        min(1, z_s exp(-beta W) / (N_sub' q(y; x))), N_sub' the atoms of the
+        species in the region at the end (docs/REGC_algorithm.md, Sec. 11).
+        Rejected if the proposal or the final position of the atom is
+        outside the region. Counted under ``'insert'`` and
+        ``'insert_sub:<sp>'``.
+
+        Parameters
+        ----------
+        sp : str
+            The species.
+
+        Returns
+        -------
+        None
+        """
+        from .subsurface import ncmc
+        sysm, sub = self.system, self.system.subsurface
+        sites = sub.sites(sysm)
+        accept = False
+        if len(sites):
+            y = sysm.wrap_position(sub.propose(sites, self.rng))
+            log_q = sub.log_q(y, sites, sysm)
+            if np.isfinite(log_q) and np.isfinite(sysm.external_energy(y)):
+                saved = self._save_state()
+                sysm.positions = np.vstack([sysm.positions, y])
+                sysm.species = np.append(sysm.species, sp)
+                i = sysm.n - 1
+                work, (u_with, _) = ncmc(sysm, i, True, sub, self.state.beta, self.rng)
+                ok = np.isfinite(work) and sub.in_region(sysm.positions[i:i + 1])[0]
+                if ok:
+                    log_arg = (self._log_z(sp) - self.state.beta * work
+                               - np.log(self._subsurface_count(sp)) - log_q)
+                    accept = bool(log_arg >= 0.0 or self.rng.random() < np.exp(log_arg))
+                if accept:
+                    self.energy = u_with
+                else:
+                    self._restore_state(saved)
+        self._count('insert', f"sub:{sp}", accept)
+
+    def _move_delete_subsurface(self, sp: str) -> None:
+        """
+        Attempt to remove a subsurface atom of species `sp`, with NCMC.
+
+        Picks one of the N_sub atoms of the species in the region
+        uniformly, switches it off (lambda 1 -> 0) while the system relaxes,
+        and deletes it; accepted with min(1, N_sub q(y; x') exp(-beta W) /
+        z_s), y its final position and x' the configuration without it --
+        the reverse of `_move_insert_subsurface`. A no-op without
+        subsurface atoms. Counted under ``'delete'`` and
+        ``'delete_sub:<sp>'``.
+
+        Parameters
+        ----------
+        sp : str
+            The species.
+
+        Returns
+        -------
+        None
+        """
+        from .subsurface import ncmc
+        sysm, sub = self.system, self.system.subsurface
+        cand = np.flatnonzero(sub.in_region(sysm.positions) & (sysm.species == sp))
+        if len(cand) == 0:
+            return
+        n_before = len(cand)
+        i = int(cand[self.rng.integers(n_before)])
+        saved = self._save_state()
+        work, (_, u_without) = ncmc(sysm, i, False, sub, self.state.beta, self.rng)
+        accept = False
+        if np.isfinite(work):
+            y = sysm.positions[i].copy()
+            sysm.positions = np.delete(sysm.positions, i, axis=0)
+            sysm.species = np.delete(sysm.species, i)
+            log_q = sub.log_q(y, sub.sites(sysm), sysm)
+            if np.isfinite(log_q):
+                log_arg = (np.log(n_before) + log_q - self._log_z(sp) - self.state.beta * work)
+                accept = bool(log_arg >= 0.0 or self.rng.random() < np.exp(log_arg))
+        if accept:
+            self.energy = u_without
+        else:
+            self._restore_state(saved)
+        self._count('delete', f"sub:{sp}", accept)
 
     def _move_identity(self) -> None:
         """

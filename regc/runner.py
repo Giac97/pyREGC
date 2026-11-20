@@ -30,6 +30,9 @@ surface phase diagram, all from one YAML or JSON file.
    potentials (`MolecularGasFeed`), each optionally exchanged as a
    molecule (`regc.molecules.MoleculeMove`), plus ``gas.atomic_exchange``
    for species also exchanged atom by atom.
+   A ``subsurface`` section (slab) adds NCMC insertion and removal in
+   interstitial sites below the surface (`regc.subsurface`) and confines
+   the other moves to the gas region above it.
 4. **replica_exchange** -- a (T x p) ladder (``pressures``, mu from the
    reservoir) or an explicit (T x mu) one (``mu_eV``); the [ZSG] REGC
    scheme (``scheme: regc``, MC/HMC/MD diffusion) or the sweep scheme;
@@ -104,6 +107,9 @@ _SECTIONS = {
     "structure": {"file", "build", "cluster", "geometry", "n_frozen_layers", "headroom_angstrom",
                   "layer_tol", "frozen", "full_coordination", "alloy", "alloy_seed", "alloy_per_layer"},
     "sgc": {"species", "dmu_eV", "attempts_per_step", "bulk_composition", "ensemble"},
+    "subsurface": {"z_cut_below_surface", "depth_angstrom", "species", "delta_angstrom",
+                   "ncmc_steps", "kernel", "kernel_steps", "leapfrog_steps", "timestep_fs",
+                   "max_disp", "weight", "site_min_distance"},
     "gas": {"species", "mass_amu", "insertion_z_range_above_surface",
             "insertion_shell_around_cluster", "composition", "atomic_exchange"},
     "reservoir": {"type", "d0", "D0_eV", "e_atom_eV", "bond_length_angstrom",
@@ -408,6 +414,8 @@ def validate_config(config: Dict[str, Any]) -> None:
             _check_keys(config[name], allowed, name)
     if "molecules" in config:
         _validate_molecules(config)
+    if "subsurface" in config and _geometry_kind(config["structure"]) != "slab":
+        raise ValueError("the subsurface section (NCMC insertion in subsurface sites) needs a slab")
     for name in ("reservoir", "diatomic_reservoir"):
         if name in config:
             for sp, sec in _per_species_reservoir_cfg(config, _species_list(config)).items():
@@ -1457,6 +1465,84 @@ def _build_molecular_feed(config: Dict[str, Any], species: Sequence[str],
     return feed, moves, atomic
 
 
+def _subsurface_settings(config: Dict[str, Any], geometry: Any, species: Sequence[str],
+                         feed: Any, molecule_moves: Sequence, atomic_exchange: Optional[Sequence[str]]):
+    """
+    The ``subsurface`` section as `regc.subsurface.Subsurface` settings.
+
+    Default species: every exchanged species without a ``molecules``
+    section; with one, the atomically exchanged species and the element of
+    every homonuclear diatomic gas (O2, H2: their subsurface attempts are
+    atomic), not the elements of heteronuclear or larger molecules, which
+    are exchanged only above the surface.
+
+    Parameters
+    ----------
+    config : dict
+        The parsed config.
+    geometry : SlabGeometry
+        The slab (``top_z``).
+    species : sequence of str
+        The exchanged species.
+    feed : GasFeed or MolecularGasFeed or None
+        The gas feed.
+    molecule_moves : sequence of MoleculeMove
+        The molecular moves.
+    atomic_exchange : sequence of str or None
+        The atomically exchanged species (None without molecules).
+
+    Returns
+    -------
+    Subsurface or None
+        The settings; None without the section.
+
+    Raises
+    ------
+    ValueError
+        If no species qualifies, a species is not exchanged, or its
+        chemical potential is not fixed by the gases.
+    """
+    from .subsurface import Subsurface
+    sec = config.get("subsurface")
+    if sec is None:
+        return None
+    sec = sec or {}
+    if "species" in sec:
+        sub_species = [sec["species"]] if isinstance(sec["species"], str) else [
+            str(x) for x in sec["species"]]
+    elif "molecules" not in config:
+        sub_species = list(species)
+    else:
+        sub_species = list(atomic_exchange or [])
+        for g in feed.gases:
+            comp = g.composition
+            if len(comp) == 1 and sum(comp.values()) == 2:     # O2, H2, N2
+                sub_species += list(comp)
+        sub_species = list(dict.fromkeys(sub_species))
+    if not sub_species:
+        raise ValueError("subsurface: no species qualifies (heteronuclear and larger molecules "
+                         "are exchanged only above the surface); list subsurface.species")
+    foreign = sorted(set(sub_species) - set(species))
+    if foreign:
+        raise ValueError(f"subsurface.species {foreign} are not exchanged species {list(species)}")
+    if feed is not None and hasattr(feed, "check_moves"):
+        feed.check_moves({f"subsurface {e}": {e: 1} for e in sub_species})
+    z_cut = geometry.top_z - _as_float(sec.get("z_cut_below_surface", 0.0),
+                                       "subsurface.z_cut_below_surface")
+    depth = _as_float(sec.get("depth_angstrom", 4.0), "subsurface.depth_angstrom")
+    return Subsurface(
+        z_cut=z_cut, z_min=z_cut - depth, species=tuple(sub_species),
+        delta=_as_float(sec.get("delta_angstrom", 0.3), "subsurface.delta_angstrom"),
+        ncmc_steps=int(sec.get("ncmc_steps", 10)), kernel=str(sec.get("kernel", "hmc")).lower(),
+        kernel_steps=int(sec.get("kernel_steps", 1)),
+        leapfrog_steps=int(sec.get("leapfrog_steps", 5)),
+        dt=_as_float(sec.get("timestep_fs", 1.0), "subsurface.timestep_fs") / FS_PER_INTERNAL_TIME,
+        max_disp=_as_float(sec.get("max_disp", 0.1), "subsurface.max_disp"),
+        weight=_as_float(sec.get("weight", 1.0), "subsurface.weight"),
+        site_min_distance=_as_float(sec.get("site_min_distance", 1.0),
+                                    "subsurface.site_min_distance"))
+
+
 def _feed_to_meta(feed) -> Dict[str, Any]:
     """
     The metadata entries describing a gas feed.
@@ -1665,6 +1751,8 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
 
     exchange = species[0] if len(species) == 1 else list(species)
     sgc = _sgc_settings(config, geometry)
+    subsurface = _subsurface_settings(config, geometry, species, feed, molecule_moves,
+                                      atomic_exchange)
 
     def system_factory(rng):
         system = geometry.make_system(calc_spec.make(cell, pbc), exchange, mass_of_species=masses,
@@ -1673,6 +1761,8 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
             system.set_sgc_species(sgc["species"], canonical=sgc["canonical"])
         if atomic_exchange is not None:
             system.set_molecules(molecule_moves, atomic_exchange=atomic_exchange)
+        if subsurface is not None:
+            system.set_subsurface(subsurface)
         return system
 
     scheme = _scheme(re_cfg)
@@ -1694,6 +1784,8 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
     }
     if feed is not None:
         metadata.update(_feed_to_meta(feed))
+    if subsurface is not None:
+        metadata["subsurface"] = subsurface.metadata()
     if atomic_exchange is not None:
         metadata["molecules"] = [m.metadata() for m in molecule_moves]
         metadata["atomic_exchange"] = list(atomic_exchange)
@@ -1741,6 +1833,14 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
                   f"swappable atoms {dict(zip(sgc['species'], sgc['counts']))}, "
                   f"dmu vs {sgc['species'][0]} = {field}, "
                   f"{sgc['attempts_per_step']} identity attempts per step")
+        if subsurface is not None:
+            probe = geometry.make_system(calc_spec.make(cell, pbc), exchange,
+                                         mass_of_species=masses, **region)
+            n_sites = len(subsurface.sites(probe))
+            print(f"subsurface NCMC: {list(subsurface.species)} in {subsurface.z_min:.2f} <= z < "
+                  f"{subsurface.z_cut:.2f} A ({n_sites} interstitial sites), gas moves above; "
+                  f"{subsurface.ncmc_steps} lambda steps, {subsurface.kernel} kernel, "
+                  f"weight {subsurface.weight:g}")
         n_mu = np.shape(mu_grid)[-1 if len(species) == 1 else -2]
         print(f"replica grid: {len(temperatures_K)} T x {n_mu} "
               f"{'p' if pressures is not None else 'mu'} = {len(temperatures_K) * n_mu} replicas")
@@ -1752,6 +1852,7 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
             "insertion_z_range": insertion_z_range, "insertion_shell": insertion_shell,
             "system_factory": system_factory, "sgc": sgc,
             "molecules": molecule_moves, "atomic_exchange": atomic_exchange,
+            "subsurface": subsurface,
             "metadata": metadata}
 
 

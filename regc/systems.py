@@ -1534,6 +1534,49 @@ class SlabSystem(ParticleSystem):
             inside &= self.species == species
         return np.flatnonzero(inside)
 
+    def set_subsurface(self, settings) -> None:
+        """
+        Add subsurface NCMC channels and confine the instantaneous moves above z_c.
+
+        The exchange zone's lower bound is raised to ``settings.z_cut`` (if
+        it is lower), so the existing insertion and deletion moves (atomic
+        and molecular) act only in the gas region z >= z_c (a zone that
+        starts higher is kept: the gap is not exchanged); the subsurface
+        region below is
+        handled by the NCMC channels (`regc.subsurface`,
+        `Replica._move_insert_subsurface`). Calling it again with None
+        restores the original zone.
+
+        Parameters
+        ----------
+        settings : regc.subsurface.Subsurface or None
+            The channels (None: off).
+
+        Raises
+        ------
+        ValueError
+            If a subsurface species is not exchanged, z_cut is not below the
+            top of the original zone, or the region leaves the box.
+        """
+        full = getattr(self, "_full_insertion_z_range", self.insertion_z_range)
+        self._full_insertion_z_range = full
+        if settings is None:
+            self.subsurface = None
+            self.insertion_z_range = full
+            return
+        missing = sorted(set(settings.species) - set(self.exchange_species_list))
+        if missing:
+            raise ValueError(f"subsurface species {missing} are not exchanged species "
+                             f"{list(self.exchange_species_list)}")
+        z_lo, z_hi = full
+        if not settings.z_cut < z_hi:
+            raise ValueError(f"subsurface z_cut {settings.z_cut:.3f} must lie below the top of the "
+                             f"exchange zone ({z_hi:.3f})")
+        if settings.z_min <= 0.0:
+            raise ValueError(f"subsurface z_min {settings.z_min:.3f} is outside the box (0, Lz]")
+        self.subsurface = settings
+        self.insertion_z_range = (max(z_lo, settings.z_cut), z_hi)
+
     def in_exchange_zone(self, positions: np.ndarray) -> np.ndarray:
         """
         Whether positions have ``z_lo <= z < z_hi`` (the insertion range).

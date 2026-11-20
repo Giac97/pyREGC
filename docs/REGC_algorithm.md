@@ -775,7 +775,85 @@ among the partners) and CH$_4$ (24 orderings and the mirror mixture). With atomi
 and $N_\text{O}$ are independent Poisson variables. In an interacting gas, atomic and atomic + molecular
 exchange give the same averages. The running energy matches a recomputation with EMT.
 
-## 11. Summary of changes relative to [ZSG]
+## 11. Subsurface insertion with nonequilibrium candidate Monte Carlo (an extension beyond [ZSG])
+
+An atom inserted at a random point inside a metal is essentially never accepted: the lattice has no
+room until it relaxes around the new atom. `regc.subsurface` (config section `subsurface`,
+`SlabSystem.set_subsurface`) splits a slab at a fixed height $z_c$:
+
+* **gas region** $z \ge z_c$: the instantaneous moves of §2.3–2.4, §8 and §10 (atoms and molecules).
+  The exchange zone's lower bound is raised to $z_c$, so they act only there;
+* **subsurface region** $z_\text{min} \le z < z_c$: one channel per species, with site-biased
+  insertion and nonequilibrium candidate Monte Carlo (NCMC, Nilmeier et al., PNAS 108, E1009 (2011)).
+
+**Sites and proposal.** The interstitial sites $\{\mathbf s_k\}_{k=1}^{K}$ of a configuration
+$\mathbf x$ are the vertices of the Voronoi tessellation of its metal atoms (frozen and displaceable,
+with their periodic images) that lie in the region, at least `site_min_distance` from every metal
+atom, merged within 0.25 Å (`Subsurface.sites`). For fcc they are the octahedral and tetrahedral
+holes. An insertion draws a site uniformly and a point uniformly in its ball of radius $\delta$:
+
+$$
+q(\mathbf y;\mathbf x) = \frac{1}{K(\mathbf x)} \sum_{k:\,|\mathbf y-\mathbf s_k|<\delta} \frac{1}{V_\delta},
+\qquad V_\delta = \tfrac43\pi\delta^3 .
+\qquad (29)
+$$
+
+The sites move with the metal atoms, so $q$ depends on $\mathbf x$. Weighting the sites by the volume of
+their Voronoi cells, as in the original algorithm, would only change the efficiency, and the uniform
+choice keeps (29) exactly computable.
+
+**NCMC.** With $U_\lambda = (1-\lambda)\,U_N + \lambda\,U_{N+1}$ ($U_N$: the energy without the switched
+atom; a hard boundary forbids it at every $\lambda$) and a schedule $\lambda_t = t/T$, the protocol
+(`subsurface.ncmc`) accumulates the work
+
+$$
+W = \sum_{t=1}^{T}\big[U_{\lambda_t}(\mathbf x_{t-1}) - U_{\lambda_{t-1}}(\mathbf x_{t-1})\big],
+\qquad \mathbf x_t = K_{\lambda_t}(\mathbf x_{t-1}) \;\; (t < T),
+\qquad (30)
+$$
+
+where $K_\lambda$ is a kernel in detailed balance with $e^{-\beta U_\lambda}$: an HMC trajectory of
+every displaceable atom (substrate and mobile, the switched one included, with full momentum
+refresh and a Metropolis test), or single-atom Metropolis displacements. A removal runs the reversed
+schedule $\lambda_t = 1 - t/T$, so its kernels are those of the insertion in the reverse order.
+Thermostatted MD is not in detailed balance and is not offered as a kernel.
+
+**Acceptance.** With $z_s = e^{\beta\mu_s}/\Lambda_s^3$ and $N_\text{sub}$ the number of atoms of
+species $s$ in the region,
+
+$$
+P_\text{acc}^\text{ins} = \min\!\left[1, \frac{z_s\, e^{-\beta W}}{N_\text{sub}(\mathbf x')\; q(\mathbf y;\mathbf x)}\right],
+\qquad
+P_\text{acc}^\text{rem} = \min\!\left[1, \frac{N_\text{sub}(\mathbf x)\; q(\mathbf y;\mathbf x')\; e^{-\beta W}}{z_s}\right]
+\qquad (31)
+$$
+
+(`Replica._move_insert_subsurface`, `_move_delete_subsurface`). For an insertion, $\mathbf y$ is the
+proposed point and $\mathbf x'$ the final configuration. For a removal, $\mathbf y$ is the switched
+atom's final position and $\mathbf x'$ the configuration without it. The atom counts are taken in
+the configuration where the reverse move would pick, because the propagation can carry other atoms
+across the region's boundaries. A proposal outside the region, or a switched atom that ends outside
+it, is rejected, which keeps the pair of moves reversible. Summing the kernels' detailed balance
+along the path turns the ratio of path probabilities into $e^{-\beta(W - \Delta U)}$, and (31)
+follows. With $T = 1$ (no propagation) $W = \Delta U$, and (31) is an instantaneous site-biased
+insertion. For one atom and $q = 1/V_\text{ex}$ it reduces to (17).
+
+**Channels.** A GC attempt picks a channel independently of the configuration and alike for insertions
+and deletions: an atomic gas channel per atomically exchanged species (weight 1), a molecule (its
+`weight`), or a subsurface species (`subsurface.weight`). Each channel is in detailed balance on its own.
+Molecules are exchanged only in the gas region. The default subsurface species are the exchanged
+species without a `molecules` section. With one, they are the atomically exchanged species and the
+elements of homonuclear diatomic gases (O$_2$, H$_2$: their subsurface attempts are atomic, with
+$\mu_\text{O} = \mu_{\text{O}_2}/2$). Heteronuclear and larger molecules (CO, CH$_4$) stay above the
+surface.
+
+**Tests** (`tests/test_subsurface.py`). For fcc(100) the sites are exactly the octahedral and
+tetrahedral holes. The proposal density integrates to the probability of landing in the region. In a
+one-body potential well $f(z)$ the mean number of atoms in the subsurface and gas regions equals
+$zA\int e^{-\beta f}dz$ for $T = 1$, HMC and MC kernels. The running energy stays exact with a
+displaceable substrate.
+
+## 12. Summary of changes relative to [ZSG]
 
 | # | Item | Status |
 |---|---|---|
@@ -792,3 +870,4 @@ exchange give the same averages. The running energy matches a recomputation with
 | 9 | Several gas reservoirs at once (e.g. O + Cl) | **Implemented:** Eqs. (16)–(19), §8 |
 | 10 | Semi-grand-canonical substrate (identity swaps) with a gas | **Implemented:** Eqs. (22)–(24), §9 |
 | 11 | Molecular insertion/deletion (CO, O$_2$, CH$_4$, ...) with elemental $\mu$ from gas mixtures | **Implemented:** Eqs. (25)–(28), §10 |
+| 12 | Subsurface insertion/removal: site-biased proposal + NCMC | **Implemented:** Eqs. (29)–(31), §11 |

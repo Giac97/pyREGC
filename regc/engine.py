@@ -345,6 +345,14 @@ class ReplicaExchangeGCMC:
         if self.molecules:
             self.observables = check_observables(self.observables
                                                  + [MoleculeCounts(self.molecules)])
+        # subsurface NCMC channels: the same settings in every system
+        sub = getattr(built[0][2], "subsurface", None)
+        sub_sig = None if sub is None else sub.signature()
+        if any((None if getattr(sysm, "subsurface", None) is None
+                else sysm.subsurface.signature()) != sub_sig for _, _, sysm in built):
+            raise ValueError("every system from system_factory must use the same subsurface "
+                             "settings (SlabSystem.set_subsurface)")
+        self.subsurface = sub
 
         self.grid: Dict[Tuple[int, int], Replica] = {}
         self.samples: Dict[Tuple[int, int], Dict[str, list]] = {}

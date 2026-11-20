@@ -1649,6 +1649,54 @@ analysis = MBARSurfaceAnalysis(samples, mu_of_Tp=functools.partial(feed.mu_at_T_
   minimum, as happens with EMT's CH4 and CO2. Compare `gas.energy_eV`
   and `gas.vib_wavenumbers_cm` with experiment before a long run.
 
+### 10.2 Subsurface sites (NCMC)
+
+Uniform insertions almost never place an atom inside a metal. The
+lattice needs to relax around it first. `SlabSystem.set_subsurface`
+splits the slab at a fixed height z_c:
+
+- **Above z_c (the gas region):** all the usual insertions and
+  deletions, atomic and molecular. The exchange zone is clipped there.
+- **Below z_c (the subsurface region):** one channel per species. An
+  insertion picks an interstitial site uniformly. The sites are the
+  Voronoi vertices of the metal atoms, which for fcc are the octahedral
+  and tetrahedral holes. The atom goes at a random point within `delta`
+  of the site and is switched on gradually with NCMC: λ goes 0 → 1 in
+  `ncmc_steps` steps while HMC or MC relaxes the atom, its neighbours
+  and the displaceable substrate. The protocol work replaces the energy
+  change in the acceptance. A removal switches a random subsurface atom
+  off along the reversed schedule. Both moves are exact
+  (docs/REGC_algorithm.md §11).
+
+```python
+from regc.subsurface import Subsurface
+
+sub = Subsurface(z_cut=geometry.top_z, z_min=geometry.top_z - 4.0, species=["O"],
+                 delta=0.3, ncmc_steps=10, kernel="hmc", leapfrog_steps=5,
+                 dt=1.0 / 10.18, weight=0.5)
+
+def factory(rng):
+    s = geometry.make_system(calc, "O")
+    s.set_subsurface(sub)
+    return s
+```
+
+- **Molecules:** molecule moves act only above z_c. For homonuclear
+  diatomics (O2, H2) the runner adds an atomic subsurface channel for
+  their element, valid because μ_O = μ_O2 / 2. CO, CH4 and other
+  heteronuclear or larger molecules never go below the surface.
+- **Cost:** each subsurface attempt costs about
+  `ncmc_steps × kernel_steps × (leapfrog_steps + 1) × 2` force
+  evaluations. `weight` sets how often a GC attempt is a subsurface
+  one; each atomic gas channel has weight 1.
+- **Kernels:** HMC, or single-atom MC (`kernel="mc"`). Thermostatted MD
+  is not in detailed balance, so it is not offered as an NCMC kernel.
+  The REGC diffusion steps between GC attempts can still use MD.
+- **Region:** z_min should stay above the frozen layers, whose sites
+  cannot relax. Watch `insert_sub:<species>` in the acceptance rates.
+  If it is near zero, use more `ncmc_steps`, a smaller `delta` or a
+  larger `site_min_distance`.
+
 ## 11. Worked examples
 
 Each example below is a complete script. The examples in §11.1–11.5
@@ -2473,6 +2521,29 @@ species, key the section by species: `reservoir: {O: {...}, Cl: {...}}`.
 
 The reservoir is built when the ladder uses `pressures`, or when there
 is a `phase_diagram` or `reservoir` section.
+
+### 14.4c `subsurface`
+
+Slab only. It adds subsurface NCMC channels (§10.2) and confines the
+other insertions and deletions to z ≥ z_c.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `z_cut_below_surface` | 0 | z_c = topmost slab atom − this (Å). |
+| `depth_angstrom` | 4.0 | The subsurface region is z_c − depth ≤ z < z_c. |
+| `species` | see §10.2 | Species with a subsurface channel. The default is every exchanged species; with `molecules`, the atomic-exchange species plus the elements of homonuclear diatomic gases. |
+| `delta_angstrom` | 0.3 | Radius of the insertion ball around a site. |
+| `ncmc_steps` | 10 | λ steps of the switching protocol. |
+| `kernel` | `hmc` | `hmc` or `mc` propagation at fixed λ. |
+| `kernel_steps` | 1 | HMC trajectories, or MC sweeps, per λ step. |
+| `leapfrog_steps`, `timestep_fs` | 5, 1.0 | HMC kernel. |
+| `max_disp` | 0.1 | MC kernel displacement, Å. |
+| `weight` | 1 | Frequency of each subsurface channel; each atomic gas channel has weight 1. |
+| `site_min_distance` | 1.0 | Drop sites closer than this to a metal atom (Å). |
+
+```yaml
+subsurface: {z_cut_below_surface: 0.0, depth_angstrom: 4.0, ncmc_steps: 10, weight: 0.5}
+```
 
 ### 14.4b `molecules`
 
