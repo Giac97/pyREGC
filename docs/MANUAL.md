@@ -941,45 +941,68 @@ and accepted NCMC insertions and removals. The grid can show the mean or
 current subsurface N per replica and its acceptance, and the traces include
 N_sub.
 
-### 7.2 Building, running and monitoring from a browser: `regc-gui`
+### 7.2 Building, running and monitoring: `regc gui`
 
 ```bash
-regc-gui examples/                 # then open http://127.0.0.1:8060
-python -m regc.gui . --port 8061 --pythonpath /path/to/other/worktree
+regc gui examples/                 # desktop window (PySide6 + matplotlib), workspace examples/
+regc gui --pythonpath /path/to/other/worktree
+regc gui --web examples/ --port 8060   # the same in a browser: http://127.0.0.1:8060
 ```
 
-`regc-gui` serves a local page over a workspace directory. It finds every
-config (`*.yaml` with a `replica_exchange` section, up to four levels
-deep; output directories are skipped). The page has three tabs.
+`regc` is the umbrella command: `regc gui`, `regc run` (= `regc-run`),
+`regc monitor` (= `regc-monitor`) and `regc reevaluate` (=
+`regc-reevaluate`); `regc-gui` is `regc gui`. The desktop GUI needs
+PySide6 (`pip install regc[gui]`).
 
-- **Build**: edit a config as YAML, or through a form of the common keys
+The GUI works on a workspace directory (*File → Open workspace* changes
+it). It finds every config (`*.yaml` with a `replica_exchange` section,
+up to four levels deep; output directories are skipped). The window has
+three tabs.
+
+- **Runs**: every config with its output directory, state, progress, latest
+  convergence check, subsurface totals and the last log line. The selected
+  run's log is shown below. The states are new, starting, running, stalled,
+  finished, converged, stopped (a checkpoint to resume from), error and
+  ended. The actions are *Edit*, *Start* (refused over an existing
+  checkpoint), *Resume* (`--resume`), *Start over* (`--overwrite`, after a
+  confirmation), *Analyze* (`--analyze-only`), *Stop* (SIGTERM to the run's
+  process group, so the last checkpoint stays) and *Monitor*
+  (double-clicking a row does the same). *workers* sets `--workers`.
+- **Build**: the config as YAML next to a form of the common keys
   (structure, gas and reservoir, calculator, ladder, sampling,
   convergence, subsurface, output). Helpers fill a geometric T ladder and
   a log-spaced pressure ladder. *Form → YAML* rewrites the text without
   its comments. *Validate* runs `validate_config` and shows the grid size.
   *Save* writes the file, only inside the workspace, and replaces an
   existing file only when *overwrite* is ticked. *Check setup* runs
-  `regc-run --check` and shows its output. Built-in templates: a
-  one-minute EMT test and a slab + O2 MLIP skeleton.
-- **Runs**: every config with its output directory, state, progress, latest
-  convergence check and subsurface totals. The states are new, starting,
-  running, stalled, finished, converged, stopped (a checkpoint to resume
-  from) and error. The actions are *Start* (refused over an existing
-  checkpoint), *Resume* (`--resume`), *Start over* (`--overwrite`),
-  *Analyze* (`--analyze-only`), *Stop* (SIGTERM to the run's process group,
-  so the last checkpoint stays), *Monitor* and *Log*.
-- **Monitor**: the §7.1 page for the chosen run, mounted under `/monitor/`.
+  `regc-run --check` and streams its output. *Save & start* saves and then
+  launches the run. Built-in templates: a one-minute EMT test and a slab +
+  O2 MLIP skeleton.
+- **Monitor**: one run's heartbeat (`status.json`, or `samples.npz` for
+  runs without one). It shows progress, rate, the remaining time to the
+  `n_steps` cap, mean N, subsurface totals and the latest convergence check
+  in one line. Below that are four plots: the replica grid of a chosen
+  quantity (N, U, N_ads, subsurface N and acceptance, ...; click a cell),
+  that replica's N, N_sub and U traces, the convergence checks against
+  their tolerances, and the swap acceptance with round trips. The end of
+  the log is at the bottom. *Open directory…* monitors any output
+  directory.
 
 Runs are launched the same way as the examples' `run_monitor.sh` scripts:
 detached (`setsid`), in the config's directory, logging to
 `<output>/run.log`, with the process id in `<output>/run.pid`. They outlive
-the GUI, and the GUI and the scripts see each other's runs. They use the
-GUI's interpreter (`--python`) and `PYTHONPATH` = `--pythonpath`. By
-default that is the directory holding the `regc` package the GUI imported;
-it can be changed on the Runs tab, e.g. to another git worktree. The
-server listens on 127.0.0.1. Requests that write files or start or stop
-processes need a token that only the served page holds, so other pages
-open in the same browser cannot send them.
+the window, and the scripts, the window and the web version all see the
+same runs. They use the GUI's interpreter (`--python`) and `PYTHONPATH` =
+`--pythonpath`. By default that is the directory holding the `regc`
+package the GUI imported; it can be changed in the toolbar, e.g. to
+another git worktree. A run counts as alive only while its process id
+belongs to a regc process, so an id reused after a reboot is not taken
+for a run.
+
+The web version (`--web`) has the same tabs in a browser page, with the
+§7.1 monitor under `/monitor/`. It listens on 127.0.0.1. Requests that
+write files or start or stop processes need a token that only the served
+page holds, so other pages open in the same browser cannot send them.
 
 ## 8. Saving and loading samples
 

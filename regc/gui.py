@@ -154,6 +154,69 @@ output: {directory: output}
 }
 
 
+#: Form fields of the builders: (key, label, kind, placeholder) or (section title,).
+#: kind: str, num, int, val (number, bool or string), list, bool, or sel:|opt1|opt2.
+FORM_FIELDS = [
+    ("Structure",),
+    ("structure.file", "slab file", "str"),
+    ("structure.build.surface", "build: surface", "str", "fcc111, fcc100, bcc110, hcp0001…"),
+    ("structure.build.symbol", "build: element", "str"),
+    ("structure.build.size", "build: size", "list", "4, 4, 4"),
+    ("structure.build.a", "build: a (Å or auto)", "val"),
+    ("structure.n_frozen_layers", "frozen layers", "int"),
+    ("structure.headroom_angstrom", "headroom (Å)", "num"),
+    ("Gas and reservoir",),
+    ("gas.species", "gas species", "val", "O, or [O, Cl]"),
+    ("gas.mass_amu", "mass (amu)", "num"),
+    ("reservoir.type", "reservoir", "sel:|diatomic|monatomic"),
+    ("reservoir.d0", "D0", "val", "self, experimental or eV"),
+    ("Calculator",),
+    ("calculator.type", "type", "sel:|EMT|LAMMPS|ASE|LJ|PairLJ"),
+    ("calculator.lammps_name", "lammps_name", "str"),
+    ("calculator.pair_style", "pair_style", "str"),
+    ("calculator.pair_coeff", "pair_coeff", "str"),
+    ("calculator.species", "species", "list", "Pd, O"),
+    ("calculator.potential", "potential file", "str"),
+    ("Replica ladder",),
+    ("replica_exchange.temperatures_K", "T (K)", "list"),
+    ("replica_exchange.pressures", "pressures", "list"),
+    ("replica_exchange.pressure_unit", "pressure unit", "sel:|bar|atm|Pa"),
+    ("replica_exchange.mu_eV", "or μ (eV)", "list"),
+    ("Sampling",),
+    ("replica_exchange.scheme", "scheme", "sel:|regc|sweep"),
+    ("replica_exchange.n_steps", "n_steps (cap)", "int"),
+    ("replica_exchange.x0", "x0 (GC step prob.)", "num"),
+    ("replica_exchange.diffusion", "diffusion", "sel:|mc|mc_moves|hmc|md"),
+    ("replica_exchange.diffusion_steps", "diffusion steps", "int"),
+    ("replica_exchange.record_every", "record every", "int"),
+    ("replica_exchange.adsorbed_cutoff", "adsorbed cutoff (Å)", "num"),
+    ("replica_exchange.max_disp", "max disp (Å)", "num"),
+    ("replica_exchange.seed", "seed", "int"),
+    ("replica_exchange.n_workers", "workers", "val", "auto or a number"),
+    ("Convergence",),
+    ("replica_exchange.convergence_every", "check every (steps)", "int"),
+    ("replica_exchange.convergence_mode", "mode", "sel:|noise|blocks"),
+    ("replica_exchange.convergence_tol", "tol (max ratio)", "num"),
+    ("replica_exchange.convergence_median_tol", "median tol", "num"),
+    ("replica_exchange.convergence_min_neff", "min n_eff", "num"),
+    ("Subsurface (NCMC)",),
+    ("subsurface.depth_angstrom", "depth (Å)", "num", "empty: no subsurface moves"),
+    ("subsurface.z_cut_below_surface", "z_c below top (Å)", "num"),
+    ("subsurface.ncmc_steps", "λ steps", "int"),
+    ("subsurface.kernel", "kernel", "sel:|langevin|hmc"),
+    ("subsurface.weight", "weight", "num"),
+    ("Output",),
+    ("checkpoint.chunk", "checkpoint every", "int"),
+    ("records.save", "records.h5", "bool"),
+    ("records.every", "configs every n samples", "int"),
+    ("trajectory.save", "trajectories", "bool"),
+    ("trajectory.every", "traj. every (steps)", "int"),
+    ("phase_diagram.observable", "phase-diagram observable", "str", "N, N_ads, N_O"),
+    ("phase_diagram.coverage_per", "coverage per", "sel:|surface_atom|area|none"),
+    ("output.directory", "output directory", "str"),
+]
+
+
 # =============================================================================
 # Workspace: configs, their runs, launching and stopping
 # =============================================================================
@@ -791,7 +854,8 @@ def make_handler(ws: Workspace, token: str, plotly_js: Optional[str] = None):
     type
         A `BaseHTTPRequestHandler` subclass.
     """
-    page = PAGE.replace("__TOKEN__", token).encode()
+    page = PAGE.replace("__TOKEN__", token).replace(
+        "__FIELDS__", json.dumps(FORM_FIELDS, ensure_ascii=False)).encode()
 
     class Handler(BaseHTTPRequestHandler):
         """GET: page, workspace, configs, tasks, ``/monitor/...``; POST: the actions."""
@@ -1089,30 +1153,7 @@ document.querySelectorAll(".tab").forEach(s=>s.classList.toggle("on",s.id=="t-"+
 if(t=="monitor"){const src="/monitor/"+(monId!=null?"#run="+monId:"");if(!$("mon").src.endsWith(src)||$("mon").src=="about:blank")$("mon").src=src;$("monlink").href=src}}
 document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>tab(b.dataset.t));
 // ---------------------------------------------------------------- form
-const F=[["Structure"],["structure.file","slab file","str"],["structure.build.surface","build: surface","str","fcc111, fcc100, bcc110, hcp0001…"],
-["structure.build.symbol","build: element","str"],["structure.build.size","build: size","list","4, 4, 4"],["structure.build.a","build: a (Å or auto)","val"],
-["structure.n_frozen_layers","frozen layers","int"],["structure.headroom_angstrom","headroom (Å)","num"],
-["Gas and reservoir"],["gas.species","gas species","val","O, or [O, Cl]"],["gas.mass_amu","mass (amu)","num"],
-["reservoir.type","reservoir","sel:|diatomic|monatomic"],["reservoir.d0","D0","val","self, experimental or eV"],
-["Calculator"],["calculator.type","type","sel:|EMT|LAMMPS|ASE|LJ|PairLJ"],["calculator.lammps_name","lammps_name","str"],
-["calculator.pair_style","pair_style","str"],["calculator.pair_coeff","pair_coeff","str"],["calculator.species","species","list","Pd, O"],
-["calculator.potential","potential file","str"],
-["Replica ladder"],["replica_exchange.temperatures_K","T (K)","list"],["replica_exchange.pressures","pressures","list"],
-["replica_exchange.pressure_unit","pressure unit","sel:|bar|atm|Pa"],["replica_exchange.mu_eV","or μ (eV)","list"],
-["Sampling"],["replica_exchange.scheme","scheme","sel:|regc|sweep"],["replica_exchange.n_steps","n_steps (cap)","int"],
-["replica_exchange.x0","x0 (GC step prob.)","num"],["replica_exchange.diffusion","diffusion","sel:|mc|mc_moves|hmc|md"],
-["replica_exchange.diffusion_steps","diffusion steps","int"],["replica_exchange.record_every","record every","int"],
-["replica_exchange.adsorbed_cutoff","adsorbed cutoff (Å)","num"],["replica_exchange.max_disp","max disp (Å)","num"],
-["replica_exchange.seed","seed","int"],["replica_exchange.n_workers","workers","val","auto or a number"],
-["Convergence"],["replica_exchange.convergence_every","check every (steps)","int"],["replica_exchange.convergence_mode","mode","sel:|noise|blocks"],
-["replica_exchange.convergence_tol","tol (max ratio)","num"],["replica_exchange.convergence_median_tol","median tol","num"],
-["replica_exchange.convergence_min_neff","min n_eff","num"],
-["Subsurface (NCMC)"],["subsurface.depth_angstrom","depth (Å)","num","empty: no subsurface moves"],["subsurface.z_cut_below_surface","z_c below top (Å)","num"],
-["subsurface.ncmc_steps","λ steps","int"],["subsurface.kernel","kernel","sel:|langevin|hmc"],["subsurface.weight","weight","num"],
-["Output"],["checkpoint.chunk","checkpoint every","int"],["records.save","records.h5","bool"],["records.every","configs every n samples","int"],
-["trajectory.save","trajectories","bool"],["trajectory.every","traj. every (steps)","int"],
-["phase_diagram.observable","phase-diagram observable","str","N, N_ads, N_O"],["phase_diagram.coverage_per","coverage per","sel:|surface_atom|area|none"],
-["output.directory","output directory","str"]];
+const F=__FIELDS__;
 function buildForm(){let h="";for(const f of F){if(f.length==1){h+=`<h3 style="grid-column:1/3">${esc(f[0])}</h3>`;continue}
 const [k,l,t,ph]=f,id="f_"+k.replace(/\./g,"__");h+=`<label for="${id}">${esc(l)}</label>`;
 if(t.startsWith("sel:"))h+=`<select id="${id}">${t.slice(4).split("|").map(o=>`<option>${o}</option>`).join("")}</select>`;

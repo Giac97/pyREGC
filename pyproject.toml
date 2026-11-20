@@ -38,6 +38,7 @@ mbar = ["pymbar>=4.0", "scipy>=1.7"]         # MBAR reweighting / phase diagrams
 plot = ["matplotlib>=3.5"]
 yaml = ["pyyaml>=6.0"]                       # YAML configs for regc-run
 records = ["h5py>=3.0"]                      # per-sample records, re-evaluation with other potentials
+gui = ["PySide6>=6.5", "matplotlib>=3.5", "pyyaml>=6.0"]   # regc gui (desktop)
 all = ["regc[ase,mbar,plot,yaml,records]"]
 dev = ["regc[all]", "pytest>=7.0", "build"]
 # LAMMPS (LammpsCalculator) is deliberately not an extra: install it from conda-forge
@@ -48,7 +49,8 @@ regc-run = "regc.runner:main"
 gcmc-re-run = "regc.runner:main"          # former name, kept for existing batch scripts
 regc-reevaluate = "regc.runner:reevaluate_main"
 regc-monitor = "regc.monitor:main"
-regc-gui = "regc.gui:main"
+regc-gui = "regc.qtgui:main"               # desktop GUI (PySide6); --web: browser version
+regc = "regc.cli:main"                       # regc gui | run | monitor | reevaluate
 
 [tool.setuptools_scm]
 # The version comes from git: a tag vX.Y.Z gives X.Y.Z; commits after it give
