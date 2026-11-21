@@ -134,7 +134,8 @@ _TOP_LEVEL = set(_SECTIONS) | {"calculator", "replica_exchange", "diatomic_reser
 #: Keys of one entry of the ``molecules`` section (a gas, and optionally an insertion move).
 _MOLECULE_KEYS = {"template", "fraction", "insert", "anchor", "shell_angstrom",
                   "bond_sigma_angstrom", "angle_sigma_deg", "weight", "symmetry_number",
-                  "spin_multiplicity", "vibrational_wavenumbers_cm", "energy_eV"}
+                  "spin_multiplicity", "vibrational_wavenumbers_cm", "energy_eV",
+                  "vibrations"}
 _EXPORT_KEYS = {"mode", "n_T", "n_p", "min_cells", "tile"}
 _BOOTSTRAP_KEYS = {"n", "seed", "level", "min_agreement", "min_support"}
 _CALCULATOR_KEYS = {
@@ -533,7 +534,8 @@ def _validate_molecules(config: Dict[str, Any]) -> None:
     Raises
     ------
     ValueError
-        On unknown keys, a missing template, a reservoir section or
+        On unknown keys, a missing template, an unknown ``vibrations``
+        model, a reservoir section or
         ``gas.composition`` next to it (the molecules are the reservoir), or
         atomically exchanged species that are not exchanged.
     """
@@ -548,6 +550,11 @@ def _validate_molecules(config: Dict[str, Any]) -> None:
         if "template" not in sec:
             raise ValueError(f"molecules.{name} needs a template (an ase.build.molecule name "
                              f"such as CO, or a structure file)")
+        if "vibrations" in sec:
+            from .reservoir import VIBRATION_MODELS
+            if str(sec["vibrations"]).strip().lower() not in VIBRATION_MODELS:
+                raise ValueError(f"molecules.{name}.vibrations must be one of "
+                                 f"{list(VIBRATION_MODELS)}, not {sec['vibrations']!r}")
     for key in ("reservoir", "diatomic_reservoir"):
         if key in config:
             raise ValueError(f"with a molecules section the gases are the reservoir: drop {key}")
@@ -1405,7 +1412,8 @@ def _build_molecular_feed(config: Dict[str, Any], species: Sequence[str],
     species : sequence of str
         The exchanged elements (``gas.species``).
     masses : dict
-        Their atomic masses.
+        Their atomic masses (``gas.mass_amu``); the gas molecules use them
+        too (Lambda, moments of inertia, Hessian frequencies).
     calc_spec : _CalculatorSpec
         The calculator.
     ase_calc_getter : callable
@@ -1429,6 +1437,7 @@ def _build_molecular_feed(config: Dict[str, Any], species: Sequence[str],
     """
     from .molecules import MoleculeMove
     from .reservoir import SPIN_MULTIPLICITIES, SYMMETRY_NUMBERS, MolecularGas, MolecularGasFeed
+    from .units import default_mass_amu
 
     gases, fractions, moves = [], [], []
     for name, sec in config["molecules"].items():
@@ -1442,12 +1451,14 @@ def _build_molecular_feed(config: Dict[str, Any], species: Sequence[str],
         vib = sec.get("vibrational_wavenumbers_cm")
         vib = None if vib is None else _floats(vib, f"molecules.{name}.vibrational_wavenumbers_cm")
         sym, spin = sec.get("symmetry_number"), sec.get("spin_multiplicity")
+        vibrations = str(sec.get("vibrations", "classical"))
         calc = ase_calc_getter() if "energy_eV" not in sec else None
         if calc is not None:
             gas = MolecularGas.from_calculator(calc, template, name=str(name),
                                                symmetry_number=None if sym is None else int(sym),
                                                spin_multiplicity=None if spin is None else int(spin),
-                                               vib_wavenumbers_cm=vib)
+                                               vib_wavenumbers_cm=vib, masses_amu=masses,
+                                               vibrations=vibrations)
         else:
             from ase.build import molecule
             atoms = molecule(template) if isinstance(template, str) else template
@@ -1462,7 +1473,10 @@ def _build_molecular_feed(config: Dict[str, Any], species: Sequence[str],
                                tuple(vib or ()),
                                int(sym) if sym is not None else SYMMETRY_NUMBERS.get(str(name), 1),
                                int(spin) if spin is not None
-                               else SPIN_MULTIPLICITIES.get(str(name), 1))
+                               else SPIN_MULTIPLICITIES.get(str(name), 1),
+                               tuple(masses.get(s, default_mass_amu(s))
+                                     for s in atoms.get_chemical_symbols()),
+                               vibrations)
         gases.append(gas)
         fractions.append(_as_float(sec.get("fraction", 1.0), f"molecules.{name}.fraction"))
         if sec.get("insert", True) and len(gas.symbols) > 1:
@@ -1848,7 +1862,8 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
             for g, x in zip(feed.gases, feed.fractions):
                 print(f"gas {g.name} (x = {x:.4g}): E = {g.energy_eV:.4f} eV, vibrations "
                       f"{[round(w) for w in g.vib_wavenumbers_cm]} cm^-1, sigma = "
-                      f"{g.symmetry_number}, spin multiplicity {g.spin_multiplicity}")
+                      f"{g.symmetry_number}, spin multiplicity {g.spin_multiplicity}, "
+                      f"{g.vibrations} vibrations")
             for m in molecule_moves:
                 print(f"molecule move {m.name}: anchor {m.anchor} + {list(m.partners)}, shell "
                       f"[{m.shell[0]:.2f}, {m.shell[1]:.2f}] A, weight {m.weight:g}")

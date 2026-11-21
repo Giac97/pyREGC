@@ -30,6 +30,7 @@ molecules:                            # the gas feed; replaces reservoir and gas
     # bond_sigma_angstrom: 0.05       # proposal widths: efficiency only
     # angle_sigma_deg: 10
     # weight: 1                       # relative frequency among GC channels
+    # vibrations: classical           # gas reference: classical (matches the sampler) or quantum
   O2:
     template: O2                      # spin multiplicity 3 and sigma = 2 are tabulated
     fraction: 0.5

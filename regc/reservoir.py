@@ -861,16 +861,54 @@ SYMMETRY_NUMBERS = {"H2": 2, "N2": 2, "O2": 2, "F2": 2, "Cl2": 2, "CO": 1, "NO":
 SPIN_MULTIPLICITIES = {"O2": 3, "NO": 2, "NO2": 2}
 
 
+#: Vibration models of `MolecularGas`: 'classical' matches the sampler, 'quantum' is NIST-JANAF.
+VIBRATION_MODELS = ("classical", "quantum")
+
+
+def check_vibrations(vibrations: str) -> str:
+    """
+    Validate a vibration model name.
+
+    Parameters
+    ----------
+    vibrations : str
+        ``'classical'`` or ``'quantum'``.
+
+    Returns
+    -------
+    str
+        The name, lower case.
+
+    Raises
+    ------
+    ValueError
+        If it is neither.
+    """
+    v = str(vibrations).strip().lower()
+    if v not in VIBRATION_MODELS:
+        raise ValueError(f"vibrations must be one of {list(VIBRATION_MODELS)}, not {vibrations!r}")
+    return v
+
+
 def molecular_gas_mu_eV(T_kelvin: float, p_pascal: float, energy_eV: float, mass_amu: float,
                         moments_amu_A2: Sequence[float], vib_wavenumbers_cm: Sequence[float],
-                        symmetry_number: int = 1, spin_multiplicity: int = 1) -> float:
+                        symmetry_number: int = 1, spin_multiplicity: int = 1,
+                        vibrations: str = "classical") -> float:
     """
     Chemical potential of an ideal polyatomic gas on a potential's energy scale.
 
-    mu = E + ZPE + k_B T ln(p / p0) - k_B T ln(g q_rot q_vib), with p0 =
-    k_B T / Lambda^3 of the molecule, a classical rigid rotor (linear or
-    not) and harmonic vibrations counted from v = 0. For a diatomic this is
-    exactly `diatomic_gas_mu_eV` shifted by E + ZPE = 2 e_atom - D0.
+    mu = E + E_0 + k_B T ln(p / p0) - k_B T ln(g q_rot q_vib), with p0 =
+    k_B T / Lambda^3 of the molecule and a classical rigid rotor (linear or
+    not). With ``vibrations='classical'`` (the reference consistent with
+    sampling the internal coordinates classically, as the molecular moves
+    do) q_vib = prod_i k_B T / (h nu_i) from the potential minimum, E_0 = 0
+    and g = 1: an ideal gas of flexible molecules sampled with exp(-beta U)
+    at this mu has exactly the density p / k_B T (harmonic, rigid-rotor
+    level). With ``vibrations='quantum'`` q_vib = prod_i 1/(1 - exp(-h nu_i /
+    k_B T)), E_0 = ZPE and g = `spin_multiplicity` (the physical gas,
+    NIST-JANAF); for a diatomic this is exactly `diatomic_gas_mu_eV` shifted
+    by E + ZPE = 2 e_atom - D0. The two differ by k_B T ln R, R = prod_i
+    [2 sinh(h nu_i / 2 k_B T) / (h nu_i / k_B T)] / g.
 
     Parameters
     ----------
@@ -890,23 +928,27 @@ def molecular_gas_mu_eV(T_kelvin: float, p_pascal: float, energy_eV: float, mass
     symmetry_number : int, optional
         Rotational symmetry number. Default 1.
     spin_multiplicity : int, optional
-        Electronic ground-state degeneracy. Default 1.
+        Electronic ground-state degeneracy (used by ``'quantum'`` only).
+        Default 1.
+    vibrations : str, optional
+        ``'classical'`` (default) or ``'quantum'``.
 
     Returns
     -------
     float
         mu of the molecule, in eV.
     """
-    p0, q_int, zpe = _molecular_p0_q_zpe(T_kelvin, mass_amu, moments_amu_A2, vib_wavenumbers_cm,
-                                        symmetry_number, spin_multiplicity)
-    return energy_eV + zpe + kelvin_to_eV(T_kelvin) * (math.log(p_pascal / p0) - math.log(q_int))
+    p0, q_int, e0 = _molecular_p0_q_zpe(T_kelvin, mass_amu, moments_amu_A2, vib_wavenumbers_cm,
+                                       symmetry_number, spin_multiplicity, vibrations)
+    return energy_eV + e0 + kelvin_to_eV(T_kelvin) * (math.log(p_pascal / p0) - math.log(q_int))
 
 
 def _molecular_p0_q_zpe(T_kelvin: float, mass_amu: float, moments_amu_A2: Sequence[float],
                         vib_wavenumbers_cm: Sequence[float], symmetry_number: int,
-                        spin_multiplicity: int) -> Tuple[float, float, float]:
+                        spin_multiplicity: int, vibrations: str = "classical"
+                        ) -> Tuple[float, float, float]:
     """
-    Reference pressure, internal partition function and zero-point energy.
+    Reference pressure, internal partition function and vibrational ground-state energy.
 
     Parameters
     ----------
@@ -921,13 +963,22 @@ def _molecular_p0_q_zpe(T_kelvin: float, mass_amu: float, moments_amu_A2: Sequen
     symmetry_number : int
         Rotational symmetry number.
     spin_multiplicity : int
-        Electronic ground-state degeneracy.
+        Electronic ground-state degeneracy (``'quantum'`` only).
+    vibrations : str, optional
+        ``'classical'`` (default) or ``'quantum'``; see `molecular_gas_mu_eV`.
 
     Returns
     -------
     tuple of float
-        ``(p0_pascal, q_internal, zpe_eV)``.
+        ``(p0_pascal, q_internal, e0_eV)``; e0 is the ZPE for
+        ``'quantum'`` and 0 for ``'classical'``.
+
+    Raises
+    ------
+    ValueError
+        If `vibrations` is unknown.
     """
+    quantum = check_vibrations(vibrations) == "quantum"
     lam = thermal_wavelength_angstrom(T_kelvin, mass_amu) * 1.0e-10
     p0 = BOLTZMANN_K_SI * T_kelvin / lam ** 3
     moments = np.sort(np.asarray(moments_amu_A2, dtype=float))
@@ -940,12 +991,17 @@ def _molecular_p0_q_zpe(T_kelvin: float, mass_amu: float, moments_amu_A2: Sequen
         else:
             q_rot = (math.sqrt(math.pi) / symmetry_number
                      * math.sqrt(T_kelvin ** 3 / float(np.prod(theta))))
-    q_vib, zpe = 1.0, 0.0
+    q_vib, e0 = 1.0, 0.0
     for w in vib_wavenumbers_cm:
         theta_v = PLANCK_H * float(w) * SPEED_OF_LIGHT_CM_PER_S / BOLTZMANN_K_SI
-        q_vib /= 1.0 - math.exp(-theta_v / T_kelvin)
-        zpe += 0.5 * PLANCK_H * float(w) * SPEED_OF_LIGHT_CM_PER_S / EV_IN_JOULES
-    return p0, spin_multiplicity * q_rot * q_vib, zpe
+        if quantum:
+            q_vib /= 1.0 - math.exp(-theta_v / T_kelvin)
+            e0 += 0.5 * PLANCK_H * float(w) * SPEED_OF_LIGHT_CM_PER_S / EV_IN_JOULES
+        else:                                          # classical oscillator from the minimum
+            q_vib *= T_kelvin / theta_v
+    # the sampled Hamiltonian has one electronic state: no degeneracy for 'classical'
+    g = spin_multiplicity if quantum else 1
+    return p0, g * q_rot * q_vib, e0
 
 
 @dataclass
@@ -959,6 +1015,16 @@ class MolecularGas(Reservoir):
     spin are standard ideal-gas statistical mechanics
     (`molecular_gas_mu_eV`). The relaxed template also defines the shape
     of the molecular insertion move (`regc.molecules.MoleculeMove`).
+
+    The default ``vibrations='classical'`` is the reference consistent with
+    the sampler, which treats the internal coordinates of molecules (in the
+    gas zone or adsorbed intact) classically with exp(-beta U) on a single
+    electronic surface: classical vibrations from the minimum, no ZPE, no
+    spin degeneracy. ``'quantum'`` (quantum harmonic vibrations, ZPE and
+    `spin_multiplicity`) is the physical gas of NIST-JANAF; with it the
+    sampled intact molecules are over-stabilised by k_B T ln R (R in
+    `molecular_gas_mu_eV`; ~0.07 eV for CO, 0.5-0.7 eV for NH3 and CH4 at
+    300 K).
 
     Parameters
     ----------
@@ -975,9 +1041,11 @@ class MolecularGas(Reservoir):
     symmetry_number : int
         Rotational symmetry number.
     spin_multiplicity : int, optional
-        Electronic ground-state degeneracy. Default 1.
+        Electronic ground-state degeneracy (``'quantum'`` only). Default 1.
     masses_amu : sequence of float, optional
         Atomic masses. Default None: ASE's table.
+    vibrations : str, optional
+        ``'classical'`` (default) or ``'quantum'``; see above.
     calculator_info : dict, optional
         Diagnostics from `from_calculator`. Default None.
     """
@@ -990,6 +1058,7 @@ class MolecularGas(Reservoir):
     symmetry_number: int
     spin_multiplicity: int = 1
     masses_amu: Optional[Tuple[float, ...]] = None
+    vibrations: str = "classical"
     calculator_info: Optional[dict] = field(default=None, repr=False)
 
     def __post_init__(self):
@@ -999,7 +1068,8 @@ class MolecularGas(Reservoir):
         Raises
         ------
         ValueError
-            If symbols and positions disagree in length.
+            If symbols and positions or masses disagree in length, or
+            `vibrations` is unknown.
         """
         from .units import default_mass_amu
         self.symbols = tuple(str(s) for s in self.symbols)
@@ -1010,8 +1080,12 @@ class MolecularGas(Reservoir):
         self.vib_wavenumbers_cm = tuple(float(w) for w in self.vib_wavenumbers_cm)
         self.masses_amu = (tuple(default_mass_amu(s) for s in self.symbols)
                            if self.masses_amu is None else tuple(float(m) for m in self.masses_amu))
+        if len(self.masses_amu) != len(self.symbols):
+            raise ValueError(f"gas {self.name}: {len(self.masses_amu)} masses for "
+                             f"{len(self.symbols)} atoms")
         self.symmetry_number = int(self.symmetry_number)
         self.spin_multiplicity = int(self.spin_multiplicity)
+        self.vibrations = check_vibrations(self.vibrations)
 
     @property
     def composition(self) -> Dict[str, int]:
@@ -1059,7 +1133,7 @@ class MolecularGas(Reservoir):
         """
         return molecular_gas_mu_eV(T_kelvin, p_pascal, self.energy_eV, self.mass_exchanged_amu,
                                    self.principal_moments(), self.vib_wavenumbers_cm,
-                                   self.symmetry_number, self.spin_multiplicity)
+                                   self.symmetry_number, self.spin_multiplicity, self.vibrations)
 
     def pressure_pascal(self, T_kelvin: float, mu_eV: float) -> float:
         """
@@ -1077,10 +1151,11 @@ class MolecularGas(Reservoir):
         float
             Pressure, in Pascal.
         """
-        p0, q_int, zpe = _molecular_p0_q_zpe(T_kelvin, self.mass_exchanged_amu,
-                                            self.principal_moments(), self.vib_wavenumbers_cm,
-                                            self.symmetry_number, self.spin_multiplicity)
-        return p0 * q_int * math.exp((mu_eV - self.energy_eV - zpe) / kelvin_to_eV(T_kelvin))
+        p0, q_int, e0 = _molecular_p0_q_zpe(T_kelvin, self.mass_exchanged_amu,
+                                           self.principal_moments(), self.vib_wavenumbers_cm,
+                                           self.symmetry_number, self.spin_multiplicity,
+                                           self.vibrations)
+        return p0 * q_int * math.exp((mu_eV - self.energy_eV - e0) / kelvin_to_eV(T_kelvin))
 
     def to_dict(self) -> dict:
         """
@@ -1089,14 +1164,18 @@ class MolecularGas(Reservoir):
         Returns
         -------
         dict
-            The constructor arguments, plus ``type: molecular``.
+            The constructor arguments, plus ``type: molecular``. A quantum
+            gas omits ``vibrations``, as written before the option existed.
         """
-        return {"type": "molecular", "name": self.name, "symbols": list(self.symbols),
-                "positions_angstrom": self.positions_angstrom.tolist(),
-                "energy_eV": float(self.energy_eV),
-                "vib_wavenumbers_cm": list(self.vib_wavenumbers_cm),
-                "symmetry_number": self.symmetry_number,
-                "spin_multiplicity": self.spin_multiplicity, "masses_amu": list(self.masses_amu)}
+        d = {"type": "molecular", "name": self.name, "symbols": list(self.symbols),
+             "positions_angstrom": self.positions_angstrom.tolist(),
+             "energy_eV": float(self.energy_eV),
+             "vib_wavenumbers_cm": list(self.vib_wavenumbers_cm),
+             "symmetry_number": self.symmetry_number,
+             "spin_multiplicity": self.spin_multiplicity, "masses_amu": list(self.masses_amu)}
+        if self.vibrations != "quantum":
+            d["vibrations"] = self.vibrations
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "MolecularGas":
@@ -1106,7 +1185,7 @@ class MolecularGas(Reservoir):
         Parameters
         ----------
         d : dict
-            The dict.
+            The dict; without ``vibrations`` (older runs) the gas is quantum.
 
         Returns
         -------
@@ -1114,6 +1193,7 @@ class MolecularGas(Reservoir):
             The gas.
         """
         d = {k: v for k, v in d.items() if k != "type"}
+        d.setdefault("vibrations", "quantum")
         return cls(**d)
 
     @classmethod
@@ -1122,7 +1202,8 @@ class MolecularGas(Reservoir):
                         spin_multiplicity: Optional[int] = None,
                         vib_wavenumbers_cm: Optional[Sequence[float]] = None,
                         fmax: float = 1e-3, steps: int = 1000, delta: float = 0.005,
-                        cell: float = 20.0) -> "MolecularGas":
+                        cell: float = 20.0, masses_amu=None,
+                        vibrations: str = "classical") -> "MolecularGas":
         """
         Relax a gas molecule with a potential and take its vibrations from the Hessian.
 
@@ -1150,6 +1231,14 @@ class MolecularGas(Reservoir):
             Finite-difference displacement for the Hessian, A. Default 0.005.
         cell : float, optional
             Edge of the (non-periodic) box the molecule sits in, A. Default 20.
+        masses_amu : dict or sequence of float, optional
+            ``{element: mass}`` (elements not in it keep the template's)
+            or one mass per atom, amu; give the exchanged atoms' masses
+            (isotopes such as D). They enter Lambda, the moments of inertia
+            and the Hessian frequencies. Default None: the template's
+            (ASE's table).
+        vibrations : str, optional
+            ``'classical'`` (default) or ``'quantum'``; see the class.
 
         Returns
         -------
@@ -1160,10 +1249,10 @@ class MolecularGas(Reservoir):
         Raises
         ------
         ValueError
-            If the symmetry number is unknown and not given, or the relaxed
-            geometry is not a minimum (imaginary vibrational modes).
+            If the symmetry number is unknown and not given, the relaxed
+            geometry is not a minimum (imaginary vibrational modes), or
+            `masses_amu` does not fit the template.
         """
-        from ase import Atoms
         from ase.build import molecule
         from ase.optimize import BFGS
 
@@ -1174,6 +1263,13 @@ class MolecularGas(Reservoir):
             atoms = template.copy()
             label = atoms.get_chemical_formula()
         name = name or label
+        if masses_amu is not None:
+            if isinstance(masses_amu, dict):
+                masses_amu = [masses_amu.get(s, m) for s, m in
+                              zip(atoms.get_chemical_symbols(), atoms.get_masses())]
+            if len(masses_amu) != len(atoms):
+                raise ValueError(f"gas {name}: {len(masses_amu)} masses for {len(atoms)} atoms")
+            atoms.set_masses([float(m) for m in masses_amu])
         atoms.set_cell([cell] * 3)
         atoms.set_pbc(False)
         atoms.center()
@@ -1213,7 +1309,7 @@ class MolecularGas(Reservoir):
             omega = np.sign(lam) * np.sqrt(np.abs(lam) * EV_IN_JOULES / (1.0e-20 * AMU))
             wn = omega / (2.0 * math.pi * SPEED_OF_LIGHT_CM_PER_S)
             gas = cls(name, atoms.get_chemical_symbols(), x0, energy, (), symmetry_number,
-                      spin_multiplicity, tuple(masses))
+                      spin_multiplicity, tuple(masses), vibrations)
             linear = gas.principal_moments()[0] < 1e-3 * gas.principal_moments()[-1]
             n_rigid = 5 if linear else 6
             modes = wn[np.argsort(np.abs(wn))][n_rigid:]
@@ -1230,7 +1326,7 @@ class MolecularGas(Reservoir):
             vib_wavenumbers_cm = ()
         return cls(name, atoms.get_chemical_symbols(), x0, energy, tuple(vib_wavenumbers_cm),
                    int(symmetry_number), int(spin_multiplicity), tuple(masses),
-                   calculator_info=info)
+                   vibrations, calculator_info=info)
 
 
 class MolecularGasFeed:
@@ -1256,7 +1352,10 @@ class MolecularGasFeed:
     fractions : sequence of float
         Their mole fractions (normalised here).
     element_masses_amu : dict, optional
-        Atomic masses for Lambda_e. Default None: ASE's table.
+        Atomic masses for Lambda_e. Default None: ASE's table. They should
+        be the gases' atom masses: the activities prod_e z_e^{nu_e} =
+        exp(beta mu_g) / prod_e Lambda_e^{3 nu_e} of a molecular move put a
+        classical gas at its pressure only then (a mismatch is warned about).
 
     Raises
     ------
@@ -1305,6 +1404,14 @@ class MolecularGasFeed:
         masses = dict(element_masses_amu or {})
         self.element_masses_amu = {e: float(masses.get(e, default_mass_amu(e)))
                                    for e in self.species}
+        # z_e = exp(beta mu_e) / Lambda_e^3 reproduces a gas only if its atoms have these masses
+        for g in self.gases:
+            off = sorted({s for s, m in zip(g.symbols, g.masses_amu)
+                          if abs(m - self.element_masses_amu[s]) > 1e-6 * m})
+            if off:
+                warnings.warn(f"gas {g.name}: masses of {off} differ from the exchanged atoms' "
+                              f"{ {s: self.element_masses_amu[s] for s in off} }; the sampled gas "
+                              f"is then not at the reservoir pressure", stacklevel=2)
 
     @property
     def reservoirs(self) -> List[MolecularGas]:

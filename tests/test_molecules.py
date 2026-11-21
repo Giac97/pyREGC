@@ -11,7 +11,11 @@ The moves are checked against exact results:
 * an interacting gas: atomic and atomic + molecular exchange sample the
   same distribution, and the running energy stays exact;
 * `MolecularGas` reduces to `DiatomicReservoir` for O2, and a feed's
-  elemental chemical potentials reproduce every gas's.
+  elemental chemical potentials reproduce every gas's;
+* the classical gas reference puts a sampled ideal gas of flexible
+  molecules at its pressure (<N> = beta p V), exactly by quadrature and in
+  a short GC run; the quantum reference keeps its earlier values;
+* ``gas.mass_amu`` (isotopes) reaches the molecular gases.
 """
 
 import json
@@ -292,7 +296,7 @@ def _o2_pair():
     zpe = 0.5 * 6.62607015e-34 * w * 2.99792458e10 / 1.602176634e-19
     dia = DiatomicReservoir(D0, ea, m, r, w, 2, 3)
     gas = MolecularGas("O2", ["O", "O"], [[0, 0, 0], [0, 0, r]], 2 * ea - D0 - zpe, (w,), 2, 3,
-                       (m / 2, m / 2))
+                       (m / 2, m / 2), "quantum")
     return dia, gas
 
 
@@ -303,6 +307,161 @@ def test_molecular_gas_reduces_to_the_diatomic_reservoir():
         assert gas.pressure_pascal(T, gas.mu_eV(T, p)) == pytest.approx(p, rel=1e-10)
     assert MolecularGas.from_dict(json.loads(json.dumps(gas.to_dict()))).mu_eV(500, 1.0) == \
         pytest.approx(gas.mu_eV(500, 1.0))
+    assert "vibrations" not in gas.to_dict()          # quantum dicts are as before the option
+
+
+def _co_h2o_o2(vibrations):
+    co = MolecularGas("CO", ["C", "O"], [[0, 0, 0], [0, 0, 1.128]], -15.0, (2143.0,), 1,
+                      vibrations=vibrations)
+    h2o = MolecularGas("H2O", ["O", "H", "H"],
+                       [[0, 0, 0.119], [0, 0.763, -0.477], [0, -0.763, -0.477]], -14.2,
+                       (1595.0, 3657.0, 3756.0), 2, vibrations=vibrations)
+    o2 = MolecularGas("O2", ["O", "O"], [[0, 0, 0], [0, 0, 1.21]], -9.8, (1580.0,), 2, 3,
+                      vibrations=vibrations)
+    return co, h2o, o2
+
+
+def test_quantum_reference_keeps_its_values():
+    """The NIST-JANAF-like reference: numbers of the code before the vibrations option."""
+    before = {"CO": (-15.81843760585429, -15.68928114427845),
+              "H2O": (-14.537796577568082, -14.423863910571988),
+              "O2": (-10.692446024502468, -10.547437870241678)}
+    for g in _co_h2o_o2("quantum"):
+        assert g.mu_eV(500.0, 1e5) == pytest.approx(before[g.name][0], abs=1e-10)
+        assert g.mu_eV(300.0, 1.0) == pytest.approx(before[g.name][1], abs=1e-10)
+        assert g.pressure_pascal(300.0, g.mu_eV(300.0, 1.0)) == pytest.approx(1.0, rel=1e-10)
+        old = {k: v for k, v in g.to_dict().items() if k != "vibrations"}
+        assert MolecularGas.from_dict(old).vibrations == "quantum"   # metadata of older runs
+
+
+def test_classical_reference_differs_by_the_vibrational_and_spin_factor():
+    from regc.units import kelvin_to_eV
+    from regc.reservoir import PLANCK_H, SPEED_OF_LIGHT_CM_PER_S, BOLTZMANN_K_SI
+    T, p = 300.0, 1e5
+    for gq, gc in zip(_co_h2o_o2("quantum"), _co_h2o_o2("classical")):
+        log_r = sum(math.log(2.0 * math.sinh(x / 2.0) / x) for x in
+                    (PLANCK_H * w * SPEED_OF_LIGHT_CM_PER_S / (BOLTZMANN_K_SI * T)
+                     for w in gq.vib_wavenumbers_cm)) - math.log(gq.spin_multiplicity)
+        assert gq.mu_eV(T, p) - gc.mu_eV(T, p) == pytest.approx(kelvin_to_eV(T) * log_r, rel=1e-9)
+        assert gc.pressure_pascal(T, gc.mu_eV(T, p)) == pytest.approx(p, rel=1e-10)
+        assert MolecularGas.from_dict(json.loads(json.dumps(gc.to_dict()))).mu_eV(T, p) == \
+            pytest.approx(gc.mu_eV(T, p))
+    co_q, co_c = _co_h2o_o2("quantum")[0], _co_h2o_o2("classical")[0]
+    assert co_q.mu_eV(T, p) - co_c.mu_eV(T, p) == pytest.approx(0.0726, abs=1e-3)
+    with pytest.raises(ValueError, match="vibrations"):
+        MolecularGas("CO", ["C", "O"], [[0, 0, 0], [0, 0, 1.128]], -15.0, (2143.0,), 1,
+                     vibrations="semiclassical")
+
+
+# A flexible "CO": harmonic C-O bond inside RB, hard cores between like atoms (so that every
+# atom bonds once and the molecules form an ideal gas). 1259 cm^-1.
+R0_CO, K_CO, RB_CO, HC_CO = 1.13, 40.0, 1.6, 2.9
+
+
+def _bond_energy(r):
+    return 0.5 * K_CO * (r - R0_CO) ** 2 - 5.0
+
+
+class HarmonicCO(Calculator):
+    """Bonded C-O pairs, hard cores between like atoms."""
+
+    supports_incremental = False
+
+    def total_energy(self, system) -> float:
+        P, S = system.positions, system.species
+        e = 0.0
+        for i in range(len(P)):
+            d = np.linalg.norm(system._min_image(P[i + 1:] - P[i]), axis=-1)
+            same = S[i + 1:] == S[i]
+            if np.any(same & (d < HC_CO)):
+                return np.inf
+            e += float(np.sum(_bond_energy(d[~same & (d < RB_CO)])))
+        return e
+
+
+def _harmonic_co_gas(vibrations="classical", masses=(12.011, 15.999)):
+    from regc.units import AMU, EV_IN_JOULES
+    mred = masses[0] * masses[1] / sum(masses)
+    wn = math.sqrt(K_CO * EV_IN_JOULES / 1e-20 / (mred * AMU)) / (2 * math.pi * 2.99792458e10)
+    return MolecularGas("CO", ["C", "O"], [[0, 0, 0], [0, 0, R0_CO]], _bond_energy(R0_CO),
+                        (wn,), 1, 1, masses, vibrations)
+
+
+@pytest.mark.parametrize("T", [300.0, 1000.0])
+def test_classical_reference_is_the_sampled_configurational_integral(T):
+    """
+    exp(beta mu) / (Lambda_C^3 Lambda_O^3) int 4 pi r^2 exp(-beta u(r)) dr = beta p.
+
+    The GC target of the molecular moves, integrated exactly over the bond
+    (and 1/2! for the identical atoms of a homonuclear molecule): the
+    classical reference makes the sampled gas density p / k_B T.
+    """
+    from regc.units import BOLTZMANN_K_SI, kelvin_to_eV
+    from regc.units import thermal_wavelength_cubed_angstrom3 as lam3
+    kT, p = kelvin_to_eV(T), 1e5
+    rs = np.linspace(R0_CO - 0.3, R0_CO + 0.3, 20001)
+    bond = np.trapezoid(4 * np.pi * rs ** 2 * np.exp(-(_bond_energy(rs) - _bond_energy(R0_CO))
+                                                     / kT), rs)
+    beta_p = p / (BOLTZMANN_K_SI * T) * 1e-30                         # A^-3
+    for masses, sigma in [((12.011, 15.999), 1), ((15.999, 15.999), 2)]:
+        gas = _harmonic_co_gas(masses=masses)
+        gas.symmetry_number = sigma
+        mu = gas.mu_eV(T, p) - gas.energy_eV
+        rho = math.exp(mu / kT) / (lam3(T, masses[0]) * lam3(T, masses[1])) * bond / sigma
+        assert rho / beta_p == pytest.approx(1.0, abs=2e-3)        # harmonic-rigid-rotor level
+        gas.vibrations = "quantum"
+        mu_q = gas.mu_eV(T, p) - gas.energy_eV
+        assert math.exp((mu_q - mu) / kT) > 1.05                # quantum overshoots
+
+
+def test_classical_reference_ideal_gas_of_flexible_molecules_has_beta_p_v():
+    """A short GC run: <N_CO> = beta p V with the classical reference (3.4 with the quantum)."""
+    from regc.units import BOLTZMANN_K_SI, kelvin_to_eV
+    from regc.units import thermal_wavelength_cubed_angstrom3 as lam3
+    gas = _harmonic_co_gas()
+    co = MoleculeMove("CO", gas.symbols, gas.positions_angstrom)
+    T, L, zr = 300.0, 30.0, (2.0, 28.0)
+    kT, V = kelvin_to_eV(T), L * L * (zr[1] - zr[0])
+    p = 1.0 * BOLTZMANN_K_SI * T / (V * 1e-30)                       # beta p V = 1
+    mu = gas.mu_eV(T, p)
+    sysm = SlabSystem(L, L, L, HarmonicCO(), exchange_species=["C", "O"], insertion_z_range=zr)
+    sysm.set_molecules([co])
+    lam = np.array([lam3(T, m) for m in gas.masses_amu])
+    rep = Replica(ThermoState(kT, np.array([mu / 2, mu / 2]), (0, 0), lambda_cubed=lam), sysm,
+                  np.random.default_rng(3), max_disp=0.02)
+    ns = []
+    for it in range(1500):
+        rep.sweep(10, p_displace=0.0, p_insert=0.5, p_delete=0.5)
+        if it >= 10:
+            ns.append(sysm.species_counts()[0])
+    assert np.mean(ns) == pytest.approx(1.0, abs=0.12)
+    assert rep.n_accepts.get("insert_mol:CO", 0) > 100
+
+
+def test_gas_masses_reach_the_molecules():
+    """D2 vs H2: Lambda, moments and the Hessian frequency all follow the given masses."""
+    pytest.importorskip("ase")
+    from ase.calculators.emt import EMT
+    from regc.runner import _build_molecular_feed
+    h2 = MolecularGas.from_calculator(EMT(), "H2")
+    d2 = MolecularGas.from_calculator(EMT(), "H2", masses_amu={"H": 2.014})
+    assert d2.masses_amu == (2.014, 2.014) and d2.mass_exchanged_amu == pytest.approx(4.028)
+    ratio = math.sqrt(2.014 / h2.masses_amu[0])
+    assert h2.vib_wavenumbers_cm[0] / d2.vib_wavenumbers_cm[0] == pytest.approx(ratio, rel=1e-3)
+    assert d2.principal_moments()[-1] / h2.principal_moments()[-1] == pytest.approx(ratio ** 2,
+                                                                                   rel=1e-3)
+    assert abs(d2.mu_eV(300.0, 1e5) - h2.mu_eV(300.0, 1e5)) > 0.05
+    cfg = {"gas": {"species": ["H"]}, "molecules": {"H2": {"template": "H2"}}}
+    for getter in (lambda: EMT(), lambda: None):
+        if getter() is None:
+            cfg["molecules"]["H2"].update(energy_eV=h2.energy_eV,
+                                          vibrational_wavenumbers_cm=[3000.0])
+        feed, _, _ = _build_molecular_feed(cfg, ["H"], {"H": 2.014}, None, getter)
+        assert feed.gases[0].masses_amu == (2.014, 2.014)
+        assert feed.element_masses_amu == {"H": 2.014}
+        assert feed.gases[0].vibrations == "classical"
+    with pytest.warns(UserWarning, match="masses"):
+        MolecularGasFeed(["H"], [h2], [1.0], {"H": 2.014})
 
 
 def test_nonlinear_rotor_and_ch4_partition_function():
@@ -390,6 +549,9 @@ def test_runner_validates_the_molecules_section(tmp_path):
     cfg["gas"]["atomic_exchange"] = ["C"]           # pure CO cannot fix mu_C alone
     with pytest.raises(ValueError, match="does not fix"):
         setup_from_config(cfg, verbose=False)
+    with pytest.raises(ValueError, match="vibrations"):
+        validate_config(_co_config(tmp_path, CO={"template": "CO", "vibrations": "anharmonic"}))
+    validate_config(_co_config(tmp_path, CO={"template": "CO", "vibrations": "quantum"}))
 
 
 def test_runner_co_and_o2_feed_end_to_end(tmp_path):
@@ -404,6 +566,7 @@ def test_runner_co_and_o2_feed_end_to_end(tmp_path):
     mu = np.asarray(setup["mu_grid"])
     feed = setup["feed"]
     co, o2 = feed.gases
+    assert co.vibrations == o2.vibrations == "classical"
     assert mu[0, 1].sum() == pytest.approx(co.mu_eV(400.0, 0.5e5))
     assert 2 * mu[0, 1, 1] == pytest.approx(o2.mu_eV(400.0, 0.5e5))
     with open(tmp_path / "out" / "run_metadata.json") as f:

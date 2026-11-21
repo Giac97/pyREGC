@@ -3962,7 +3962,7 @@ calculator; D0 does too unless `d0` says otherwise.
 ### `MolecularGas`
 
 ```python
-MolecularGas(name: str, symbols: Tuple[str, ...], positions_angstrom: Sequence, energy_eV: float, vib_wavenumbers_cm: Tuple[float, ...], symmetry_number: int, spin_multiplicity: int = 1, masses_amu: Optional[Tuple[float, ...]] = None, calculator_info: Optional[dict] = None) -> None
+MolecularGas(name: str, symbols: Tuple[str, ...], positions_angstrom: Sequence, energy_eV: float, vib_wavenumbers_cm: Tuple[float, ...], symmetry_number: int, spin_multiplicity: int = 1, masses_amu: Optional[Tuple[float, ...]] = None, vibrations: str = 'classical', calculator_info: Optional[dict] = None) -> None
 ```
 
 An ideal polyatomic (or monatomic) gas, referenced to the simulation potential.
@@ -3974,6 +3974,16 @@ spin are standard ideal-gas statistical mechanics
 (`molecular_gas_mu_eV`). The relaxed template also defines the shape
 of the molecular insertion move (`regc.molecules.MoleculeMove`).
 
+The default `vibrations='classical'` is the reference consistent with
+the sampler, which treats the internal coordinates of molecules (in the
+gas zone or adsorbed intact) classically with exp(-beta U) on a single
+electronic surface: classical vibrations from the minimum, no ZPE, no
+spin degeneracy. `'quantum'` (quantum harmonic vibrations, ZPE and
+`spin_multiplicity`) is the physical gas of NIST-JANAF; with it the
+sampled intact molecules are over-stabilised by k_B T ln R (R in
+`molecular_gas_mu_eV`; ~0.07 eV for CO, 0.5-0.7 eV for NH3 and CH4 at
+300 K).
+
 **Parameters**
 
 - `name` (*str*): Label, e.g. `'CO'`.
@@ -3982,8 +3992,9 @@ of the molecular insertion move (`regc.molecules.MoleculeMove`).
 - `energy_eV` (*float*): Energy of the relaxed molecule with the potential, eV.
 - `vib_wavenumbers_cm` (*sequence of float*): Vibrational wavenumbers, cm^-1.
 - `symmetry_number` (*int*): Rotational symmetry number.
-- `spin_multiplicity` (*int, optional*): Electronic ground-state degeneracy. Default 1.
+- `spin_multiplicity` (*int, optional*): Electronic ground-state degeneracy (`'quantum'` only). Default 1.
 - `masses_amu` (*sequence of float, optional*): Atomic masses. Default None: ASE's table.
+- `vibrations` (*str, optional*): `'classical'` (default) or `'quantum'`; see above.
 - `calculator_info` (*dict, optional*): Diagnostics from `from_calculator`. Default None.
 
 #### `MolecularGas.composition` (property)
@@ -4050,7 +4061,7 @@ JSON-able form (diagnostics dropped).
 
 **Returns**
 
-- *dict*: The constructor arguments, plus `type: molecular`.
+- *dict*: The constructor arguments, plus `type: molecular`. A quantum gas omits `vibrations`, as written before the option existed.
 
 #### `MolecularGas.from_dict` (classmethod)
 
@@ -4062,7 +4073,7 @@ Rebuild a gas written by `to_dict`.
 
 **Parameters**
 
-- `d` (*dict*): The dict.
+- `d` (*dict*): The dict; without `vibrations` (older runs) the gas is quantum.
 
 **Returns**
 
@@ -4071,7 +4082,7 @@ Rebuild a gas written by `to_dict`.
 #### `MolecularGas.from_calculator` (classmethod)
 
 ```python
-MolecularGas.from_calculator(ase_calculator, template, name: Optional[str] = None, symmetry_number: Optional[int] = None, spin_multiplicity: Optional[int] = None, vib_wavenumbers_cm: Optional[Sequence[float]] = None, fmax: float = 0.001, steps: int = 1000, delta: float = 0.005, cell: float = 20.0) -> MolecularGas
+MolecularGas.from_calculator(ase_calculator, template, name: Optional[str] = None, symmetry_number: Optional[int] = None, spin_multiplicity: Optional[int] = None, vib_wavenumbers_cm: Optional[Sequence[float]] = None, fmax: float = 0.001, steps: int = 1000, delta: float = 0.005, cell: float = 20.0, masses_amu=None, vibrations: str = 'classical') -> MolecularGas
 ```
 
 Relax a gas molecule with a potential and take its vibrations from the Hessian.
@@ -4088,6 +4099,8 @@ Relax a gas molecule with a potential and take its vibrations from the Hessian.
 - `steps` (*int, optional*): Maximum relaxation steps. Default 1000.
 - `delta` (*float, optional*): Finite-difference displacement for the Hessian, A. Default 0.005.
 - `cell` (*float, optional*): Edge of the (non-periodic) box the molecule sits in, A. Default 20.
+- `masses_amu` (*dict or sequence of float, optional*): `{element: mass}` (elements not in it keep the template's) or one mass per atom, amu; give the exchanged atoms' masses (isotopes such as D). They enter Lambda, the moments of inertia and the Hessian frequencies. Default None: the template's (ASE's table).
+- `vibrations` (*str, optional*): `'classical'` (default) or `'quantum'`; see the class.
 
 **Returns**
 
@@ -4095,7 +4108,7 @@ Relax a gas molecule with a potential and take its vibrations from the Hessian.
 
 **Raises**
 
-- *ValueError*: If the symmetry number is unknown and not given, or the relaxed geometry is not a minimum (imaginary vibrational modes).
+- *ValueError*: If the symmetry number is unknown and not given, the relaxed geometry is not a minimum (imaginary vibrational modes), or `masses_amu` does not fit the template.
 
 ---
 
@@ -4122,7 +4135,7 @@ mu_C + mu_O), only combinations that the moves use -- checked by
 - `elements` (*sequence of str*): The exchanged elements, in `ParticleSystem.exchange_species` order.
 - `gases` (*sequence of MolecularGas*): The gases.
 - `fractions` (*sequence of float*): Their mole fractions (normalised here).
-- `element_masses_amu` (*dict, optional*): Atomic masses for Lambda_e. Default None: ASE's table.
+- `element_masses_amu` (*dict, optional*): Atomic masses for Lambda_e. Default None: ASE's table. They should be the gases' atom masses: the activities prod_e z_e^{nu_e} = exp(beta mu_g) / prod_e Lambda_e^{3 nu_e} of a molecular move put a classical gas at its pressure only then (a mismatch is warned about).
 
 **Raises**
 

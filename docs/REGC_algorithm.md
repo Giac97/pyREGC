@@ -515,6 +515,11 @@ $-e_\text{atom}$. In (4), (5), (8) and (9), the
 $\Lambda$ is that of the **exchanged species** (the H atom), since that is the particle whose
 number fluctuates.
 
+(14) has quantum vibrations, ZPE and spin degeneracy. This is the standard reference for atoms that
+adsorb dissociatively, and it stays the default. The sampled atoms are classical, though. A molecule they
+form in the gas zone is over-stabilised by $k_BT\ln R$ of §10 (O$_2$ 0.02 eV, H$_2$ 0.19 eV at 300 K):
+its equilibrium number there is $\beta pV R$ instead of $\beta pV$.
+
 ---
 
 ## 7. The LJ surface of [ZSG] §III A (`examples/12_paper_lj_surface.py`)
@@ -785,16 +790,37 @@ own and they can be combined freely.
 $g$ of composition $\boldsymbol\nu_g$ at partial pressure $x_g p$ has
 
 $$
-\mu_g = E_g + \text{ZPE}_g + k_BT\ln\frac{x_g p\,\Lambda_g^3}{k_BT} - k_BT\ln\!\big(g_\text{el}\, q_\text{rot}\, q_\text{vib}\big),
+\mu_g = E_g + k_BT\ln\frac{x_g p\,\Lambda_g^3}{k_BT} - k_BT\ln\!\big(q_\text{rot}\, q^\text{cl}_\text{vib}\big),
+\quad q^\text{cl}_\text{vib} = \prod_i \frac{k_BT}{h\nu_i},
 \qquad
 \boldsymbol\nu_g\cdot\boldsymbol\mu = \mu_g \;\;\forall g,
 \qquad (28)
 $$
 
-$E_g$ the energy of the molecule relaxed with the simulation potential, a classical rigid rotor
-(linear or not, symmetry number $\sigma$), harmonic vibrations from the potential's Hessian, $q_\text{vib}$
-counted from $v = 0$. For a diatomic, (28) is (14) times two. The linear system is solved with the
-pseudo-inverse (minimum norm). The gas compositions must be linearly independent: CO, O$_2$ and CO$_2$
+$E_g$ the energy of the molecule relaxed with the simulation potential, $\Lambda_g$ that of its mass, a
+classical rigid rotor (linear or not, symmetry number $\sigma$) and classical harmonic vibrations from
+the potential's Hessian, counted from the minimum (`vibrations="classical"`, the default). The masses
+are those of the exchanged atoms (`gas.mass_amu`), the same as in $\Lambda_e$.
+
+*Why classical.* (28) is the reference under which (25) reproduces the gas. Integrate (25) over one
+isolated molecule. The atoms carry $\prod_e \Lambda_e^{-3\nu_e}$, and counting a set of identical atoms once
+gives the $1/\sigma$. At the harmonic, rigid-rotor level the coordinate integral is
+$V\,e^{-\beta E_g}\,(\prod_e\Lambda_e^{3\nu_e}/\Lambda_g^3)\,q_\text{rot}\,q^\text{cl}_\text{vib}$, so
+$\langle N_g\rangle = V e^{\beta(\mu_g - E_g)} q_\text{rot}q^\text{cl}_\text{vib}/\Lambda_g^3$, and
+$\langle N_g\rangle = \beta x_g p V$ requires (28). A diatomic is checked exactly by quadrature, and a GC
+run of flexible molecules gives $\langle N\rangle/\beta pV = 1.010 \pm 0.008$. The physical gas
+(`vibrations="quantum"`, NIST-JANAF) has instead
+$E_g + \text{ZPE}_g$ and $g_\text{el}\prod_i(1-e^{-h\nu_i/k_BT})^{-1}$. For a diatomic that is (14) times
+two. Used in (25), it over-stabilises every sampled intact molecule, in the gas zone or adsorbed, by
+$k_BT\ln R$, where $R = g_\text{el}^{-1}\prod_i 2\sinh(h\nu_i/2k_BT)/(h\nu_i/k_BT)$. At 300 K this is
+0.07 eV (CO), 0.02 (O$_2$), 0.36 (H$_2$O), 0.53 (NH$_3$) and 0.65 (CH$_4$). The spin degeneracy
+$g_\text{el}$ is dropped from (28) because the sampled Hamiltonian has a single electronic surface:
+molecules, fragments and atoms all have weight 1. The classical reference puts gas and adsorbate at one
+level of theory, so the intact molecule's internal modes cancel. What it leaves out are the physical
+corrections, the gas molecule's ZPE for dissociation products and the kT ln 3 of O$_2$ that chemisorption
+quenches. Those are the corrections the quantum reference keeps.
+
+The linear system is solved with the pseudo-inverse (minimum norm). The gas compositions must be linearly independent: CO, O$_2$ and CO$_2$
 together have common $\mu_e$ only at gas-phase equilibrium. One gas per independent composition is the
 *constrained equilibrium* of atomistic thermodynamics (Reuter and Scheffler, PRB 68, 045407 (2003)):
 the surface is in equilibrium with every gas, the gases not with each other. With fewer gases than
@@ -806,7 +832,10 @@ enter (27), and those are unique if every move's composition is a combination of
 number follows $P(n) \propto (\prod_e z_e^{\nu_e} V^{\sum\nu})^n / \prod_e N_e!$ for CO, O$_2$ (anchor
 among the partners) and CH$_4$ (24 orderings and the mirror mixture). With atomic moves added, $N_\text{C}$
 and $N_\text{O}$ are independent Poisson variables. In an interacting gas, atomic and atomic + molecular
-exchange give the same averages. The running energy matches a recomputation with EMT.
+exchange give the same averages. The running energy matches a recomputation with EMT. The classical
+reference (28) puts a flexible diatomic exactly at $\beta p$ by quadrature (heteronuclear and $\sigma=2$),
+and a short GC run of flexible molecules reproduces $\langle N\rangle = \beta pV$. The quantum
+reference keeps its earlier values. The masses of `gas.mass_amu` reach the gas (D$_2$ vs H$_2$).
 
 ## 11. Subsurface insertion with nonequilibrium candidate Monte Carlo (an extension beyond [ZSG])
 

@@ -763,6 +763,19 @@ the O2 gas chemical potential is within 2 meV of NIST-JANAF at 300–1000 K;
 H2 (closed shell) is within 7 meV. Constructing a `DiatomicReservoir`
 directly, pass `electronic_degeneracy` yourself.
 
+This is the standard atomistic-thermodynamics reference for atoms that
+adsorb dissociatively: quantum vibrations, ZPE and spin. The sampled
+atoms are classical, though. If two exchanged atoms form an intact
+molecule in the gas zone, that molecule carries the classical/quantum
+mismatch of §10.1: it is over-stabilised by 0.02 eV (O2) or 0.19 eV
+(H2) at 300 K. The equilibrium number of such molecules is then βpV·R
+instead of βpV, where V is the gas-zone volume and R ≈ 2 for O2 and
+≈ 1800 for H2 at 300 K. At low pressure this is negligible. For H2 near
+1 bar it can amount to several molecules in a typical gas zone. Atom-by-
+atom insertion rarely forms them, because an isolated gas atom costs
+about D0/2, but associative desorption can. At high H2 pressure, check
+the gas zone for H2 molecules and leave them out of the coverage.
+
 ### 4.2 Monatomic gases
 
 ```python
@@ -1769,16 +1782,56 @@ they are enabled, can still exchange those atoms.
 
 `MolecularGas` is the reservoir. It relaxes the molecule with the
 simulation's potential and takes the vibrations from that potential's
-Hessian. Rotation (linear or not, symmetry number) and spin (3 for O2)
-are standard ideal-gas terms. `MolecularGasFeed` turns a gas mixture at
-fixed mole fractions into elemental μ's. Each gas g fixes ν_g · μ = μ_g.
+Hessian. Rotation (linear or not, symmetry number) is the standard
+ideal-gas term. `MolecularGasFeed` turns a gas mixture at fixed mole
+fractions into elemental μ's. Each gas g fixes ν_g · μ = μ_g. The
+masses are those of `gas.mass_amu` (or `masses_amu=` in
+`from_calculator`), so isotopes such as D enter Λ, the moments of
+inertia and the Hessian frequencies.
+
+**Classical or quantum vibrations (`vibrations`).** The moves sample a
+molecule's internal coordinates classically, with exp(−βU) on a single
+potential energy surface, both in the gas zone and adsorbed intact. The
+reference consistent with that sampling, the default
+`vibrations="classical"`, counts each vibration classically from the
+potential minimum, q_vib = Π kT/(hν_i), with no zero-point energy and
+no spin degeneracy (the sampled Hamiltonian has one electronic state).
+With it, a sampled ideal gas of flexible molecules has exactly
+⟨N⟩ = βpV, and the internal modes of an intact adsorbed molecule are
+treated alike in the gas and on the surface.
+`vibrations="quantum"` is the physical gas (quantum harmonic
+vibrations from v = 0, ZPE, spin multiplicity 3 for O2), within meV of
+NIST-JANAF. With it, every sampled intact molecule is over-stabilised by
+kT ln R, R = Π_i [2 sinh(hν_i/2kT)/(hν_i/kT)] / g:
+
+| μ_quantum − μ_classical (eV) | H2 | CO | O2 | H2O | NH3 | CH4 |
+|---|---|---|---|---|---|---|
+| 300 K | 0.19 | 0.07 | 0.02 | 0.36 | 0.53 | 0.65 |
+| 600 K | 0.15 | 0.05 | −0.03 | 0.26 | 0.38 | 0.45 |
+| 1000 K | 0.11 | 0.03 | −0.08 | 0.19 | 0.27 | 0.31 |
+
+(experimental frequencies; O2 includes −kT ln 3). The classical choice
+puts the whole simulation, gas and adsorbate, at one level of theory.
+Quantum effects of the adsorbate (ZPE of its surface bonds) are absent
+either way. Two physical effects are then left out: the gas molecule's
+own vibrational ZPE and free energy for products that do not keep the
+molecule's bonds (dissociated O from O2), and the triplet degeneracy of
+O2 that chemisorption quenches (kT ln 3 per O2, 0.03 eV at 300 K).
+Where those matter more than the intact molecules, for example O2 with
+`insert: false` that only fixes μ_O for atomic exchange, use
+`vibrations: quantum`, the standard atomistic-thermodynamics reference
+that `DiatomicReservoir` uses (§4.1).
+
+Runs made before this option existed used `quantum`. Their stored
+metadata are read as quantum, so their analysis is unchanged. To resume
+one of them, add `vibrations: quantum` to each gas.
 
 ```python
 from regc import MolecularGas, MolecularGasFeed, MoleculeMove
 
 ase_calc = ...                                        # the simulation potential as an ASE calculator
 co = MolecularGas.from_calculator(ase_calc, "CO")     # relaxed, Hessian vibrations, sigma = 1
-o2 = MolecularGas.from_calculator(ase_calc, "O2")     # spin multiplicity 3, sigma = 2
+o2 = MolecularGas.from_calculator(ase_calc, "O2")     # sigma = 2; classical vibrations
 feed = MolecularGasFeed(["C", "O"], [co, o2], [0.5, 0.5])
 mus = feed.mu_grid(T_K, p_bar, unit="bar")            # (n_T, n_p, 2): mu_C, mu_O
 
@@ -2750,7 +2803,8 @@ pressure.
 | `angle_sigma_deg` | 10 | Width of the direction proposals. |
 | `weight` | 1 | Relative frequency among the GC channels. Each atomic species has weight 1. |
 | `symmetry_number` | tabulated | Rotational symmetry number (CO 1, O2 2, H2O 2, NH3 3, CH4 12, ...). |
-| `spin_multiplicity` | 3 for O2, else 1 | Electronic ground-state degeneracy. |
+| `vibrations` | `classical` | Gas reference (§10.1): `classical` (no ZPE, no spin degeneracy; consistent with the sampled molecules) or `quantum` (physical gas, NIST-JANAF; intact molecules over-stabilised by 0.07 eV for CO, 0.5–0.7 eV for NH3 and CH4 at 300 K). |
+| `spin_multiplicity` | 3 for O2, else 1 | Electronic ground-state degeneracy, used with `vibrations: quantum`. |
 | `vibrational_wavenumbers_cm` | from the Hessian | Use these instead, e.g. experimental values. |
 | `energy_eV` | from the potential | Energy of the molecule. Required, with the vibrations, for `LJ` and `PairLJ`, which cannot relax a molecule. |
 
