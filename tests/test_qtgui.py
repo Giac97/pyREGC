@@ -134,3 +134,80 @@ def test_window_build_run_monitor(app, tmp_path):
     finally:
         w.build.set_dirty(False)        # no unsaved-changes dialog offscreen
         w.close()
+
+
+def test_apply_field_keeps_yaml_edits_since_sync():
+    cfg = {"replica_exchange": {"n_steps": 999}}      # YAML edited after the form was filled
+    qtgui.apply_field(cfg, "replica_exchange.n_steps", "int", "400", synced="400")
+    assert cfg["replica_exchange"]["n_steps"] == 999
+    qtgui.apply_field(cfg, "replica_exchange.n_steps", "int", "500", synced="400")
+    assert cfg["replica_exchange"]["n_steps"] == 500
+
+
+def test_ladders_reject_bad_input():
+    for bad in ((0, 900, 3), (300, -1, 3), (300, 900, 0)):
+        with pytest.raises(ValueError):
+            qtgui.geometric_ladder(*bad)
+    with pytest.raises(ValueError):
+        qtgui.log_ladder(0.0, 1.0, 3)
+
+
+def test_window_outside_output_form_and_external_run(app, tmp_path):
+    """No run launched: output dirs outside the workspace, Form -> YAML, an external run."""
+    ws_dir, scratch = tmp_path / "ws", tmp_path / "scratch"
+    for d in (ws_dir / "a", ws_dir / "b", scratch / "out"):
+        d.mkdir(parents=True)
+    cfg = yaml.safe_load(next(iter(gui.TEMPLATES.values())))
+    cfg["output"] = {"directory": str(scratch / "out")}                 # absolute, outside
+    (ws_dir / "a" / "run.yaml").write_text(yaml.safe_dump(cfg))
+    cfg["output"] = {"directory": "../../elsewhere"}                     # relative, outside
+    (ws_dir / "b" / "run.yaml").write_text(yaml.safe_dump(cfg))
+    # a run started by a script into the scratch output: fresh heartbeat, a checkpoint
+    (scratch / "out" / "checkpoint.pkl").write_bytes(b"x")
+    (scratch / "out" / "status.json").write_text(
+        '{"time": %f, "started": %f, "step": 10, "n_steps": 400}' % (time.time(), time.time()))
+    w = qtgui.MainWindow(str(ws_dir), pythonpath=ROOT)
+    w.auto.setChecked(False)
+    try:
+        by = {r["path"]: r for r in w.runs.rows}
+        assert by[os.path.join("a", "run.yaml")]["output_dir"] == str(scratch / "out")
+        job = by[os.path.join("a", "run.yaml")]["job"]
+        assert job["state"] == "running" and job["external"]
+        w.runs.select(os.path.join("a", "run.yaml"))
+        w.runs.selection_changed()
+        for m in ("run", "resume", "overwrite", "analyze", "stop"):
+            assert not w.runs.buttons[m].isEnabled(), m
+        with pytest.raises(ValueError, match="outside the workspace"):   # launching stays inside
+            w.ws.start(os.path.join("a", "run.yaml"), "overwrite")
+        assert w.monitor.run_box.findData(str(scratch / "out")) >= 0
+        w.runs.select(os.path.join("b", "run.yaml"))            # ../../elsewhere: no crash
+        w.runs.selection_changed()
+        assert w.runs.buttons["run"].isEnabled()
+        w.runs.action("monitor")
+        assert w.monitor.out_dir == str(tmp_path / "elsewhere")
+        # Form -> YAML keeps YAML edits made after the form was filled, and can be undone
+        b = w.build
+        b.load("t", next(iter(gui.TEMPLATES)), ask=False)
+        edited = b.yaml.toPlainText().replace("n_steps: 400", "n_steps: 999") + \
+            "subsurface:\n  depth_angstrom: 2.0\n"
+        b.yaml.setPlainText(edited)
+        b.fields["replica_exchange.seed"][0].setText("7")
+        b.form_to_yaml()
+        new = yaml.safe_load(b.yaml.toPlainText())
+        assert new["replica_exchange"]["n_steps"] == 999 and new["replica_exchange"]["seed"] == 7
+        assert new["subsurface"] == {"depth_angstrom": 2.0}
+        assert b.fields["replica_exchange.n_steps"][0].text() == "999"   # form re-synced
+        b.yaml.undo()
+        assert b.yaml.toPlainText() == edited
+        # YAML that does not parse: left alone, error shown
+        b.yaml.setPlainText("replica_exchange: [1,\n")
+        b.form_to_yaml()
+        assert b.yaml.toPlainText() == "replica_exchange: [1,\n"
+        assert "not applied" in b.msg.text.text()
+        # ladder from 0 K: an error message, no exception
+        b.t0.setText("0")
+        b.t_ladder()
+        assert "Ladder" in b.msg.text.text()
+    finally:
+        w.build.set_dirty(False)
+        w.close()

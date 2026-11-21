@@ -41,6 +41,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import socket
 import time
 import warnings
 from concurrent.futures import ProcessPoolExecutor
@@ -1655,10 +1656,11 @@ class ReplicaExchangeGCMC:
         Write a JSON heartbeat of the running simulation from now on (or stop).
 
         At most every `interval_s` seconds (and at the end of every run
-        call) the file is replaced atomically with the progress, the
-        per-replica sample counts and averages, the latest stretch of every
-        replica's N and U, the swap statistics and the convergence history:
-        what `regc.monitor` shows while the run is going.
+        call) the file is replaced atomically with the writing process (id
+        and host), the progress, the per-replica sample counts and
+        averages, the latest stretch of every replica's N and U, the swap
+        statistics and the convergence history: what `regc.monitor` shows
+        while the run is going.
 
         Parameters
         ----------
@@ -1750,6 +1752,7 @@ class ReplicaExchangeGCMC:
         composition = self._status_composition(keys, grid_of, stride) if self.sgc_species else None
         return {
             "schema": 1, "time": time.time(), "started": self._status_started,
+            "pid": os.getpid(), "host": socket.gethostname(),   # who writes it (GUI liveness)
             "scheme": scheme, "step": int(self._status_offset + step), "n_steps": int(total),
             "shape": shape, "temperatures": [float(T) for T in self.temperatures],
             "mu_grid": np.asarray(self.mu_grid, dtype=float).tolist(),

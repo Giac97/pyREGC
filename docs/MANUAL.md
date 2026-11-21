@@ -1074,14 +1074,22 @@ the window, and the scripts, the window and the web version all see the
 same runs. They use the GUI's interpreter (`--python`) and `PYTHONPATH` =
 `--pythonpath`. By default that is the directory holding the `regc`
 package the GUI imported; it can be changed in the toolbar, e.g. to
-another git worktree. A run counts as alive only while its process id
-belongs to a regc process, so an id reused after a reboot is not taken
-for a run.
+another git worktree. A run counts as alive while the process in
+`run.pid` runs (its start time, kept in `run.pid.start`, must match, so a
+reused id is not taken for the run), or while its `status.json` heartbeat
+says so: the process named in it is alive on this machine, or, for
+heartbeats from another machine or older versions, the heartbeat is fresher
+than two minutes. Runs started by scripts or plain `regc-run` thus show as
+running (external), and starting, resuming or starting over into their
+output is refused. A run that stopped for its time limit shows as stopped
+(resumable).
 
 The web version (`--web`) has the same tabs in a browser page, with the
 §7.1 monitor under `/monitor/`. It listens on 127.0.0.1. Requests that
 write files or start or stop processes need a token that only the served
 page holds, so other pages open in the same browser cannot send them.
+Requests naming another host (DNS rebinding), and changes coming from
+another origin, are refused; so are foreign host names on `regc-monitor`.
 
 ## 8. Saving and loading samples
 

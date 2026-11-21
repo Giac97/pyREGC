@@ -167,7 +167,7 @@ def _scalar(text: str):
         return t
 
 
-def apply_field(cfg: dict, key: str, kind: str, text: str) -> None:
+def apply_field(cfg: dict, key: str, kind: str, text: str, synced: Optional[str] = None) -> None:
     """
     Write one form entry into the config (unchanged entries leave the config alone).
 
@@ -181,8 +181,12 @@ def apply_field(cfg: dict, key: str, kind: str, text: str) -> None:
         ``str``, ``num``, ``int``, ``val``, ``list``, ``bool`` or ``sel:...``.
     text : str
         The entry; empty removes the key.
+    synced : str, optional
+        The entry's text when the form was last filled from the YAML: an
+        entry not edited since is left alone, so YAML edits made since
+        then are kept. Default None (compare with the config only).
     """
-    if text == field_text(_get(cfg, key)):
+    if text == synced or text == field_text(_get(cfg, key)):
         return                                     # untouched (keeps non-scalar values too)
     if kind == "list":
         value = [_scalar(x) for x in text.replace(",", " ").split()] or None
@@ -210,7 +214,14 @@ def geometric_ladder(t0: float, t1: float, n: int) -> List[int]:
     -------
     list of int
         The ladder.
+
+    Raises
+    ------
+    ValueError
+        If an end point is not positive or `n` < 1.
     """
+    if not (t0 > 0 and t1 > 0) or n < 1:
+        raise ValueError("the temperatures must be positive and the number of points at least 1")
     if n < 2:
         return [int(round(t0))]
     return [int(round(t0 * (t1 / t0) ** (i / (n - 1)))) for i in range(n)]
@@ -231,7 +242,14 @@ def log_ladder(p0: float, p1: float, n: int) -> List[float]:
     -------
     list of float
         The ladder (3 significant digits).
+
+    Raises
+    ------
+    ValueError
+        If an end point is not positive or `n` < 1.
     """
+    if not (p0 > 0 and p1 > 0) or n < 1:
+        raise ValueError("the pressures must be positive and the number of points at least 1")
     if n < 2:
         return [p0]
     e0, e1 = np.log10(p0), np.log10(p1)
@@ -446,10 +464,9 @@ if QtWidgets is not None:
 
     def _process_env(ws: Workspace) -> "QtCore.QProcessEnvironment":
         """The environment of processes started from the window."""
-        env = QtCore.QProcessEnvironment.systemEnvironment()
-        if ws.pythonpath:
-            env.insert("PYTHONPATH", ws.pythonpath)
-        env.insert("PYTHONUNBUFFERED", "1")
+        env = QtCore.QProcessEnvironment()
+        for k, v in ws._env().items():      # the runs' environment (PYTHONPATH, threads)
+            env.insert(k, v)
         return env
 
     def _repolish(w: "QtWidgets.QWidget") -> None:
@@ -707,6 +724,8 @@ QTabBar::tab {{ padding: 7px 16px; }}
             self.proc: Optional[QtCore.QProcess] = None
             self.dirty = False
             self._loading = False
+            self._synced: Dict[str, str] = {}      # field texts at the last YAML -> form fill
+            self._synced_groups: Dict[str, bool] = {}
 
             # row 1: source and destination
             top = QtWidgets.QHBoxLayout()
@@ -1094,8 +1113,18 @@ QTabBar::tab {{ padding: 7px 16px; }}
         def yaml_to_form(self) -> None:
             """Fill the form from the YAML."""
             cfg = self.parse()
-            if cfg is None:
-                return
+            if cfg is not None:
+                self._fill_form(cfg)
+
+        def _fill_form(self, cfg: dict) -> None:
+            """
+            Fill the form from a config and remember what it shows.
+
+            Parameters
+            ----------
+            cfg : dict
+                The config.
+            """
             for key, (w, kind) in self.fields.items():
                 text = field_text(_get(cfg, key))
                 if isinstance(w, QtWidgets.QComboBox):
@@ -1105,22 +1134,43 @@ QTabBar::tab {{ padding: 7px 16px; }}
                 else:
                     w.setText(text)
                     w.setCursorPosition(0)
+                self._synced[key] = text
             for title, g in self.groups.items():
                 if g.isCheckable():
                     g.setChecked(isinstance(cfg.get("subsurface"), dict))
+                    self._synced_groups[title] = g.isChecked()
 
         def form_to_yaml(self) -> None:
-            """Rewrite the YAML with the form's values."""
-            cfg = self.parse() or {}
+            """
+            Rewrite the YAML with the form's values.
+
+            Only the entries edited since the form was last filled from the
+            YAML are written, so edits typed into the YAML since then are
+            kept. Nothing happens if the YAML does not parse. The editor's
+            undo history covers the rewrite.
+            """
+            cfg = self.parse()
+            if cfg is None:
+                self.say("“Write form to YAML” not applied: the YAML does not parse (see the "
+                         "highlighted line). Fix it, or undo, and try again.\n"
+                         + self.msg.text.text(), False)
+                return
             for key, (w, kind) in self.fields.items():
                 g = w.parentWidget()
                 if isinstance(g, QtWidgets.QGroupBox) and g.isCheckable() and not g.isChecked():
-                    _set(cfg, key.split(".")[0], None)
+                    if self._synced_groups.get(g.title(), True):     # switched off in the form
+                        _set(cfg, key.split(".")[0], None)
                     continue
                 text = w.currentText() if isinstance(w, QtWidgets.QComboBox) else w.text()
-                apply_field(cfg, key, kind, text)
-            self.yaml.setPlainText(dump_config(cfg))
-            self.parse()
+                apply_field(cfg, key, kind, text, self._synced.get(key, ""))
+            cur = QtGui.QTextCursor(self.yaml.document())
+            cur.beginEditBlock()                    # one undo step, history kept
+            cur.select(QtGui.QTextCursor.SelectionType.Document)
+            cur.insertText(dump_config(cfg))
+            cur.endEditBlock()
+            cfg = self.parse()
+            if cfg is not None:
+                self._fill_form(cfg)
 
         def t_ladder(self) -> None:
             """Fill T with a geometric ladder."""
@@ -1144,7 +1194,10 @@ QTabBar::tab {{ padding: 7px 16px; }}
 
         def browse_save(self) -> None:
             """Choose where to save."""
-            start = self.main.ws.resolve(self.save_path.text() or ".")
+            try:
+                start = self.main.ws.resolve(self.save_path.text() or ".")
+            except ValueError:
+                start = self.main.ws.root
             path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save config", start,
                                                             "YAML (*.yaml *.yml)")
             if path:
@@ -1446,7 +1499,10 @@ QTabBar::tab {{ padding: 7px 16px; }}
                 name.setData(QtCore.Qt.ItemDataRole.UserRole, c["path"])
                 self.table.setItem(i, 0, name)
                 tok, icon, why = STATE_STYLE.get(j["state"], ("neutral", "SP_FileIcon", ""))
-                st = self._item(j["state"], f"{j['state']}: {why}" + (f" (pid {j['pid']})" if j["pid"] else ""))
+                if j.get("external"):
+                    why = "started outside the GUI (a script or regc-run); found by its heartbeat"
+                label = j["state"] + (" (external)" if j.get("external") else "")
+                st = self._item(label, f"{label}: {why}" + (f" (pid {j['pid']})" if j["pid"] else ""))
                 st.setIcon(_icon(icon))
                 st.setForeground(QtGui.QColor(t[tok]))
                 f = st.font()
@@ -1515,12 +1571,13 @@ QTabBar::tab {{ padding: 7px 16px; }}
             enabled = {"edit": bool(c), "run": bool(c) and not live and not resumable,
                        "resume": bool(c) and not live and resumable,
                        "overwrite": bool(c) and not live and resumable,
-                       "analyze": bool(c) and not live, "stop": bool(c) and live,
+                       "analyze": bool(c) and not live,
+                       "stop": bool(c) and live and not j.get("external"),
                        "monitor": bool(c)}
             for m, b in self.buttons.items():
                 b.setEnabled(enabled[m])
             if c:
-                out = self.main.ws.resolve(c["output"])
+                out = c["output_dir"]           # may lie outside the workspace
                 self.log_title.setText(f"<b>Log</b> &nbsp;<span style='color:{self.main.theme['muted_fg']}'>"
                                        f"{c['output']}/run.log</span>")
                 text = tail_text(os.path.join(out, "run.log"), 20_000)
@@ -1578,7 +1635,7 @@ QTabBar::tab {{ padding: 7px 16px; }}
                 if self.main.build.load("c", c["path"]):
                     self.main.tabs.setCurrentWidget(self.main.build)
             elif mode == "monitor":
-                self.main.monitor.show_run(self.main.ws.resolve(c["output"]))
+                self.main.monitor.show_run(c["output_dir"])
                 self.main.tabs.setCurrentWidget(self.main.monitor)
             elif mode == "stop":
                 box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Icon.Warning, "Stop run",
@@ -1708,7 +1765,7 @@ QTabBar::tab {{ padding: 7px 16px; }}
             """
             have = {self.run_box.itemData(i) for i in range(self.run_box.count())}
             for c in configs:
-                out = self.main.ws.resolve(c["output"])
+                out = c["output_dir"]
                 if out not in have:
                     self.run_box.addItem(f"{c['output']}   ({c['path']})", out)
                     have.add(out)

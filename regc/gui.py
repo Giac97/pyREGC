@@ -30,7 +30,9 @@ be changed on the page, e.g. to another git worktree).
 
 The server binds to 127.0.0.1. Requests that change files or start and stop
 processes need a per-session token that only the served page knows, so
-other web pages open in the same browser cannot use them. On a remote
+other web pages open in the same browser cannot use them; requests naming
+another host (DNS rebinding) or, for changes, coming from another origin
+are refused. On a remote
 machine, forward the port (``ssh -L 8060:localhost:8060 host``).
 """
 
@@ -41,6 +43,7 @@ import json
 import os
 import secrets
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -293,29 +296,87 @@ def _within(path: str, root: str) -> bool:
     return os.path.commonpath([p, r]) == r
 
 
-def pid_alive(pid: Optional[int]) -> bool:
+def _proc_stat(pid: int) -> Optional[tuple]:
     """
-    Whether a process with this id runs and is a regc process.
+    State and start time of a process, from ``/proc/<pid>/stat`` (Linux).
 
-    On Linux the command line is checked for ``regc`` too, so a process id
-    reused after a reboot is not taken for the run.
+    Parameters
+    ----------
+    pid : int
+        Process id.
+
+    Returns
+    -------
+    tuple or None
+        ``(state letter, start time in clock ticks after boot)`` (fields 3
+        and 22), or None where ``/proc`` is unavailable.
+    """
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()   # the name may hold spaces
+        return fields[0], int(fields[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _proc_start_epoch(pid: int) -> Optional[float]:
+    """
+    When a process started, in seconds since the epoch (Linux).
+
+    Parameters
+    ----------
+    pid : int
+        Process id.
+
+    Returns
+    -------
+    float or None
+        The start time (to about a second), or None if unknown.
+    """
+    st = _proc_stat(pid)
+    if st is None:
+        return None
+    try:
+        with open("/proc/stat") as f:
+            btime = next(int(ln.split()[1]) for ln in f if ln.startswith("btime"))
+        return btime + st[1] / os.sysconf("SC_CLK_TCK")
+    except (OSError, StopIteration, ValueError):
+        return None
+
+
+def pid_alive(pid: Optional[int], start: Optional[int] = None) -> bool:
+    """
+    Whether a process with this id runs (and is the one meant).
+
+    With `start` (the process start time recorded at launch, field 22 of
+    ``/proc/<pid>/stat``) the process must have that start time, so a
+    reused id is not taken for the run. Without it (old ``run.pid`` files)
+    the command line must contain ``regc``, where it can be read.
 
     Parameters
     ----------
     pid : int or None
         Process id.
+    start : int, optional
+        Start time in clock ticks after boot. Default None.
 
     Returns
     -------
     bool
-        True if alive (and, where checkable, a regc process).
+        True if alive (and, where checkable, the same process).
     """
     if not pid:
         return False
     try:
         os.kill(pid, 0)
-    except (OSError, ProcessLookupError):
+    except OSError:
         return False
+    st = _proc_stat(pid)
+    if st is not None:
+        if st[0] == "Z":                  # exited, not reaped yet
+            return False
+        if start is not None:
+            return st[1] == start
     cmdline = f"/proc/{pid}/cmdline"
     if os.path.exists(cmdline):
         try:
@@ -324,6 +385,46 @@ def pid_alive(pid: Optional[int]) -> bool:
         except OSError:
             return False
     return True
+
+
+def heartbeat_alive(st: Optional[dict], now: Optional[float] = None) -> Optional[bool]:
+    """
+    Whether the process that wrote a ``status.json`` heartbeat still runs.
+
+    Heartbeats name their process (``pid``, ``host``); on this host that
+    process is checked (it must have started before the heartbeat did, so
+    a reused id does not count). Other heartbeats (another host, older
+    runs) count as alive while fresher than `STALE_S`.
+
+    Parameters
+    ----------
+    st : dict or None
+        The heartbeat.
+    now : float, optional
+        Current time. Default: `time.time()`.
+
+    Returns
+    -------
+    bool or None
+        True / False, or None if there is no heartbeat.
+    """
+    if not st:
+        return None
+    pid = st.get("pid")
+    if isinstance(pid, int) and st.get("host") == socket.gethostname():
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            pass                          # exists (another user's)
+        stat = _proc_stat(pid)
+        if stat is not None and stat[0] == "Z":
+            return False
+        began = _proc_start_epoch(pid)
+        return began is None or began <= float(st.get("started") or st.get("time") or 0) + 2.0
+    now = time.time() if now is None else now
+    return now - float(st.get("time") or 0) < STALE_S
 
 
 def _read_pid(path: str) -> Optional[int]:
@@ -342,9 +443,33 @@ def _read_pid(path: str) -> Optional[int]:
     """
     try:
         with open(path) as f:
-            return int(f.read().strip())
+            return int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _read_pid_start(out_dir: str, pid: Optional[int]) -> Optional[int]:
+    """
+    The start time recorded with a run's process id (``run.pid.start``).
+
+    Parameters
+    ----------
+    out_dir : str
+        The output directory.
+    pid : int or None
+        The id in ``run.pid``.
+
+    Returns
+    -------
+    int or None
+        Start time in clock ticks after boot, or None if not recorded for this id.
+    """
+    try:
+        with open(os.path.join(out_dir, "run.pid.start")) as f:
+            p, start = (int(x) for x in f.read().split()[:2])
     except (OSError, ValueError):
         return None
+    return start if p == pid else None
 
 
 def _tail(path: str, n_bytes: int = 4000) -> str:
@@ -405,6 +530,7 @@ class Workspace:
         self._run_ids: Dict[str, int] = {}
         self._status_cache: Dict[str, tuple] = {}   # path -> (mtime, parsed)
         self._lock = threading.Lock()
+        self._start_lock = threading.Lock()
         self.tasks: Dict[str, dict] = {}            # --check processes
         self._task_dir = tempfile.mkdtemp(prefix="regc_gui_")
 
@@ -559,6 +685,56 @@ class Workspace:
             self._status_cache[path] = (mtime, st)
         return st
 
+    def _liveness(self, out_dir: str, st: Optional[dict] = None,
+                  log: Optional[str] = None) -> tuple:
+        """
+        Whether a run is going in an output directory, and whether the GUI started it.
+
+        A run counts as going if the process in ``run.pid`` runs (started by
+        a GUI), or else if the ``status.json`` heartbeat says so (started by
+        a script or ``regc-run``; see `heartbeat_alive`). A heartbeat
+        without a checkable process does not count once sampling is done or
+        the log recorded the run's end since.
+
+        Parameters
+        ----------
+        out_dir : str
+            The output directory.
+        st : dict, optional
+            Its heartbeat (read if None).
+        log : str, optional
+            The end of its ``run.log`` (read if None).
+
+        Returns
+        -------
+        tuple
+            ``(alive, pid or None, external)``.
+        """
+        pid = _read_pid(os.path.join(out_dir, "run.pid"))
+        if pid_alive(pid, _read_pid_start(out_dir, pid)):
+            return True, pid, False
+        st = self._status(out_dir) if st is None else st
+        if not heartbeat_alive(st):
+            return False, None, False
+        hb_pid = st.get("pid") if isinstance(st.get("pid"), int) else None
+        if hb_pid is None or st.get("host") != socket.gethostname():
+            checks = (st.get("convergence") or {}).get("checks") or [{}]
+            done = (st.get("converged") or checks[-1].get("converged")
+                    or (st.get("n_steps") and st.get("step", 0) >= st["n_steps"]))
+            log_path = os.path.join(out_dir, "run.log")
+            log = _tail(log_path) if log is None else log
+            mark = log.rfind("# regc-gui")
+            stopped_here = mark >= 0 and log.startswith("stop", log.find(": ", mark) + 2)
+            ended = stopped_here or max(log.rfind("Outputs in"), log.rfind("Traceback"),
+                                        log.rfind("Killed")) > mark
+            try:
+                ended = ended and os.path.getmtime(log_path) >= float(st.get("time") or 0) - 1.0
+            except OSError:
+                ended = False
+            if done or ended:
+                return False, None, False
+        return True, hb_pid, True
+
     def job(self, out_dir: str) -> dict:
         """
         The state of the run in an output directory.
@@ -573,20 +749,26 @@ class Workspace:
         dict
             ``state`` (new, starting, running, stalled, finished, converged,
             stopped: a checkpoint to resume from, error, ended), ``pid``,
-            ``step``, ``n_steps``, ``convergence`` (the latest check),
-            ``subsurface`` (the heartbeat's totals), ``last_line`` of the
-            log, ``resumable``.
+            ``external`` (going, but not started by a GUI: found through its
+            heartbeat), ``step``, ``n_steps``, ``convergence`` (the latest
+            check), ``subsurface`` (the heartbeat's totals), ``last_line`` of
+            the log, ``resumable``.
         """
-        pid = _read_pid(os.path.join(out_dir, "run.pid"))
-        alive = pid_alive(pid)
         st = self._status(out_dir)
         log = _tail(os.path.join(out_dir, "run.log"))
+        alive, pid, external = self._liveness(out_dir, st, log)
         lines = [ln for ln in log.splitlines() if ln.strip()]
         last = lines[-1] if lines else ""
         resumable = os.path.isfile(os.path.join(out_dir, "checkpoint.pkl"))
         conv = None
         if st and (st.get("convergence") or {}).get("checks"):
             conv = st["convergence"]["checks"][-1]
+        mark, trace = log.rfind("# regc-gui"), log.rfind("Traceback")
+        end = log.rfind("Outputs in")
+        # "Stopped for the time limit; continue with --resume. Outputs in ..."
+        time_limited = end >= 0 and "Stopped for the time limit" in log[log.rfind("\n", 0, end) + 1:end]
+        sampled = bool((conv or {}).get("converged")
+                       or (st and st.get("n_steps") and st.get("step", 0) >= st["n_steps"]))
         if alive:
             if st is None:
                 state = "starting"
@@ -594,18 +776,18 @@ class Workspace:
                 state = "running" if time.time() - st.get("time", 0) < STALE_S else "stalled"
         elif not os.path.isdir(out_dir):
             state = "new"
-        elif (log.rfind("Outputs in") > max(log.rfind("Traceback"), log.rfind("# regc-gui"))
-              or (conv or {}).get("converged")
-              or (st and st.get("n_steps") and st.get("step", 0) >= st["n_steps"])):
+        elif end > max(trace, mark) and time_limited and not sampled:
+            state = "stopped"
+        elif end > max(trace, mark) or sampled:
             # (runs launched elsewhere may log to another file: trust the heartbeat too)
             state = "converged" if (conv or {}).get("converged") else "finished"
-        elif log.rfind("Traceback") > log.rfind("# regc-gui") or last.endswith("Killed"):
+        elif trace > mark or last.endswith("Killed"):
             state = "error"
         elif resumable:
             state = "stopped"
         else:
             state = "ended" if os.listdir(out_dir) else "new"
-        return {"state": state, "pid": pid if alive else None,
+        return {"state": state, "pid": pid if alive else None, "external": alive and external,
                 "step": st.get("step") if st else None, "n_steps": st.get("n_steps") if st else None,
                 "convergence": conv, "subsurface": (st or {}).get("subsurface"),
                 "last_line": last[-300:], "resumable": resumable}
@@ -618,13 +800,15 @@ class Workspace:
         -------
         dict
             ``root``, ``python``, ``pythonpath``, ``configs`` (one entry per
-            config file: ``path``, ``output``, ``monitor_id``, ``job``),
+            config file: ``path``, ``output`` (workspace-relative),
+            ``output_dir`` (absolute; may lie outside the workspace),
+            ``monitor_id``, ``job``),
             ``templates``.
         """
         rows = []
         for path in self.config_files():
             out = self.output_dir(path)
-            rows.append({"path": self.rel(path), "output": self.rel(out),
+            rows.append({"path": self.rel(path), "output": self.rel(out), "output_dir": out,
                          "monitor_id": self.monitor_id(out), "job": self.job(out)})
         return {"root": self.root, "python": self.python, "pythonpath": self.pythonpath,
                 "configs": rows, "templates": list(TEMPLATES)}
@@ -637,12 +821,17 @@ class Workspace:
         Returns
         -------
         dict
-            This environment with `pythonpath` first on ``PYTHONPATH``.
+            This environment with `pythonpath` first on ``PYTHONPATH``, and one
+            thread per process for the math libraries unless set already
+            (as the example ``run.sh`` scripts do).
         """
         env = os.environ.copy()
         if self.pythonpath:
-            env["PYTHONPATH"] = self.pythonpath
+            env["PYTHONPATH"] = os.pathsep.join(
+                [self.pythonpath] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
         env.setdefault("PYTHONUNBUFFERED", "1")
+        for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+            env.setdefault(var, "1")
         return env
 
     def _cmd(self, config_path: str, *flags: str) -> List[str]:
@@ -687,8 +876,8 @@ class Workspace:
         Raises
         ------
         ValueError
-            On an unknown mode, a run already going, or ``run`` over an
-            existing checkpoint.
+            On an unknown mode, a run already going (started by a GUI, a
+            script or ``regc-run``), or ``run`` over an existing checkpoint.
         """
         path = self.resolve(rel_config)
         if not os.path.isfile(path):
@@ -700,26 +889,34 @@ class Workspace:
                  "analyze": ["--analyze-only"]}.get(mode)
         if flags is None:
             raise ValueError(f"unknown mode {mode!r}")
-        pid = _read_pid(os.path.join(out, "run.pid"))
-        if pid_alive(pid):
-            raise ValueError(f"a run is already going in {self.rel(out)} (pid {pid})")
-        if mode == "run" and os.path.isfile(os.path.join(out, "checkpoint.pkl")):
-            raise ValueError(f"{self.rel(out)} holds a checkpoint: resume it, or start over "
-                             f"(overwrite)")
-        if workers:
-            flags = flags + ["--workers", str(int(workers))]
-        os.makedirs(out, exist_ok=True)
-        log_path = os.path.join(out, "run.log")
-        cmd = self._cmd(path, *flags)
-        with open(log_path, "ab") as log:
-            log.write(f"\n# regc-gui {time.strftime('%Y-%m-%d %H:%M:%S')}: {mode} "
-                      f"(PYTHONPATH={self.pythonpath})\n".encode())
-            log.flush()
-            proc = subprocess.Popen(cmd, cwd=os.path.dirname(path), stdout=log,
-                                    stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                    start_new_session=True, env=self._env())
-        with open(os.path.join(out, "run.pid"), "w") as f:
-            f.write(str(proc.pid))
+        with self._start_lock:            # check -> launch -> run.pid, one request at a time
+            alive, pid, external = self._liveness(out)
+            if alive:
+                who = "started outside the GUI, " if external else ""
+                raise ValueError(f"a run is already going in {self.rel(out)} ({who}pid {pid or '?'})")
+            if mode == "run" and os.path.isfile(os.path.join(out, "checkpoint.pkl")):
+                raise ValueError(f"{self.rel(out)} holds a checkpoint: resume it, or start over "
+                                 f"(overwrite)")
+            if workers:
+                flags = flags + ["--workers", str(int(workers))]
+            os.makedirs(out, exist_ok=True)
+            log_path = os.path.join(out, "run.log")
+            cmd = self._cmd(path, *flags)
+            with open(log_path, "ab") as log:
+                log.write(f"\n# regc-gui {time.strftime('%Y-%m-%d %H:%M:%S')}: {mode} "
+                          f"(PYTHONPATH={self.pythonpath})\n".encode())
+                log.flush()
+                proc = subprocess.Popen(cmd, cwd=os.path.dirname(path), stdout=log,
+                                        stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                        start_new_session=True, env=self._env())
+            stat, start_file = _proc_stat(proc.pid), os.path.join(out, "run.pid.start")
+            if stat is not None:                  # the start time: against pid reuse
+                with open(start_file, "w") as f:
+                    f.write(f"{proc.pid} {stat[1]}\n")
+            elif os.path.exists(start_file):
+                os.remove(start_file)
+            with open(os.path.join(out, "run.pid"), "w") as f:
+                f.write(str(proc.pid))
         threading.Thread(target=proc.wait, daemon=True).start()   # reap it when it ends
         self.monitor_id(out)
         return {"pid": proc.pid, "log": self.rel(log_path), "command": " ".join(cmd)}
@@ -744,16 +941,25 @@ class Workspace:
         Raises
         ------
         ValueError
-            If no run is going.
+            If no run is going, or it was not started by a GUI.
         """
         out = self.output_dir(self.resolve(rel_config))
         pid = _read_pid(os.path.join(out, "run.pid"))
-        if not pid_alive(pid):
+        if not pid_alive(pid, _read_pid_start(out, pid)):
+            alive, hb_pid, _ = self._liveness(out)
+            if alive:
+                raise ValueError(f"the run in {self.rel(out)} was started outside the GUI "
+                                 f"(pid {hb_pid or '?'}): stop it where it was started")
             raise ValueError(f"no run going in {self.rel(out)}")
         try:
             os.killpg(os.getpgid(pid), signal.SIGTERM)
         except OSError:
             os.kill(pid, signal.SIGTERM)
+        try:
+            with open(os.path.join(out, "run.log"), "a") as f:
+                f.write(f"\n# regc-gui {time.strftime('%Y-%m-%d %H:%M:%S')}: stop (SIGTERM to {pid})\n")
+        except OSError:
+            pass
         return {"stopped": pid}
 
     def check(self, rel_config: str) -> str:
@@ -962,8 +1168,37 @@ def make_handler(ws: Workspace, token: str, plotly_js: Optional[str] = None):
             """
             self._send(monitor._json_bytes(data), "application/json", code)
 
+        def _foreign(self, post: bool = False) -> bool:
+            """
+            Refuse (403) a request for another host name, or a POST from another origin.
+
+            A page of another site whose name was rebound to this machine
+            (DNS rebinding) sends its own name as ``Host``; this keeps the
+            page, and so the token, away from it.
+
+            Parameters
+            ----------
+            post : bool, optional
+                Check ``Origin`` too. Default False.
+
+            Returns
+            -------
+            bool
+                True if refused (the response is sent).
+            """
+            bound, port = monitor.server_host(self.server)
+            if not monitor.host_allowed(self.headers.get("Host"), bound, port):
+                self._json({"error": "forbidden host"}, 403)
+                return True
+            if post and not monitor.origin_allowed(self.headers.get("Origin"), bound, port):
+                self._json({"error": "forbidden origin"}, 403)
+                return True
+            return False
+
         def do_GET(self) -> None:  # noqa: N802 - http.server API
             """Serve one GET request."""
+            if self._foreign():
+                return None
             url = urlparse(self.path)
             path, q = unquote(url.path), parse_qs(url.query)
             try:
@@ -989,12 +1224,14 @@ def make_handler(ws: Workspace, token: str, plotly_js: Optional[str] = None):
                 if path == "/api/log":
                     out = ws.output_dir(ws.resolve(q["path"][0]))
                     return self._json({"text": _tail(os.path.join(out, "run.log"), 20_000)})
-            except (KeyError, ValueError, OSError) as err:
+            except (KeyError, ValueError, TypeError, OSError) as err:
                 return self._json({"error": f"{type(err).__name__}: {err}"}, 400)
             self._send(b"not found", "text/plain", 404)
 
         def do_POST(self) -> None:  # noqa: N802 - http.server API
             """Serve one POST request (token required)."""
+            if self._foreign(post=True):
+                return None
             if not secrets.compare_digest(self.headers.get("X-Regc-Token", ""), token):
                 return self._json({"error": "missing or wrong session token"}, 403)
             try:
@@ -1002,6 +1239,8 @@ def make_handler(ws: Workspace, token: str, plotly_js: Optional[str] = None):
                 data = json.loads(self.rfile.read(n) or b"{}")
             except (ValueError, json.JSONDecodeError):
                 return self._json({"error": "bad JSON"}, 400)
+            if not isinstance(data, dict):
+                return self._json({"error": "bad request: a JSON object is expected"}, 400)
             path = urlparse(self.path).path
             try:
                 if path == "/api/parse":
@@ -1029,7 +1268,7 @@ def make_handler(ws: Workspace, token: str, plotly_js: Optional[str] = None):
                     if "pythonpath" in data:
                         ws.pythonpath = str(data["pythonpath"]).strip()
                     return self._json({"pythonpath": ws.pythonpath})
-            except (KeyError, ValueError, OSError) as err:
+            except (KeyError, ValueError, TypeError, OSError) as err:
                 return self._json({"error": f"{type(err).__name__}: {err}"}, 400)
             self._json({"error": "not found"}, 404)
 
@@ -1068,7 +1307,7 @@ def serve(root: str = ".", host: str = "127.0.0.1", port: int = 8060,
     ws = Workspace(root, python, pythonpath)
     token = secrets.token_urlsafe(24)
     httpd = ThreadingHTTPServer((host, port), make_handler(ws, token, plotly_js))
-    httpd.workspace, httpd.token = ws, token
+    httpd.workspace, httpd.token, httpd.regc_host = ws, token, host
     url = f"http://{host}:{httpd.server_address[1]}/"
     print(f"regc gui: workspace {ws.root}\n  {url}  (Ctrl-C to stop)\n"
           f"  runs use {ws.python} with PYTHONPATH={ws.pythonpath}", flush=True)
@@ -1233,20 +1472,26 @@ function scalar(s){s=s.trim();if(s==="")return undefined;if(s=="true")return tru
 if(/^[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(s))return Number(s);return s}
 function show(v){if(v===undefined||v===null)return"";if(Array.isArray(v))return v.map(x=>typeof x=="object"?JSON.stringify(x):x).join(", ");
 if(typeof v=="object")return JSON.stringify(v);return String(v)}
+const SNAP={};   // each field's text at the last YAML -> form sync
 function cfgToForm(c){for(const f of F){if(f.length==1)continue;const el=$("f_"+f[0].replace(/\./g,"__"));const v=get(c,f[0]);
 if(el.tagName=="SELECT"&&v!==undefined&&![...el.options].some(o=>o.value==String(v)))el.insertAdjacentHTML("beforeend",`<option>${esc(v)}</option>`);
-el.value=show(v)}}
+el.value=show(v);SNAP[f[0]]=el.value}}
 function formToCfg(c){for(const f of F){if(f.length==1)continue;const [k,,t]=f,raw=$("f_"+k.replace(/\./g,"__")).value;let v;
-const cur=get(c,k);if(raw===show(cur))continue;   // untouched: keep (also non-scalar values)
+// only fields edited since the last sync: YAML edits made since then are kept
+if(raw===(SNAP[k]??"")||raw===show(get(c,k)))continue;
 if(t=="list")v=raw.trim()?raw.split(/[,\s]+/).filter(Boolean).map(scalar):undefined;
 else if(t=="int"){v=scalar(raw);if(typeof v=="number")v=Math.round(v)}
 else if(t=="str")v=raw.trim()?raw.trim():undefined;else v=scalar(raw);set(c,k,v)}return c}
+let parseError="";
 async function parse(){const d=await api("/api/parse",{text:$("yaml").value});
-if(d.config===null){msg("vmsg",d.error,false);return null}
+if(d.config===null){parseError=d.error;msg("vmsg",d.error,false);return null}
 const s=d.summary;const sum=s?`${s.replicas} replicas (${s.n_T} T × ${s.n_mu} μ/p), n_steps ${s.n_steps}, ~${s.samples_per_replica} samples per replica`:"";
 msg("vmsg",d.ok?"Valid. "+sum:d.error+(sum?"\n"+sum:""),d.ok);return d.config}
 $("y2f").onclick=async()=>{const c=await parse();if(c)cfgToForm(c)};
-$("f2y").onclick=async()=>{const c=await parse()||{};formToCfg(c);$("yaml").value=(await api("/api/dump",{config:c})).text;await parse()};
+$("f2y").onclick=async()=>{try{const c=await parse();
+if(!c)return msg("vmsg","Form → YAML not applied: the YAML does not parse, fix it first.\n"+parseError,false);
+formToCfg(c);$("yaml").value=(await api("/api/dump",{config:c})).text;const c2=await parse();if(c2)cfgToForm(c2)}
+catch(e){msg("vmsg",e.message,false)}};
 $("validate").onclick=()=>parse().catch(e=>msg("vmsg",e.message,false));
 async function save(){try{if(!$("savepath").value.trim())throw new Error("give a path to save to");
 const d=await api("/api/save",{path:$("savepath").value.trim(),text:$("yaml").value,overwrite:$("overwrite").checked});
@@ -1257,9 +1502,11 @@ $("check").onclick=async()=>{try{const p=$("savepath").value.trim();if(!p)throw 
 const {task}=await api("/api/check",{path:p});$("checkout").textContent="running regc-run --check …";
 const poll=async()=>{const d=await api("/api/task/"+task);$("checkout").textContent=d.output+(d.done?`\n[exit ${d.returncode}, ${d.elapsed.toFixed(0)} s]`:`\n… ${d.elapsed.toFixed(0)} s`);if(!d.done)setTimeout(poll,1500)};poll()}
 catch(e){$("checkout").textContent=e.message}};
-$("ltgo").onclick=()=>{const a=+$("lt0").value,b=+$("lt1").value,n=+$("ltn").value;const T=[...Array(n)].map((_,i)=>Math.round(a*Math.pow(b/a,n>1?i/(n-1):0)));
+$("ltgo").onclick=()=>{const a=+$("lt0").value,b=+$("lt1").value,n=+$("ltn").value;
+if(!(a>0&&b>0&&Number.isInteger(n)&&n>0))return msg("vmsg","T ladder: give positive temperatures and a whole number of points.",false);const T=[...Array(n)].map((_,i)=>Math.round(a*Math.pow(b/a,n>1?i/(n-1):0)));
 $("f_replica_exchange__temperatures_K").value=T.join(", ")};
 $("lpgo").onclick=()=>{const a=Math.log10(+$("lp0").value),b=Math.log10(+$("lp1").value),n=+$("lpn").value;
+if(!(isFinite(a)&&isFinite(b)&&Number.isInteger(n)&&n>0))return msg("vmsg","p ladder: give positive pressures and a whole number of points.",false);
 $("f_replica_exchange__pressures").value=[...Array(n)].map((_,i)=>{const e=a+(b-a)*(n>1?i/(n-1):0);return Number.isInteger(+e.toFixed(6))?`1.0e${e<0?"":"+"}${Math.round(e)}`:Math.pow(10,e).toPrecision(3)}).join(", ")};
 function loadSources(){if(!WS)return;$("src").innerHTML=`<optgroup label="templates">${WS.templates.map(t=>`<option value="t:${esc(t)}">${esc(t)}</option>`).join("")}</optgroup>`+
 `<optgroup label="configs in the workspace">${WS.configs.map(c=>`<option value="c:${esc(c.path)}">${esc(c.path)}</option>`).join("")}</optgroup>`}
@@ -1282,12 +1529,12 @@ function row(c,i){const j=c.job,live=["running","starting","stalled"].includes(j
 const frac=j.step!=null&&j.n_steps?j.step/j.n_steps:0;const cv=j.convergence;const ss=j.subsurface;
 const B=(m,l,dis,cls="")=>`<button class="b ${cls}" data-i="${i}" data-m="${m}"${dis?" disabled":""}>${l}</button>`;
 return `<tr><td><b>${esc(c.path)}</b><div class="note">→ ${esc(c.output)}</div><div class="last" title="${esc(j.last_line)}">${esc(j.last_line)}</div></td>
-<td><span class="badge ${j.state}">${j.state}</span>${j.pid?`<div class="note">pid ${j.pid}</div>`:""}</td>
+<td><span class="badge ${j.state}">${j.state}${j.external?" (external)":""}</span>${j.pid?`<div class="note">pid ${j.pid}</div>`:""}</td>
 <td>${j.step!=null?`${j.step.toLocaleString()} / ${(j.n_steps||0).toLocaleString()}<div class="bar"><div style="width:${(100*frac).toFixed(1)}%"></div></div>`:"–"}</td>
 <td>${cv&&cv.max_ratio!=null?`max ${cv.max_ratio.toFixed(2)} · med ${cv.median_ratio.toFixed(2)}<div class="note">n_eff ${cv.min_neff.toFixed(1)}${cv.converged?" · converged":""}</div>`:cv&&cv.max_change!=null?`Δρ ${cv.max_change.toFixed(3)}`:"–"}</td>
 <td>${ss?`${ss.n_now} now<div class="note">ins ${ss.inserted}/${ss.insert_attempts} · rem ${ss.removed}/${ss.delete_attempts}</div>`:"–"}</td>
 <td><div class="acts">${B("edit","Edit")}${B("run","Start",live||j.resumable,"p")}${B("resume","Resume",live||!j.resumable)}
-${B("overwrite","Start over",live||!j.resumable)}${B("analyze","Analyze",live)}${B("stop","Stop",!live,"d")}${B("monitor","Monitor")}${B("log","Log")}</div></td></tr>`}
+${B("overwrite","Start over",live||!j.resumable)}${B("analyze","Analyze",live)}${B("stop","Stop",!live||j.external,"d")}${B("monitor","Monitor")}${B("log","Log")}</div></td></tr>`}
 async function refreshRuns(){try{WS=await api("/api/workspace");$("root").textContent="workspace "+WS.root;$("pyexe").textContent=WS.python;
 if(document.activeElement!==$("pypath"))$("pypath").value=WS.pythonpath;
 $("rows").innerHTML=WS.configs.length?WS.configs.map(row).join(""):`<tr><td colspan="6" class="note">No configs found in the workspace. Make one on the Build tab.</td></tr>`;

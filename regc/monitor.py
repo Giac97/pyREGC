@@ -25,10 +25,14 @@ log. The server binds to 127.0.0.1; on a cluster, forward the port
 from __future__ import annotations
 
 import argparse
+import functools
 import glob
+import ipaddress
 import json
+import math
 import os
 import re
+import socket
 import threading
 import time
 import warnings
@@ -425,9 +429,36 @@ def discover(paths: List[str]) -> List[Run]:
     return runs
 
 
+def _finite(data):
+    """
+    A copy of JSON-like data with NaN and infinities replaced by None.
+
+    Parameters
+    ----------
+    data : object
+        Nested dicts, lists, tuples, numpy arrays and scalars.
+
+    Returns
+    -------
+    object
+        The same structure with plain Python values.
+    """
+    if isinstance(data, float):
+        return data if math.isfinite(data) else None
+    if isinstance(data, dict):
+        return {k: _finite(v) for k, v in data.items()}
+    if isinstance(data, (list, tuple)):
+        return [_finite(v) for v in data]
+    if isinstance(data, np.ndarray):
+        return _finite(data.tolist())
+    if isinstance(data, np.generic):
+        return _finite(data.item())
+    return data
+
+
 def _json_bytes(data) -> bytes:
     """
-    JSON with NaN and infinities as null.
+    JSON with NaN and infinities as null (strings are left alone).
 
     Parameters
     ----------
@@ -439,8 +470,120 @@ def _json_bytes(data) -> bytes:
     bytes
         UTF-8 JSON.
     """
-    return json.dumps(data, default=float).replace("NaN", "null").replace(
-        "-Infinity", "null").replace("Infinity", "null").encode()
+    return json.dumps(_finite(data), allow_nan=False,
+                      default=lambda o: _finite(float(o))).encode()
+
+
+_WILDCARD = ("", "0.0.0.0", "::")
+
+
+@functools.lru_cache(maxsize=16)
+def allowed_hosts(bound: str, port: int) -> frozenset:
+    """
+    The ``Host`` header values a local server answers (against DNS rebinding).
+
+    Parameters
+    ----------
+    bound : str
+        The interface the server was asked to bind (``--host``).
+    port : int
+        Its port.
+
+    Returns
+    -------
+    frozenset of str
+        Lower-case ``name:port`` forms: the loopback names, plus the bound
+        host if it is a specific one, or this machine's names if it is a
+        wildcard address.
+    """
+    names = {"127.0.0.1", "localhost", "[::1]"}
+    if bound in _WILDCARD:
+        names |= {socket.gethostname(), socket.getfqdn()}
+    else:
+        names.add(f"[{bound}]" if ":" in bound else bound)
+    forms = {f"{n}:{port}".lower() for n in names}
+    if port == 80:
+        forms |= {n.lower() for n in names}
+    return frozenset(forms)
+
+
+def host_allowed(host: Optional[str], bound: str, port: int) -> bool:
+    """
+    Whether a request's ``Host`` header names this server.
+
+    A page served from another name (a DNS-rebinding attack) sends that
+    name, so it is refused. With a wildcard bind any IP literal with the
+    right port is accepted too (an address cannot be rebound).
+
+    Parameters
+    ----------
+    host : str or None
+        The ``Host`` header.
+    bound : str
+        The interface the server was asked to bind.
+    port : int
+        Its port.
+
+    Returns
+    -------
+    bool
+        True if allowed.
+    """
+    h = (host or "").strip().lower()
+    if not h:
+        return False
+    if h in allowed_hosts(bound, port):
+        return True
+    if bound in _WILDCARD:
+        name, _, p = h.rpartition(":")
+        if p == str(port):
+            try:
+                ipaddress.ip_address(name[1:-1] if name.startswith("[") else name)
+                return True
+            except ValueError:
+                pass
+    return False
+
+
+def origin_allowed(origin: Optional[str], bound: str, port: int) -> bool:
+    """
+    Whether a request's ``Origin`` header (if any) is this server.
+
+    Parameters
+    ----------
+    origin : str or None
+        The ``Origin`` header (absent for same-origin GETs and non-browser clients).
+    bound : str
+        The interface the server was asked to bind.
+    port : int
+        Its port.
+
+    Returns
+    -------
+    bool
+        True if absent or ``http://`` plus an allowed host.
+    """
+    if origin is None:
+        return True
+    o = origin.strip()
+    return o.lower().startswith("http://") and host_allowed(o[7:], bound, port)
+
+
+def server_host(server) -> Tuple[str, int]:
+    """
+    The interface a server was asked to bind and its port.
+
+    Parameters
+    ----------
+    server : socketserver.BaseServer
+        The server (``regc_host`` set by `serve`, else its bound address).
+
+    Returns
+    -------
+    tuple
+        ``(host, port)``.
+    """
+    return getattr(server, "regc_host", server.server_address[0]), server.server_address[1]
 
 
 def route(path: str, runs: List[Run], plotly_js: Optional[str] = None) -> Tuple[bytes, str, int]:
@@ -536,7 +679,9 @@ def make_handler(runs: List[Run], plotly_js: Optional[str] = None):
             self.wfile.write(body)
 
         def do_GET(self) -> None:  # noqa: N802 - http.server API
-            """Serve one request."""
+            """Serve one request (only for this server's own host names)."""
+            if not host_allowed(self.headers.get("Host"), *server_host(self.server)):
+                return self._send(b"forbidden host", "text/plain", 403)
             body, ctype, code = route(unquote(self.path.split("?", 1)[0]), runs, plotly_js)
             self._send(body, ctype, code)
 
@@ -568,6 +713,7 @@ def serve(paths: List[str], host: str = "127.0.0.1", port: int = 8050,
     """
     runs = discover(paths)
     httpd = ThreadingHTTPServer((host, port), make_handler(runs, plotly_js))
+    httpd.regc_host = host
     url = f"http://{host}:{httpd.server_address[1]}/"
     print(f"regc monitor: {len(runs)} run(s) at {url}  (Ctrl-C to stop)", flush=True)
     for r in runs:
@@ -693,8 +839,9 @@ paper_bgcolor:"rgba(0,0,0,0)",plot_bgcolor:"rgba(0,0,0,0)",font:{color:ink,size:
 xaxis:{gridcolor:line,zerolinecolor:line},yaxis:{gridcolor:line,zerolinecolor:line},
 legend:{orientation:"h",y:1.12},hovermode:"closest"},extra||{})}
 const cfg={displaylogo:false,responsive:true,modeBarButtonsToRemove:["lasso2d","select2d"]};
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 async function loadRuns(){runs=await (await fetch("api/runs")).json();
-$("run").innerHTML=runs.map(r=>`<option value="${r.id}">${r.name}</option>`).join("");
+$("run").innerHTML=runs.map(r=>`<option value="${r.id}">${esc(r.name)}</option>`).join("");
 $("run").onchange=()=>{cur=+$("run").value;sel=null;refresh()};fromHash()}
 function fromHash(){const m=location.hash.match(/run=(\d+)/);if(m&&runs.some(r=>r.id==+m[1])){cur=+m[1];$("run").value=cur;sel=null}}
 window.addEventListener("hashchange",async()=>{await loadRuns();refresh()});
@@ -719,7 +866,7 @@ $("where").textContent=d.directory+(d.log?"  ·  log "+d.log.path:"")+(st?"":"  
 drawGrid(d);drawTraces(d);drawComp(d);drawHist(d);drawSwaps(d);drawConv(d);drawData(d);
 $("logname").textContent=d.log?d.log.path:"";$("log").textContent=d.log?d.log.tail.join("\n"):"(no log)";
 const imgs=d.images||[];$("imgcard").hidden=!imgs.length;
-$("imgs").innerHTML=imgs.map(n=>`<a href="file/${cur}/${encodeURIComponent(n)}" target="_blank"><img loading="lazy" src="file/${cur}/${encodeURIComponent(n)}?t=${Math.round(d.now)}" alt="${n}"><div class="note">${n}</div></a>`).join("");}
+$("imgs").innerHTML=imgs.map(n=>`<a href="file/${cur}/${encodeURIComponent(n)}" target="_blank"><img loading="lazy" src="file/${cur}/${encodeURIComponent(n)}?t=${Math.round(d.now)}" alt="${esc(n)}"><div class="note">${esc(n)}</div></a>`).join("");}
 function gridData(d){const st=d.status;if(st)return {st,z:st.replicas[$("gridq").value]};
 const s=d.samples;if(!s||!d.metadata)return null;const nT=d.metadata.temperatures_K.length,keys=s.keys,
 nM=Math.max(...keys.map(k=>k[1]))+1;const q=$("gridq").value,src={mean_N:s.mean_N,std_N:s.std_N,mean_U:s.mean_U}[q];
