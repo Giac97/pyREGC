@@ -3028,10 +3028,11 @@ ReplicaExchangeGCMC.save_status(path: Optional[str], interval_s: float = 5.0, ex
 Write a JSON heartbeat of the running simulation from now on (or stop).
 
 At most every `interval_s` seconds (and at the end of every run
-call) the file is replaced atomically with the progress, the
-per-replica sample counts and averages, the latest stretch of every
-replica's N and U, the swap statistics and the convergence history:
-what `regc.monitor` shows while the run is going.
+call) the file is replaced atomically with the writing process (id
+and host), the progress, the per-replica sample counts and
+averages, the latest stretch of every replica's N and U, the swap
+statistics and the convergence history: what `regc.monitor` shows
+while the run is going.
 
 **Parameters**
 
