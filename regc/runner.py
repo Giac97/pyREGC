@@ -112,7 +112,8 @@ _SECTIONS = {
     "sgc": {"species", "dmu_eV", "attempts_per_step", "bulk_composition", "ensemble"},
     "subsurface": {"z_cut_below_surface", "depth_angstrom", "species", "delta_angstrom",
                    "ncmc_steps", "kernel", "kernel_steps", "leapfrog_steps", "timestep_fs",
-                   "friction_per_fs", "max_disp", "weight", "site_min_distance"},
+                   "friction_per_fs", "max_disp", "weight", "site_min_distance",
+                   "freeze_switched"},
     "gas": {"species", "mass_amu", "insertion_z_range_above_surface",
             "insertion_shell_around_cluster", "composition", "atomic_exchange"},
     "reservoir": {"type", "d0", "D0_eV", "e_atom_eV", "bond_length_angstrom",
@@ -1582,7 +1583,35 @@ def _subsurface_settings(config: Dict[str, Any], geometry: Any, species: Sequenc
         max_disp=_as_float(sec.get("max_disp", 0.1), "subsurface.max_disp"),
         weight=_as_float(sec.get("weight", 1.0), "subsurface.weight"),
         site_min_distance=_as_float(sec.get("site_min_distance", 1.0),
-                                    "subsurface.site_min_distance"))
+                                    "subsurface.site_min_distance"),
+        freeze_switched=_subsurface_flag(sec.get("freeze_switched", False),
+                                         "subsurface.freeze_switched"))
+
+
+def _subsurface_flag(value: Any, where: str) -> bool:
+    """
+    A YAML boolean, strictly.
+
+    Parameters
+    ----------
+    value : Any
+        The value.
+    where : str
+        The key, for the message.
+
+    Returns
+    -------
+    bool
+        The flag.
+
+    Raises
+    ------
+    ValueError
+        If the value is not true or false.
+    """
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{where} must be true or false, got {value!r}")
 
 
 def _feed_to_meta(feed) -> Dict[str, Any]:

@@ -6181,7 +6181,7 @@ JSON-able description.
 ### `Subsurface`
 
 ```python
-Subsurface(z_cut: float, z_min: float, species: Tuple[str, ...], delta: float = 0.3, ncmc_steps: int = 10, kernel: str = 'hmc', kernel_steps: int = 1, leapfrog_steps: int = 5, dt: float = 0.0982, friction: float = 0.509, max_disp: float = 0.1, weight: float = 1.0, site_min_distance: float = 1.0) -> None
+Subsurface(z_cut: float, z_min: float, species: Tuple[str, ...], delta: float = 0.3, ncmc_steps: int = 10, kernel: str = 'hmc', kernel_steps: int = 1, leapfrog_steps: int = 5, dt: float = 0.0982, friction: float = 0.509, max_disp: float = 0.1, weight: float = 1.0, site_min_distance: float = 1.0, freeze_switched: bool = False) -> None
 ```
 
 Settings of the subsurface NCMC channels of a slab.
@@ -6201,6 +6201,7 @@ Settings of the subsurface NCMC channels of a slab.
 - `max_disp` (*float, optional*): MC kernel displacement per axis (A). Default 0.1.
 - `weight` (*float, optional*): Relative frequency of each subsurface channel among the GC channels (an atomic gas channel has weight 1). Default 1.
 - `site_min_distance` (*float, optional*): Sites closer than this to a metal atom are dropped (A). Default 1.0.
+- `freeze_switched` (*bool, optional*): Hold the switched atom fixed during the protocol: the kernels move only the other atoms, so the lattice relaxes around it (still exact: each kernel preserves the lambda-distribution of the atoms it moves). Far less work is dissipated than when the half-coupled atom drifts and pushes into the lattice, and it ends where it was inserted, inside the proposal ball, so the reverse move stays possible. Default False.
 
 **Raises**
 

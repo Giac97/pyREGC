@@ -147,17 +147,24 @@ def test_langevin_shadow_work_is_the_energy_drift_without_friction():
                                  dict(ncmc_steps=4, kernel="hmc", leapfrog_steps=4, dt=0.05),
                                  dict(ncmc_steps=4, kernel="langevin", leapfrog_steps=4, dt=0.05,
                                       friction=2.0),
-                                 dict(ncmc_steps=4, kernel="mc", max_disp=0.3)])
+                                 dict(ncmc_steps=4, kernel="mc", max_disp=0.3),
+                                 dict(ncmc_steps=4, kernel="langevin", leapfrog_steps=4, dt=0.05,
+                                      friction=2.0, freeze_switched=True),
+                                 dict(ncmc_steps=4, kernel="mc", max_disp=0.3,
+                                      freeze_switched=True)])
 def test_one_body_well_exact_region_averages(sub):
     mu = -4.0
     exact_sub, exact_gas = _exact(1.5, 5.0, mu), _exact(5.0, LZ, mu)
     res = []
+    # the subsurface count of this toy mixes slowly (seed-to-seed spread ~0.8 at 600 samples):
+    # longer runs for the held-atom variants
+    n_sweeps = 1600 if sub.get("freeze_switched") else 700
     for seed in range(3):
         s = _slab(**sub)
         rep = Replica(ThermoState(1.0, mu, (0, 0)), s, np.random.default_rng(10 + seed),
                       max_disp=1.5)
         out = []
-        for k in range(700):
+        for k in range(n_sweeps):
             rep.sweep(20)
             if k >= 100:
                 z = s.positions[:, 2]
@@ -296,3 +303,18 @@ def test_checkpoint_from_before_the_automatic_count_resumes(tmp_path):
     assert SUBSURFACE_COUNTS_NAME not in new.observables_meta
     new.run_regc(20, x0=0.95, diffusion="mc", diffusion_steps=1, record_every=10, verbose=False)
     assert len(new.samples[(0, 0)]["U"]) == 6
+
+
+def test_frozen_switched_atom_does_not_move():
+    """With freeze_switched the switched atom ends exactly where it started."""
+    from regc.subsurface import ncmc
+    for kernel in ("langevin", "hmc", "mc"):
+        s = _slab(ncmc_steps=5, kernel=kernel, leapfrog_steps=3, dt=0.05, friction=1.0,
+                  max_disp=0.3, freeze_switched=True)
+        s.positions = np.array([[1.0, 1.0, 3.0], [2.0, 2.0, 3.2]])
+        s.species = np.array(["X", "X"])
+        x0 = s.positions[0].copy()
+        w, _ = ncmc(s, 0, True, s.subsurface, 1.0, np.random.default_rng(0))
+        assert np.isfinite(w) and np.array_equal(s.positions[0], x0)
+        assert not np.array_equal(s.positions[1], [2.0, 2.0, 3.2])   # the others relax
+    assert "freeze_switched" in s.subsurface.metadata()

@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -89,6 +89,14 @@ class Subsurface:
         channels (an atomic gas channel has weight 1). Default 1.
     site_min_distance : float, optional
         Sites closer than this to a metal atom are dropped (A). Default 1.0.
+    freeze_switched : bool, optional
+        Hold the switched atom fixed during the protocol: the kernels move
+        only the other atoms, so the lattice relaxes around it (still exact:
+        each kernel preserves the lambda-distribution of the atoms it
+        moves). Far less work is dissipated than when the half-coupled atom
+        drifts and pushes into the lattice, and it ends where it was
+        inserted, inside the proposal ball, so the reverse move stays
+        possible. Default False.
 
     Raises
     ------
@@ -109,6 +117,7 @@ class Subsurface:
     max_disp: float = 0.1
     weight: float = 1.0
     site_min_distance: float = 1.0
+    freeze_switched: bool = False
 
     def __post_init__(self):
         """
@@ -120,6 +129,7 @@ class Subsurface:
             See the class docstring.
         """
         self.species = tuple(str(s) for s in self.species)
+        self.freeze_switched = bool(self.freeze_switched)
         self.z_cut, self.z_min = float(self.z_cut), float(self.z_min)
         if not self.z_min < self.z_cut:
             raise ValueError(f"subsurface region needs z_min < z_cut, got {self.z_min}, {self.z_cut}")
@@ -151,7 +161,8 @@ class Subsurface:
         """
         return (round(self.z_cut, 9), round(self.z_min, 9), self.species, self.delta,
                 self.ncmc_steps, self.kernel, self.kernel_steps, self.leapfrog_steps, self.dt,
-                self.friction, self.max_disp, self.weight, self.site_min_distance)
+                self.friction, self.max_disp, self.weight, self.site_min_distance,
+                self.freeze_switched)
 
     def metadata(self) -> dict:
         """
@@ -166,7 +177,8 @@ class Subsurface:
                 "delta": self.delta, "ncmc_steps": self.ncmc_steps, "kernel": self.kernel,
                 "kernel_steps": self.kernel_steps, "leapfrog_steps": self.leapfrog_steps,
                 "dt": self.dt, "friction": self.friction, "max_disp": self.max_disp, "weight": self.weight,
-                "site_min_distance": self.site_min_distance}
+                "site_min_distance": self.site_min_distance,
+                "freeze_switched": self.freeze_switched}
 
     # -- region and sites --------------------------------------------------------------------
     def in_region(self, positions: np.ndarray) -> np.ndarray:
@@ -297,9 +309,12 @@ class _Alchemy:
         The configuration, atom `i` present.
     i : int
         Index of the switched atom in the mobile arrays.
+    freeze : bool, optional
+        Hold atom `i` fixed: zero force on it and no momentum
+        (`moving`). Default False.
     """
 
-    def __init__(self, system, i: int):
+    def __init__(self, system, i: int, freeze: bool = False):
         """
         Store the system and the switched atom.
 
@@ -309,9 +324,31 @@ class _Alchemy:
             The configuration.
         i : int
             The switched atom.
+        freeze : bool, optional
+            Hold it fixed. Default False.
         """
         self.system = system
         self.i = int(i)
+        self.freeze = bool(freeze)
+
+    @property
+    def frozen_row(self) -> Optional[int]:
+        """int or None: Row of the held atom in the (substrate + mobile) arrays."""
+        return self.system.n_substrate + self.i if self.freeze else None
+
+    def moving(self) -> np.ndarray:
+        """
+        Which rows the kernels move.
+
+        Returns
+        -------
+        numpy.ndarray
+            Shape (n_substrate + n_mobile, 1): 1.0, and 0.0 for a held atom.
+        """
+        m = np.ones((self.system.n_substrate + self.system.n, 1))
+        if self.freeze:
+            m[self.frozen_row] = 0.0
+        return m
 
     def energies(self) -> Tuple[float, float]:
         """
@@ -358,7 +395,10 @@ class _Alchemy:
         finally:
             s.positions, s.species = pos, sp
         f_without = np.insert(f_without, s.n_substrate + i, 0.0, axis=0)
-        return (1.0 - lam) * f_without + lam * f_with
+        f = (1.0 - lam) * f_without + lam * f_with
+        if self.freeze:
+            f[self.frozen_row] = 0.0
+        return f
 
 
 def _kernel_hmc(alch: _Alchemy, lam: float, energies: Tuple[float, float], settings: Subsurface,
@@ -389,7 +429,8 @@ def _kernel_hmc(alch: _Alchemy, lam: float, energies: Tuple[float, float], setti
     s = alch.system
     n_sub = s.n_substrate
     masses = np.concatenate([s.substrate_masses(), s.masses()])
-    v = rng.standard_normal((len(masses), 3)) * np.sqrt(1.0 / (beta * masses))[:, None]
+    v = (rng.standard_normal((len(masses), 3)) * np.sqrt(1.0 / (beta * masses))[:, None]
+         * alch.moving())
     u0 = (1.0 - lam) * energies[1] + lam * energies[0]
     ke0 = 0.5 * np.sum(masses[:, None] * v ** 2)
     old_sub, old_mob = s.substrate_positions.copy(), s.positions.copy()
@@ -442,8 +483,11 @@ def _kernel_mc(alch: _Alchemy, lam: float, energies: Tuple[float, float], settin
     """
     s = alch.system
     n_sub = s.n_substrate
-    for _ in range(max(1, (n_sub + s.n))):
-        k = int(rng.integers(n_sub + s.n))
+    rows = np.flatnonzero(alch.moving()[:, 0])
+    if len(rows) == 0:              # only the held atom: nothing to move
+        return energies
+    for _ in range(len(rows)):
+        k = int(rows[rng.integers(len(rows))])
         step = (rng.random(3) - 0.5) * 2.0 * settings.max_disp
         if k < n_sub:
             old = s.substrate_positions[k].copy()
@@ -508,7 +552,7 @@ def _kernel_langevin(alch: _Alchemy, lam: float, energies: Tuple[float, float], 
     n_sub = s.n_substrate
     m = np.concatenate([s.substrate_masses(), s.masses()])[:, None]
     dt, a = settings.dt, math.exp(-settings.friction * settings.dt)
-    noise = np.sqrt((1.0 - a * a) / (beta * m))
+    noise = np.sqrt((1.0 - a * a) / (beta * m)) * alch.moving()
     pos = np.vstack([s.substrate_positions, s.positions])
     u = (1.0 - lam) * energies[1] + lam * energies[0]
     f = alch.forces(lam)
@@ -575,14 +619,14 @@ def ncmc(system, i: int, insert: bool, settings: Subsurface, beta: float,
         the two energies of the final configuration (W is inf for a
         forbidden configuration).
     """
-    alch = _Alchemy(system, i)
+    alch = _Alchemy(system, i, freeze=settings.freeze_switched)
     T = settings.ncmc_steps
     lams = np.linspace(0.0, 1.0, T + 1) if insert else np.linspace(1.0, 0.0, T + 1)
     energies = alch.energies()
     work = 0.0
     if settings.kernel == "langevin":
         m = np.concatenate([system.substrate_masses(), system.masses()])[:, None]
-        v = rng.standard_normal((len(m), 3)) / np.sqrt(beta * m)
+        v = rng.standard_normal((len(m), 3)) / np.sqrt(beta * m) * alch.moving()
     kernel = _kernel_hmc if settings.kernel == "hmc" else _kernel_mc
     for t in range(1, T + 1):
         if not np.all(np.isfinite(energies)):

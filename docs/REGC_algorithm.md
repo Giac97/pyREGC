@@ -898,6 +898,12 @@ it does not count against acceptance. GCNCMC (Melling et al., JCTC 19, 1050 (202
 propagation in the same way. Thermostatted MD with velocity rescaling has no such work accounting
 and is not offered as a kernel.
 
+The kernels need not move every coordinate: a kernel that leaves the switched atom where it is and
+moves the others is still in detailed balance with $e^{-\beta U_\lambda}$ (it samples the
+conditional distribution), so the acceptance is unchanged (`freeze_switched`). The lattice then
+relaxes around a fixed atom. That dissipates less work, and the atom ends at its proposed position,
+inside the $\delta$-ball, so the reverse proposal density $q(y_0; x')$ stays non-zero.
+
 **Acceptance.** With $z_s = e^{\beta\mu_s}/\Lambda_s^3$ and $N_\text{sub}$ the number of atoms of
 species $s$ in the region,
 

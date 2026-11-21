@@ -1918,10 +1918,33 @@ def factory(rng):
     stay exact at any time step.
   - Velocity-rescaling MD is not offered as a kernel.
   - The REGC diffusion steps between GC attempts can still use MD.
+- **Holding the switched atom (`freeze_switched=True`):** the kernels
+  then move every atom except the one being switched, so the lattice
+  relaxes around it. This is still exact. Two things improve:
+  - Less work is dissipated, because the half-coupled atom no longer
+    drifts and pushes into the lattice.
+  - The atom ends where it was inserted, inside the δ-ball. A removal
+    therefore always has a reverse proposal. Without holding, a slow
+    switch-off lets the atom drift out of every ball (q = 0), and the
+    removal cannot be accepted.
+
+  On Pd(100)+O (6 kT at 410 K), holding the atom with 160 λ steps and
+  γ = 0.01/fs cut the dissipation per insert-and-remove cycle from
+  0.7–1.2 eV to 0.1–0.4 eV, and kept 80–100% of removals possible
+  with δ = 0.5 Å.
 - **Region:** z_min should stay above the frozen layers, whose sites
-  cannot relax. Watch `insert_sub:<species>` in the acceptance rates.
-  If it is near zero, use more `ncmc_steps`, a smaller `delta` or a
-  larger `site_min_distance`.
+  cannot relax. z_c is measured from the *initial* top layer. An
+  adsorbate-covered top layer relaxes outward, often by 0.2–0.4 Å.
+  With `z_cut_below_surface: 0`, hollow adsorbates sunk into the top
+  layer then count as subsurface and are out of reach of the gas
+  deletions. Put z_c 0.5–0.7 Å below the relaxed top layer.
+- **Low acceptance:** watch `insert_sub:<species>` in the acceptance
+  rates. First check the reverse move. Removals need the final position
+  within δ of a site, so a δ of 0.2 Å is too small for a thermalised
+  atom. Then reduce the dissipation: hold the atom, lower the friction
+  and use more `ncmc_steps`. If the sites are thermodynamically
+  unfavourable, a low insertion rate is the right answer, and no
+  protocol changes it.
 
 ## 11. Worked examples
 
@@ -2779,6 +2802,7 @@ other insertions and deletions to z ≥ z_c.
 | `max_disp` | 0.1 | MC kernel displacement, Å. |
 | `weight` | 1 | Frequency of each subsurface channel; each atomic gas channel has weight 1. |
 | `site_min_distance` | 1.0 | Drop sites closer than this to a metal atom (Å). |
+| `freeze_switched` | false | Hold the switched atom fixed during the protocol; the lattice relaxes around it (§10.2). |
 
 ```yaml
 subsurface: {z_cut_below_surface: 0.0, depth_angstrom: 4.0, ncmc_steps: 10, weight: 0.5}
