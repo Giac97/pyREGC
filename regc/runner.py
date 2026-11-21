@@ -1707,19 +1707,21 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
             insertion_shell = geometry.shell(*_floats(shell, "gas.insertion_shell_around_cluster"))
         region = {"insertion_shell": insertion_shell}
     else:
-        nfl, n_th = struct_cfg.get("n_frozen_layers"), None
+        nfl, n_th, ppl = struct_cfg.get("n_frozen_layers"), None, 1
+        layer_tol = _as_float(struct_cfg.get("layer_tol", 1e-3), "structure.layer_tol")
         if "layers" in struct_cfg:
-            from .structures import substrate_layers
+            from .structures import layer_planes, substrate_layers
             nfl, n_th, n_free = substrate_layers(struct_cfg["layers"])
+            try:     # open / stepped surfaces: several atomic planes per layer
+                ppl = layer_planes(atoms, nfl + n_th + n_free, layer_tol)
+            except ValueError as err:
+                raise ValueError(f"structure.layers adds up to {nfl + n_th + n_free} layers, "
+                                 f"which does not match the slab: {err}") from None
         geometry = slab_geometry_from_atoms(
             atoms, n_frozen_layers=None if nfl is None else int(nfl),
             headroom=_as_float(struct_cfg.get("headroom_angstrom", 5.0),
                                "structure.headroom_angstrom"),
-            layer_tol=_as_float(struct_cfg.get("layer_tol", 1e-3), "structure.layer_tol"),
-            n_thermostat_layers=n_th)
-        if n_th is not None and geometry.layers[2] != n_free:
-            raise ValueError(f"structure.layers adds up to {nfl + n_th + n_free} layers but the "
-                             f"slab has {len(geometry.layer_z)}")
+            layer_tol=layer_tol, n_thermostat_layers=n_th, planes_per_layer=ppl)
         cell, pbc = np.zeros((3, 3)), (True, True, False)
         cell[:2, :2], cell[2, 2] = geometry.cell_xy, geometry.Lz
         region = {"insertion_z_range": None}

@@ -9,7 +9,7 @@ Everything below is importable as `from regc import <name>`, except the runner f
 - [Calculators (`regc.calculators`)](#calculators-regccalculators): `Calculator`, `LJCalculator`, `PairLJCalculator`, `ASECalculatorAdapter`
 - [LAMMPS backend (`regc.lammps_backend`)](#lammps-backend-regclammps_backend): `LammpsCalculator`, `eam_pair_commands`, `lammps_ase_calculator`, `open_lammps`
 - [Systems (`regc.systems`)](#systems-regcsystems): `ParticleSystem`, `BulkSystem`, `SlabSystem`, `ClusterSystem`, `LJSystem`, `SlabLJSystem`
-- [Structures and slab geometry (`regc.structures`)](#structures-and-slab-geometry-regcstructures): `cubic_lattice_constant`, `slab_geometry_from_atoms`, `SlabGeometry`, `insertion_energy_scan`, `cluster_geometry_from_atoms`, `ClusterGeometry`, `coordination_numbers`, `reference_lattice_constant`, `surface_slab`, `substrate_layers`
+- [Structures and slab geometry (`regc.structures`)](#structures-and-slab-geometry-regcstructures): `cubic_lattice_constant`, `slab_geometry_from_atoms`, `SlabGeometry`, `insertion_energy_scan`, `cluster_geometry_from_atoms`, `ClusterGeometry`, `coordination_numbers`, `reference_lattice_constant`, `surface_slab`, `substrate_layers`, `layer_planes`
 - [Thermodynamic state (`regc.state`)](#thermodynamic-state-regcstate): `ThermoState`
 - [Replicas (`regc.replica`)](#replicas-regcreplica): `Replica`
 - [The replica-exchange engine (`regc.engine`)](#the-replica-exchange-engine-regcengine): `ReplicaExchangeGCMC`, `SWAP_TYPES`
@@ -1914,12 +1914,15 @@ a finer scan around it is fitted with a parabola.
 ### `slab_geometry_from_atoms`
 
 ```python
-slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headroom: float = 5.0, layer_tol: float = 0.001, n_thermostat_layers: Optional[int] = None) -> SlabGeometry
+slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headroom: float = 5.0, layer_tol: float = 0.001, n_thermostat_layers: Optional[int] = None, planes_per_layer: int = 1) -> SlabGeometry
 ```
 
 Lay out an ASE slab for `SlabSystem`.
 
-Layers are identified by z. The slab is shifted so the top *frozen*
+Layers are identified by z: atoms within `layer_tol` share an atomic
+plane, and each layer is `planes_per_layer` consecutive planes (use
+`planes_per_layer` to count the layers of open or stepped surfaces the
+way `ase.build` stacks them). The slab is shifted so the top *frozen*
 layer is at z = 0: the box's hard wall then keeps the exchanged species
 out of the frozen block, while it can still reach the displaceable
 layers above (subsurface sites included).
@@ -1931,6 +1934,7 @@ layers above (subsurface sites included).
 - `headroom` (*float, optional*): Space (A) for the exchanged species above the topmost atom. Default 5.0.
 - `layer_tol` (*float, optional*): z tolerance (A) for grouping atoms into layers. Default 1e-3.
 - `n_thermostat_layers` (*int, optional*): Split the displaceable layers into a thermostatted block (these many layers right above the frozen ones) and a free top (the rest, at least one layer), integrated NVE by MD diffusion together with the exchanged species: the fixed / thermostat / free substrate. Default None: every moving atom is thermostatted.
+- `planes_per_layer` (*int, optional*): Atomic z-planes per layer, counted from the bottom; the number of planes must be a multiple of it. Default 1 (a layer is a plane). `layer_planes` gives the value for an `ase.build` slab.
 
 **Returns**
 
@@ -1938,14 +1942,14 @@ layers above (subsurface sites included).
 
 **Raises**
 
-- *ValueError*: If the cell is not in the restricted (a1 along x, a2 in xy) form, or `n_frozen_layers` or `n_thermostat_layers` is out of range.
+- *ValueError*: If the cell is not in the restricted (a1 along x, a2 in xy) form, the planes do not divide into layers of `planes_per_layer`, or `n_frozen_layers` or `n_thermostat_layers` is out of range.
 
 ---
 
 ### `SlabGeometry`
 
 ```python
-SlabGeometry(cell_xy: np.ndarray, Lz: float, top_z: float, frozen_positions: np.ndarray, frozen_species: np.ndarray, substrate_positions: np.ndarray, substrate_species: np.ndarray, layer_z: np.ndarray, n_surface: int = 0, thermostat_mask: Optional[np.ndarray] = None, layers: Optional[Tuple[int, int, int]] = None) -> None
+SlabGeometry(cell_xy: np.ndarray, Lz: float, top_z: float, frozen_positions: np.ndarray, frozen_species: np.ndarray, substrate_positions: np.ndarray, substrate_species: np.ndarray, layer_z: np.ndarray, n_surface: int = 0, thermostat_mask: Optional[np.ndarray] = None, layers: Optional[Tuple[int, int, int]] = None, planes_per_layer: int = 1) -> None
 ```
 
 A slab laid out for `SlabSystem`: frozen block at z <= 0, substrate above.
@@ -1957,10 +1961,11 @@ A slab laid out for `SlabSystem`: frozen block at z <= 0, substrate above.
 - `top_z` (*float*): z of the topmost slab atom.
 - `frozen_positions, substrate_positions` (*numpy.ndarray*): Positions of the rigid and the displaceable slab atoms, (M, 3).
 - `frozen_species, substrate_species` (*numpy.ndarray*): Their species labels.
-- `layer_z` (*numpy.ndarray*): z of every atomic layer, ascending (after the shift).
+- `layer_z` (*numpy.ndarray*): z of every atomic plane, ascending (after the shift).
 - `n_surface` (*int*): Number of atoms in the top layer (for coverages per surface atom).
 - `thermostat_mask` (*numpy.ndarray or None*): Which displaceable atoms the MD thermostat acts on (bool, one per substrate atom), for the fixed / thermostat / free layout; the rest (and the exchanged species) are integrated NVE. None (default): every moving atom is thermostatted.
 - `layers` (*tuple of int or None*): `(fixed, thermostat, free)` layer counts when `thermostat_mask` comes from layers (`slab_geometry_from_atoms`), else None.
+- `planes_per_layer` (*int*): Atomic z-planes per layer (1 for flat surfaces; more for open and stepped ones such as fcc(211) or hcp(10-10), where one `ase.build` layer spans several planes).
 
 #### `SlabGeometry.orthogonal` (property)
 
@@ -2192,7 +2197,9 @@ bottom `fixed` layers are rigid (they stand for the bulk), the next
 and the top `free` layers move with plain Newtonian (NVE) dynamics
 together with the exchanged species, so adsorption energy and surface
 motion are carried away through the lattice rather than damped at the
-surface. The split matters for MD diffusion (`diffusion='md'`); MC and
+surface. Layers are `ase.build` layers (the surface's repeat unit
+along z), so on open or stepped surfaces a layer holds several atomic
+planes (`layer_planes`). The split matters for MD diffusion (`diffusion='md'`); MC and
 HMC moves see fixed vs. displaceable only.
 
 **Parameters**
@@ -2212,7 +2219,7 @@ HMC moves see fixed vs. displaceable only.
 
 **Raises**
 
-- *ValueError*: If `size` is not two integers, `layers` is malformed, or `ase.build` has no such surface function.
+- *ValueError*: If `size` is not two integers, `layers` is malformed, `ase.build` has no such surface function, or the built slab's atomic planes do not divide evenly into its layers.
 
 ---
 
@@ -2235,6 +2242,36 @@ Normalise a fixed / thermostat / free layer specification.
 **Raises**
 
 - *ValueError*: If keys are missing or unknown, or a count is below 1.
+
+---
+
+### `layer_planes`
+
+```python
+layer_planes(atoms, n_layers: int, layer_tol: float = 0.001) -> int
+```
+
+Atomic z-planes per layer of a slab built with `n_layers` layers.
+
+`ase.build` surface functions stack `size[2]` copies of the
+surface's repeat unit, which on open and stepped surfaces holds
+several atomic planes (two for hcp(10-10), three for fcc(211)).
+Counting layers in these units keeps a fixed / thermostat / free split
+the same physical thickness on every surface.
+
+**Parameters**
+
+- `atoms` (*ase.Atoms*): The slab.
+- `n_layers` (*int*): The number of layers it was built with.
+- `layer_tol` (*float, optional*): z tolerance (A) for grouping atoms into planes. Default 1e-3.
+
+**Returns**
+
+- *int*: Planes per layer, for `slab_geometry_from_atoms`.
+
+**Raises**
+
+- *ValueError*: If the number of planes is not a multiple of `n_layers`.
 
 ## Thermodynamic state (`regc.state`)
 

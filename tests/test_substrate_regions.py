@@ -196,3 +196,88 @@ def test_yaml_layers_run(tmp_path):
     from regc.runner import run_from_config
     run_from_config(_yaml_config(tmp_path), verbose=False)
     assert (tmp_path / "out" / "samples.npz").exists()
+
+
+@pytest.mark.parametrize("surface, symbol, size, ppl", [
+    ("fcc211", "Pd", (3, 2), 3), ("hcp10m10", "Ru", (2, 2), 2), ("fcc110", "Pd", (2, 2), 1)])
+def test_layers_on_open_and_stepped_surfaces(surface, symbol, size, ppl):
+    """A layer is an ase.build layer (several atomic planes on stepped surfaces)."""
+    g = surface_slab(symbol, surface, size=size, layers=(2, 2, 2))
+    assert g.layers == (2, 2, 2) and g.planes_per_layer == ppl
+    assert len(g.layer_z) == 6 * ppl
+    n_layer = len(g.frozen_positions) // 2            # atoms per layer
+    assert g.thermostat_mask.sum() == 2 * n_layer and len(g.substrate_positions) == 4 * n_layer
+    z = g.substrate_positions[:, 2]
+    assert z[g.thermostat_mask].max() < z[~g.thermostat_mask].min()
+    assert g.frozen_positions[:, 2].max() == pytest.approx(0.0)
+    if ppl > 1:
+        assert f"of {ppl} atomic planes each" in g.summary()
+
+
+def test_planes_must_divide_into_layers():
+    from ase.build import fcc100
+    from regc import layer_planes
+    atoms = fcc100("Pd", size=(2, 2, 5), a=3.9)
+    assert layer_planes(atoms, 5) == 1
+    with pytest.raises(ValueError, match="do not divide"):
+        layer_planes(atoms, 4)
+    with pytest.raises(ValueError, match="do not group"):
+        slab_geometry_from_atoms(atoms, n_frozen_layers=1, planes_per_layer=2)
+
+
+def test_yaml_layers_stepped_surface(tmp_path):
+    cfg = _yaml_config(tmp_path)
+    cfg["structure"]["build"] = {"surface": "fcc211", "symbol": "Pd", "size": [3, 2], "a": 3.9}
+    g = setup_from_config(cfg, verbose=False)["geometry"]
+    assert g.layers == (1, 1, 2) and g.planes_per_layer == 3
+
+
+def test_yaml_layers_mismatch_names_the_key(tmp_path):
+    from ase.build import fcc100
+    from ase.io import write
+    write(tmp_path / "slab.traj", fcc100("Pd", size=(2, 2, 5), a=3.9, vacuum=5.0))
+    cfg = _yaml_config(tmp_path)
+    cfg["structure"] = {"file": str(tmp_path / "slab.traj"),
+                        "layers": {"fixed": 1, "thermostat": 1, "free": 2}}
+    with pytest.raises(ValueError, match="structure.layers adds up to 4"):
+        setup_from_config(cfg, verbose=False)
+
+
+def test_ase_md_friction_none_means_one_over_taut():
+    rep = _replica(600.0)
+    rep.diffuse('md', n=5, timestep_fs=1.0, thermostat='bussi', taut_fs=20.0,
+                friction_per_fs=None)
+    rep.diffuse('md', n=5, timestep_fs=1.0, thermostat='langevin', taut_fs=20.0,
+                friction_per_fs=None)
+    assert np.isfinite(rep.energy)
+
+
+class _Blowup(ASECalc):
+    """Finite forces, but every energy after the first call is infinite."""
+    implemented_properties = ["energy", "forces"]
+
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def calculate(self, atoms=None, properties=("energy",), system_changes=all_changes):
+        super().calculate(atoms, properties, system_changes)
+        self.calls += 1
+        self.results = {"energy": 0.0 if self.calls == 1 else np.inf,
+                        "forces": np.zeros((len(self.atoms), 3))}
+
+
+@pytest.mark.parametrize("regions", [True, False])
+def test_ase_md_discards_a_non_finite_end_point(regions):
+    g = surface_slab("Pd", "fcc100", size=(2, 2), layers=(1, 1, 1), a=3.9)
+    blow = _Blowup()
+    system = g.make_system(ASECalculatorAdapter(blow, [2 * 3.9 / np.sqrt(2)] * 2 + [g.Lz]), "H")
+    if not regions:
+        system.set_thermostat_region(None)
+    rep = Replica(ThermoState(kelvin_to_eV(500.0), -2.0, label=(0, 0)), system,
+                  np.random.default_rng(0))
+    rep.energy = 0.0
+    sub0 = system.substrate_positions.copy()
+    rep.diffuse('md', n=3, timestep_fs=1.0)
+    assert rep.n_attempts.get('md_reverted') == 1
+    assert np.array_equal(system.substrate_positions, sub0) and rep.energy == 0.0

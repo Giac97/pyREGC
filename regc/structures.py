@@ -140,7 +140,7 @@ class SlabGeometry:
     frozen_species, substrate_species : numpy.ndarray
         Their species labels.
     layer_z : numpy.ndarray
-        z of every atomic layer, ascending (after the shift).
+        z of every atomic plane, ascending (after the shift).
     n_surface : int
         Number of atoms in the top layer (for coverages per surface atom).
     thermostat_mask : numpy.ndarray or None
@@ -151,6 +151,10 @@ class SlabGeometry:
     layers : tuple of int or None
         ``(fixed, thermostat, free)`` layer counts when `thermostat_mask`
         comes from layers (`slab_geometry_from_atoms`), else None.
+    planes_per_layer : int
+        Atomic z-planes per layer (1 for flat surfaces; more for open and
+        stepped ones such as fcc(211) or hcp(10-10), where one ``ase.build``
+        layer spans several planes).
     """
 
     cell_xy: np.ndarray
@@ -164,6 +168,7 @@ class SlabGeometry:
     n_surface: int = 0
     thermostat_mask: Optional[np.ndarray] = field(default=None, repr=False)
     layers: Optional[Tuple[int, int, int]] = None
+    planes_per_layer: int = 1
 
     @property
     def orthogonal(self) -> bool:
@@ -227,7 +232,10 @@ class SlabGeometry:
             atoms = (f"{len(self.frozen_positions)} fixed + {n_th} thermostatted + "
                      f"{len(self.substrate_positions) - n_th} free")
             if self.layers is not None:
-                atoms += " ({} / {} / {} layers)".format(*self.layers)
+                atoms += " ({} / {} / {} layers".format(*self.layers)
+                if self.planes_per_layer > 1:
+                    atoms += f" of {self.planes_per_layer} atomic planes each"
+                atoms += ")"
         else:
             atoms = (f"{len(self.frozen_positions)} frozen + {len(self.substrate_positions)} "
                      f"displaceable")
@@ -238,11 +246,15 @@ class SlabGeometry:
 
 def slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headroom: float = 5.0,
                              layer_tol: float = 1e-3,
-                             n_thermostat_layers: Optional[int] = None) -> SlabGeometry:
+                             n_thermostat_layers: Optional[int] = None,
+                             planes_per_layer: int = 1) -> SlabGeometry:
     """
     Lay out an ASE slab for `SlabSystem`.
 
-    Layers are identified by z. The slab is shifted so the top *frozen*
+    Layers are identified by z: atoms within `layer_tol` share an atomic
+    plane, and each layer is `planes_per_layer` consecutive planes (use
+    `planes_per_layer` to count the layers of open or stepped surfaces the
+    way ``ase.build`` stacks them). The slab is shifted so the top *frozen*
     layer is at z = 0: the box's hard wall then keeps the exchanged species
     out of the frozen block, while it can still reach the displaceable
     layers above (subsurface sites included).
@@ -266,6 +278,10 @@ def slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headr
         at least one layer), integrated NVE by MD diffusion together with
         the exchanged species: the fixed / thermostat / free substrate.
         Default None: every moving atom is thermostatted.
+    planes_per_layer : int, optional
+        Atomic z-planes per layer, counted from the bottom; the number of
+        planes must be a multiple of it. Default 1 (a layer is a plane).
+        `layer_planes` gives the value for an ``ase.build`` slab.
 
     Returns
     -------
@@ -275,7 +291,8 @@ def slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headr
     Raises
     ------
     ValueError
-        If the cell is not in the restricted (a1 along x, a2 in xy) form, or
+        If the cell is not in the restricted (a1 along x, a2 in xy) form,
+        the planes do not divide into layers of `planes_per_layer`, or
         `n_frozen_layers` or `n_thermostat_layers` is out of range.
     """
     cell = np.array(atoms.cell[:], dtype=float)
@@ -284,9 +301,13 @@ def slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headr
     pos = atoms.positions.copy()
     species = np.array(atoms.get_chemical_symbols())
     z_round = np.round(pos[:, 2] / layer_tol) * layer_tol
-    layers = np.unique(z_round)
-    layer_of = np.searchsorted(layers, z_round)
-    n_layers = len(layers)
+    layers = np.unique(z_round)                       # the atomic planes
+    ppl = int(planes_per_layer)
+    if ppl < 1 or len(layers) % ppl:
+        raise ValueError(f"the slab has {len(layers)} atomic planes, which do not group into "
+                         f"layers of planes_per_layer = {planes_per_layer}")
+    layer_of = np.searchsorted(layers, z_round) // ppl
+    n_layers = len(layers) // ppl
     if n_frozen_layers is None:
         n_frozen_layers = n_layers
     if not 0 < n_frozen_layers <= n_layers:
@@ -310,7 +331,43 @@ def slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headr
                         frozen_positions=pos[frozen], frozen_species=species[frozen],
                         substrate_positions=pos[~frozen], substrate_species=species[~frozen],
                         layer_z=layers - shift, n_surface=int(np.sum(layer_of == n_layers - 1)),
-                        thermostat_mask=mask, layers=regions)
+                        thermostat_mask=mask, layers=regions, planes_per_layer=ppl)
+
+
+def layer_planes(atoms, n_layers: int, layer_tol: float = 1e-3) -> int:
+    """
+    Atomic z-planes per layer of a slab built with `n_layers` layers.
+
+    ``ase.build`` surface functions stack ``size[2]`` copies of the
+    surface's repeat unit, which on open and stepped surfaces holds
+    several atomic planes (two for hcp(10-10), three for fcc(211)).
+    Counting layers in these units keeps a fixed / thermostat / free split
+    the same physical thickness on every surface.
+
+    Parameters
+    ----------
+    atoms : ase.Atoms
+        The slab.
+    n_layers : int
+        The number of layers it was built with.
+    layer_tol : float, optional
+        z tolerance (A) for grouping atoms into planes. Default 1e-3.
+
+    Returns
+    -------
+    int
+        Planes per layer, for `slab_geometry_from_atoms`.
+
+    Raises
+    ------
+    ValueError
+        If the number of planes is not a multiple of `n_layers`.
+    """
+    n_planes = len(np.unique(np.round(atoms.positions[:, 2] / layer_tol) * layer_tol))
+    if n_layers < 1 or n_planes % n_layers:
+        raise ValueError(f"the slab has {n_planes} atomic planes, which do not divide into "
+                         f"{n_layers} layers")
+    return n_planes // n_layers
 
 
 def substrate_layers(layers) -> Tuple[int, int, int]:
@@ -363,7 +420,9 @@ def surface_slab(symbol: str, surface: str = "fcc111", size: Sequence[int] = (4,
     and the top ``free`` layers move with plain Newtonian (NVE) dynamics
     together with the exchanged species, so adsorption energy and surface
     motion are carried away through the lattice rather than damped at the
-    surface. The split matters for MD diffusion (``diffusion='md'``); MC and
+    surface. Layers are ``ase.build`` layers (the surface's repeat unit
+    along z), so on open or stepped surfaces a layer holds several atomic
+    planes (`layer_planes`). The split matters for MD diffusion (``diffusion='md'``); MC and
     HMC moves see fixed vs. displaceable only.
 
     Parameters
@@ -397,8 +456,9 @@ def surface_slab(symbol: str, surface: str = "fcc111", size: Sequence[int] = (4,
     Raises
     ------
     ValueError
-        If `size` is not two integers, `layers` is malformed, or
-        ``ase.build`` has no such surface function.
+        If `size` is not two integers, `layers` is malformed,
+        ``ase.build`` has no such surface function, or the built slab's
+        atomic planes do not divide evenly into its layers.
     """
     import ase.build
     fixed, thermostat, free = substrate_layers(layers)
@@ -410,9 +470,11 @@ def surface_slab(symbol: str, surface: str = "fcc111", size: Sequence[int] = (4,
         raise ValueError(f"size is the lateral (nx, ny), got {size}; the layers give nz")
     if a is not None:
         build_kwargs["a"] = float(a)
-    atoms = builder(symbol, size=size + (fixed + thermostat + free,), **build_kwargs)
+    n_layers = fixed + thermostat + free
+    atoms = builder(symbol, size=size + (n_layers,), **build_kwargs)
     return slab_geometry_from_atoms(atoms, n_frozen_layers=fixed, headroom=headroom,
-                                    layer_tol=layer_tol, n_thermostat_layers=thermostat)
+                                    layer_tol=layer_tol, n_thermostat_layers=thermostat,
+                                    planes_per_layer=layer_planes(atoms, n_layers, layer_tol))
 
 
 @dataclass

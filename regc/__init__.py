@@ -28,6 +28,7 @@ molecules       MoleculeMove -- molecular insertion/deletion on top of atomic ex
 subsurface      Subsurface -- site-biased NCMC insertion/removal in subsurface sites
 structures      cubic_lattice_constant, slab_geometry_from_atoms, SlabGeometry,
                 surface_slab (fixed / thermostat / free substrate template),
+                substrate_layers, layer_planes,
                 cluster_geometry_from_atoms, ClusterGeometry, coordination_numbers,
                 insertion_energy_scan  (needs ase)
 lammps_backend  LammpsCalculator (any LAMMPS pair style; native MD),
@@ -108,6 +109,7 @@ from .structures import (
     coordination_numbers,
     cubic_lattice_constant,
     insertion_energy_scan,
+    layer_planes,
     reference_lattice_constant,
     slab_geometry_from_atoms,
     substrate_layers,
@@ -139,7 +141,7 @@ __all__ = [
     # structures
     "cubic_lattice_constant", "slab_geometry_from_atoms", "SlabGeometry", "insertion_energy_scan",
     "cluster_geometry_from_atoms", "ClusterGeometry", "coordination_numbers",
-    "reference_lattice_constant", "surface_slab", "substrate_layers",
+    "reference_lattice_constant", "surface_slab", "substrate_layers", "layer_planes",
     # running and analysis
     "run_with_checkpoints", "RunStatus", "EXIT_RESUBMIT",
     "save_samples", "load_samples", "SampleSet",

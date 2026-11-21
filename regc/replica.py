@@ -1017,7 +1017,8 @@ class Replica:
         rest moves NVE (`_md_partial_thermostat`). Hard walls (`system.md_wall_bounds()`: the z-walls
         of a slab, all six faces of a cluster box) are
         enforced by specular reflection after every step, like the
-        reflecting boundaries [ZSG] apply via PLUMED.
+        reflecting boundaries [ZSG] apply via PLUMED. A segment ending at
+        non-finite positions or energy is discarded (``md_reverted``).
 
         Unlike MC/HMC, MD has no accept/reject step: the sampled ensemble
         carries the integrator's time-step error ([ZSG] use 1 fs with a
@@ -1038,8 +1039,9 @@ class Replica:
             ``'langevin'``. Default is ``'bussi'``.
         taut_fs : float, optional
             Bussi relaxation time in fs. Default is 20.0.
-        friction_per_fs : float, optional
-            Langevin friction in 1/fs. Default is 0.01.
+        friction_per_fs : float or None, optional
+            Langevin friction in 1/fs; None means ``1 / taut_fs`` (the
+            LAMMPS backend's convention). Default is 0.01.
 
         Returns
         -------
@@ -1054,6 +1056,8 @@ class Replica:
         """
         sysm = self.system
         calc = sysm.calculator
+        if friction_per_fs is None:      # as LAMMPS: Langevin damping time = taut_fs
+            friction_per_fs = 1.0 / taut_fs
         if hasattr(calc, 'run_md'):  # e.g. LammpsCalculator: the whole segment natively
             self._diffuse_md_native(n_steps, timestep_fs, thermostat, taut_fs, friction_per_fs)
             return
@@ -1092,12 +1096,7 @@ class Replica:
             self._md_partial_thermostat(atoms, n_fr, n_fr + np.flatnonzero(mask), n_steps,
                                         dt, walls, thermostat, timestep_fs / taut_fs,
                                         friction_per_fs * timestep_fs)
-            new = atoms.get_positions()[n_fr:]
-            for i in range(n_sub):
-                sysm.apply_move_substrate(i, new[i])
-            for i in range(n_mob):
-                sysm.apply_move(i, new[n_sub + i])
-            self.energy = sysm.total_energy()
+            self._end_md_segment(atoms.get_positions()[n_fr:], sysm.total_energy)
             return
         if thermostat == 'bussi':
             from ase.md.bussi import Bussi
@@ -1128,12 +1127,42 @@ class Replica:
             dyn.attach(reflect, interval=1)
         dyn.run(n_steps)
 
-        new = atoms.get_positions()[n_fr:]
-        for i in range(n_sub):
-            sysm.apply_move_substrate(i, new[i])  # wraps x, y through the geometry
-        for i in range(n_mob):
-            sysm.apply_move(i, new[n_sub + i])
-        self.energy = sysm.total_energy()
+        self._end_md_segment(atoms.get_positions()[n_fr:], sysm.total_energy)
+
+    def _end_md_segment(self, new: np.ndarray, energy_of) -> None:
+        """
+        Take the end point of an MD segment, or discard it if it is not finite.
+
+        Parameters
+        ----------
+        new : numpy.ndarray
+            End positions of the substrate then the mobile atoms, (n_sub + n, 3).
+        energy_of : callable
+            Returns the energy of the system once the moves are applied.
+
+        Returns
+        -------
+        None
+            The positions and `self.energy` are updated in place; a segment
+            that ends at non-finite positions or energy (e.g. inside a hard
+            core of the calculator) is discarded and counted in
+            ``n_attempts['md_reverted']``.
+        """
+        sysm = self.system
+        n_sub = sysm.n_substrate
+        saved_sub, saved_mob = sysm.substrate_positions.copy(), sysm.positions.copy()
+        energy = np.nan
+        if np.all(np.isfinite(new)):
+            for i in range(n_sub):
+                sysm.apply_move_substrate(i, new[i])   # wraps x, y through the geometry
+            for i in range(sysm.n):
+                sysm.apply_move(i, new[n_sub + i])
+            energy = energy_of()
+        if np.isfinite(energy):
+            self.energy = energy
+        else:
+            sysm.substrate_positions, sysm.positions = saved_sub, saved_mob
+            self.n_attempts['md_reverted'] = self.n_attempts.get('md_reverted', 0) + 1
 
     def _md_partial_thermostat(self, atoms, n_fr: int, bath: np.ndarray, n_steps: int,
                                dt: float, walls: list, thermostat: str, dt_over_tau: float,
@@ -1250,20 +1279,12 @@ class Replica:
         new = sysm.calculator.run_md(sysm, n_steps, self.state.temperature, timestep_fs,
                                      taut_fs, seed, thermostat=thermostat,
                                      friction_per_fs=friction_per_fs)
-        saved_sub, saved_mob = sysm.substrate_positions.copy(), sysm.positions.copy()
-        for i in range(n_sub):
-            sysm.apply_move_substrate(i, new[i])
-        for i in range(sysm.n):
-            sysm.apply_move(i, new[n_sub + i])
         if hasattr(sysm.calculator, "energy_after_md"):   # the segment's own end energy
-            energy = sysm.calculator.energy_after_md(sysm) + sysm.external_energy_total()
+            def energy_of() -> float:
+                return sysm.calculator.energy_after_md(sysm) + sysm.external_energy_total()
         else:
-            energy = sysm.total_energy()
-        if np.isfinite(energy):
-            self.energy = energy
-        else:
-            sysm.substrate_positions, sysm.positions = saved_sub, saved_mob
-            self.n_attempts['md_reverted'] = self.n_attempts.get('md_reverted', 0) + 1
+            energy_of = sysm.total_energy
+        self._end_md_segment(np.asarray(new, dtype=float), energy_of)
 
     def sweep(self, n_steps: int, p_displace: float = 0.5,
               p_insert: float = 0.25, p_delete: float = 0.25,

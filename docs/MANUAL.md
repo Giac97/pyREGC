@@ -333,12 +333,18 @@ The rest of Part I covers each step in detail.
 
 ```python
 geometry = slab_geometry_from_atoms(atoms, n_frozen_layers=None, headroom=5.0, layer_tol=1e-3,
-                                    n_thermostat_layers=None)
+                                    n_thermostat_layers=None, planes_per_layer=1)
 ```
 
 This takes an ASE `Atoms` slab and returns a `SlabGeometry`.
 
-- **Layers** are found by z, grouping atoms within `layer_tol` Å.
+- **Layers** are found by z, grouping atoms within `layer_tol` Å into
+  atomic planes. By default each plane is one layer.
+- **`planes_per_layer`**: counts each layer as that many consecutive
+  planes, from the bottom. Open and stepped surfaces need this:
+  `ase.build` stacks a repeat unit of 2 planes on hcp(10-10) and 3 on
+  fcc(211). `layer_planes(atoms, n_layers)` gives the value for an
+  `ase.build` slab. `layer_z` always lists the individual planes.
 - **`n_frozen_layers`**: the bottom layers kept rigid. Layers above
   them are *displaceable substrate*: MC (with `displace_substrate`),
   HMC and MD move them. The default `None` freezes every layer.
@@ -414,6 +420,9 @@ system = geometry.make_system(calc, "O")      # the thermostat region comes with
   `{"fixed": 2, "thermostat": 2, "free": 2}`, each at least 1. Their sum
   is the slab depth.
 - `size` is the lateral `(nx, ny)` only.
+- Layers are `ase.build` layers, so a split has the same physical
+  thickness on every surface. On fcc(211), `layers=(2, 2, 2)` gives
+  6 layers of 3 atomic planes each, and `summary()` says so.
 - Other keywords go to the `ase.build` function, for example
   `orthogonal=True`.
 - For a slab you already have, use
@@ -2565,7 +2574,7 @@ nanoparticle).
 | `cluster` | – | A mapping for an `ase.cluster` function (below). |
 | `geometry` | `cluster` with a `cluster` block, else `slab` | `slab` or `cluster`. Needed only to read a cluster from `file`. |
 | `n_frozen_layers` | all layers | Slab only: bottom layers kept rigid; the rest are displaceable. |
-| `layers` | – | Slab only, instead of `n_frozen_layers`: `{fixed: 2, thermostat: 2, free: 2}`. Rigid bottom, thermostatted middle, NVE top (§2.1.1). With `build`, give `size: [nx, ny]` and the layers set the depth. A warning is printed unless `diffusion: md`. |
+| `layers` | – | Slab only, instead of `n_frozen_layers`: `{fixed: 2, thermostat: 2, free: 2}`. Rigid bottom, thermostatted middle, NVE top (§2.1.1). With `build`, give `size: [nx, ny]` and the layers set the depth. On open or stepped surfaces a layer is several atomic planes (§2.1); the plane count must divide by the sum. A warning is printed unless `diffusion: md`. |
 | `layer_tol` | 0.001 | Slab only: z tolerance (Å) for grouping atoms into layers. |
 | `frozen` | `center` | Cluster only: `center` (the central atom), `core` (fully coordinated atoms), `none`, or a number of central atoms (§2.6). |
 | `full_coordination` | 12 | Cluster only: coordination of an interior atom; fewer neighbours means a surface atom. Use 14 for bcc. |
