@@ -151,6 +151,58 @@ phase_diagram:
   discard: 0.3
 output: {directory: output}
 """,
+    "Realistic surface (fixed / thermostat / free) + O, LAMMPS MLIP": """\
+# O on an fcc(100) slab from O2 gas with a LAMMPS machine-learned potential, on a
+# realistic substrate: 2 fixed layers, 2 thermostatted, 2 free (NVE with the adsorbates).
+# Put model.npz next to this file; fill in the potential and the ladder.
+structure:
+  build: {surface: fcc100, symbol: Pd, size: [4, 4], a: auto}   # depth from layers
+  layers: {fixed: 2, thermostat: 2, free: 2}
+  headroom_angstrom: 5.0
+gas: {species: O, mass_amu: 15.999}
+calculator:
+  type: LAMMPS
+  lammps_name: grace
+  pair_style: grace/runtime
+  pair_coeff: "* * model.npz Pd O"
+  species: [Pd, O]
+  min_distance: 1.0
+reservoir: {type: diatomic, d0: self, bond_length_angstrom: 1.2075,
+            vibrational_wavenumber_cm: 1580.2, symmetry_number: 2}
+replica_exchange:
+  temperatures_K: [300, 350, 410, 480, 560, 650, 760, 900]
+  pressures: [1.0e-14, 1.0e-12, 1.0e-10, 1.0e-8, 1.0e-6, 1.0e-4, 1.0e-2, 1.0]
+  pressure_unit: bar
+  scheme: regc
+  n_steps: 40000
+  x0: 0.85
+  diffusion: md
+  diffusion_steps: 20
+  md: {timestep_fs: 1.0, thermostat: bussi, taut_fs: 50.0}
+  record_every: 5
+  convergence_every: 2000
+  convergence_mode: noise
+  adsorbed_cutoff: 2.6
+  max_disp: 0.3
+  seed: 0
+  n_workers: auto
+checkpoint: {chunk: 500}
+records: {save: true, every: 1, positions: float64}
+trajectory: {save: true, directory: trajectories, every: 500}
+phase_diagram:
+  T_min_K: 300
+  T_max_K: 900
+  n_T: 120
+  p_min: 1.0e-14
+  p_max: 1.0
+  n_p: 150
+  pressure_unit: bar
+  observable: N_ads
+  coverage_per: surface_atom
+  most_probable: true
+  discard: 0.3
+output: {directory: output}
+""",
 }
 
 
@@ -164,6 +216,9 @@ FORM_FIELDS = [
     ("structure.build.size", "build: size", "list", "4, 4, 4"),
     ("structure.build.a", "build: a (Å or auto)", "val"),
     ("structure.n_frozen_layers", "frozen layers", "int"),
+    ("structure.layers.fixed", "or layers: fixed", "int", "e.g. 2 (with thermostat, free)"),
+    ("structure.layers.thermostat", "layers: thermostat", "int"),
+    ("structure.layers.free", "layers: free (NVE)", "int"),
     ("structure.headroom_angstrom", "headroom (Å)", "num"),
     ("Gas and reservoir",),
     ("gas.species", "gas species", "val", "O, or [O, Cl]"),
@@ -714,6 +769,11 @@ class Workspace:
         -------
         str
             Task id for `task`.
+
+        Raises
+        ------
+        ValueError
+            If the config file does not exist.
         """
         path = self.resolve(rel_config)
         if not os.path.isfile(path):
@@ -853,6 +913,12 @@ def make_handler(ws: Workspace, token: str, plotly_js: Optional[str] = None):
     -------
     type
         A `BaseHTTPRequestHandler` subclass.
+
+    Raises
+    ------
+    ValueError
+        Inside a request, for a bad save target; caught and answered as an
+        error response, never raised to the caller.
     """
     page = PAGE.replace("__TOKEN__", token).replace(
         "__FIELDS__", json.dumps(FORM_FIELDS, ensure_ascii=False)).encode()

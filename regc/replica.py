@@ -1011,7 +1011,10 @@ class Replica:
         in the canonical ensemble, so this is exact, and it handles freshly
         inserted particles and configurations just swapped in from another
         T). Frozen atoms are held by `FixAtoms`; displaceable substrate and
-        mobile atoms move. Hard walls (`system.md_wall_bounds()`: the z-walls
+        mobile atoms move. With a thermostat region
+        (`ParticleSystem.set_thermostat_region`: the fixed / thermostat /
+        free slab) only that part of the substrate is thermostatted and the
+        rest moves NVE (`_md_partial_thermostat`). Hard walls (`system.md_wall_bounds()`: the z-walls
         of a slab, all six faces of a cluster box) are
         enforced by specular reflection after every step, like the
         reflecting boundaries [ZSG] apply via PLUMED.
@@ -1081,6 +1084,21 @@ class Replica:
         T_K = self.state.temperature / units.kB
         MaxwellBoltzmannDistribution(atoms, temperature_K=T_K, rng=self.rng)
         dt = timestep_fs * units.fs
+        walls = [(k, b) for k, b in enumerate(sysm.md_wall_bounds()) if b is not None]
+        mask = getattr(sysm, 'thermostat_mask', None)
+        if mask is not None:
+            if thermostat not in ('bussi', 'langevin'):
+                raise ValueError(f"thermostat must be 'bussi' or 'langevin', got {thermostat!r}")
+            self._md_partial_thermostat(atoms, n_fr, n_fr + np.flatnonzero(mask), n_steps,
+                                        dt, walls, thermostat, timestep_fs / taut_fs,
+                                        friction_per_fs * timestep_fs)
+            new = atoms.get_positions()[n_fr:]
+            for i in range(n_sub):
+                sysm.apply_move_substrate(i, new[i])
+            for i in range(n_mob):
+                sysm.apply_move(i, new[n_sub + i])
+            self.energy = sysm.total_energy()
+            return
         if thermostat == 'bussi':
             from ase.md.bussi import Bussi
             dyn = Bussi(atoms, dt, temperature_K=T_K, taut=taut_fs * units.fs, rng=self.rng)
@@ -1091,7 +1109,6 @@ class Replica:
         else:
             raise ValueError(f"thermostat must be 'bussi' or 'langevin', got {thermostat!r}")
 
-        walls = [(k, b) for k, b in enumerate(sysm.md_wall_bounds()) if b is not None]
         if walls:
             def reflect() -> None:
                 pos, vel = atoms.get_positions(), atoms.get_velocities()
@@ -1117,6 +1134,88 @@ class Replica:
         for i in range(n_mob):
             sysm.apply_move(i, new[n_sub + i])
         self.energy = sysm.total_energy()
+
+    def _md_partial_thermostat(self, atoms, n_fr: int, bath: np.ndarray, n_steps: int,
+                               dt: float, walls: list, thermostat: str, dt_over_tau: float,
+                               gamma_dt: float) -> None:
+        """
+        Velocity Verlet for every moving atom, thermostat on the `bath` atoms only.
+
+        Each step is thermostat(dt/2) - velocity Verlet(dt) - thermostat(dt/2),
+        the thermostat acting on the bath atoms alone: Bussi stochastic
+        velocity rescaling with their 3 * len(bath) degrees of freedom, or a
+        Langevin (Ornstein-Uhlenbeck) velocity update. The other moving
+        atoms (atoms ``n_fr`` onwards outside `bath`) are integrated NVE.
+        Hard walls reflect positions and velocities after every drift.
+        `atoms` is updated in place (positions and velocities).
+
+        Parameters
+        ----------
+        atoms : ase.Atoms
+            The full configuration (frozen first, held by `FixAtoms`) with
+            a calculator and Maxwell-Boltzmann velocities already set.
+        n_fr : int
+            Number of frozen atoms (the first rows).
+        bath : numpy.ndarray
+            Indices (into `atoms`) of the thermostatted atoms.
+        n_steps : int
+            Number of steps.
+        dt : float
+            Time step, in ASE time units.
+        walls : list
+            ``[(axis, (lo, hi)), ...]`` hard walls (`md_wall_bounds`).
+        thermostat : str
+            ``'bussi'`` or ``'langevin'``.
+        dt_over_tau : float
+            Time step over the Bussi time constant.
+        gamma_dt : float
+            Langevin friction times the time step.
+
+        Returns
+        -------
+        None
+        """
+        kT = self.state.temperature
+        m = atoms.get_masses()[:, None]
+        x, v = atoms.get_positions(), atoms.get_velocities()
+        f = atoms.get_forces()
+        mb = m[bath]
+        ndof = 3 * len(bath)
+        c_half = np.exp(-0.5 * dt_over_tau)                  # Bussi, per half step
+        c1 = np.exp(-0.5 * gamma_dt)                         # Langevin, per half step
+        c2 = np.sqrt((1.0 - c1 * c1) * kT / mb)
+
+        def bath_step() -> None:
+            if thermostat == 'langevin':
+                v[bath] = c1 * v[bath] + c2 * self.rng.standard_normal((len(bath), 3))
+                return
+            kin = 0.5 * float(np.sum(mb * v[bath] ** 2))
+            if kin <= 0.0:
+                return
+            s = (1.0 - c_half) * (0.5 * ndof * kT) / kin / ndof
+            r1 = self.rng.standard_normal()
+            chi2 = 2.0 * self.rng.standard_gamma(0.5 * (ndof - 1)) if ndof > 1 else 0.0
+            alpha2 = c_half + s * (chi2 + r1 * r1) + 2.0 * r1 * np.sqrt(c_half * s)
+            v[bath] *= np.sqrt(max(alpha2, 0.0))
+
+        mov = slice(n_fr, None)
+        for _ in range(int(n_steps)):
+            bath_step()
+            v[mov] += 0.5 * dt * f[mov] / m[mov]
+            x[mov] += dt * v[mov]
+            for k, (lo, hi) in walls:
+                xk, vk = x[mov, k], v[mov, k]
+                low, high = xk <= lo, xk > hi
+                if low.any() or high.any():
+                    xk[low] = 2.0 * lo - xk[low]
+                    xk[high] = 2.0 * hi - xk[high]
+                    vk[low | high] *= -1.0
+                    x[mov, k], v[mov, k] = xk, vk
+            atoms.set_positions(x, apply_constraint=False)
+            f = atoms.get_forces()
+            v[mov] += 0.5 * dt * f[mov] / m[mov]
+            bath_step()
+        atoms.set_velocities(v)
 
     def _diffuse_md_native(self, n_steps: int, timestep_fs: float, thermostat: str,
                            taut_fs: float, friction_per_fs: float = 0.01) -> None:

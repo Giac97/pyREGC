@@ -18,6 +18,10 @@ particle categories, delegating all physics to a pluggable `Calculator`
     this for whatever part of a substrate you don't need to let relax
     (e.g. deep, bulk-truncated layers far from the surface).
 
+For MD diffusion, `set_thermostat_region` restricts the thermostat to part
+of the substrate (the fixed / thermostat / free slab of
+`structures.surface_slab`); the other moving atoms are integrated NVE.
+
 Three concrete geometries (all work with any `Calculator`):
   * `BulkSystem` -- bulk, fully-periodic cube.
   * `SlabSystem` -- periodic in x, y only (rectangular or general, e.g.
@@ -48,6 +52,9 @@ class ParticleSystem:
     described in this module's docstring (mobile, substrate, frozen). All
     physics is delegated to `calculator`.
     """
+
+    # class-level default, so systems pickled before the attribute existed read as None
+    thermostat_mask = None
 
     def __init__(self, calculator: Calculator,
                  exchange_species: Union[str, Sequence[str]] = 'X',
@@ -140,6 +147,46 @@ class ParticleSystem:
         # semi-grand-canonical substrate (see `sgc_species`): off by default
         self.sgc_species: Tuple[str, ...] = ()
         self.sgc_canonical = False
+        self.thermostat_mask: Optional[np.ndarray] = None
+
+    # -- MD thermostat region ---------------------------------------------------
+    def set_thermostat_region(self, mask: Optional[Sequence[bool]]) -> None:
+        """
+        Thermostat only these substrate atoms during MD diffusion.
+
+        The fixed / thermostat / free layout: frozen atoms never move, the
+        masked substrate atoms are coupled to the MD thermostat (Bussi or
+        Langevin), and every other moving atom -- the rest of the substrate
+        and all mobile particles -- follows plain Newtonian dynamics. MC
+        and HMC moves are unaffected. Segments still start from fresh
+        Maxwell-Boltzmann velocities for every moving atom.
+
+        Parameters
+        ----------
+        mask : sequence of bool or None
+            One flag per substrate atom (True: thermostatted). None
+            restores the default, every moving atom thermostatted.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If `mask` does not have one entry per substrate atom, or
+            selects none.
+        """
+        if mask is None:
+            self.thermostat_mask = None
+            return
+        mask = np.asarray(mask, dtype=bool).ravel()
+        if mask.shape[0] != self.substrate_positions.shape[0]:
+            raise ValueError(f"thermostat mask has {mask.shape[0]} entries for "
+                             f"{self.substrate_positions.shape[0]} substrate atoms")
+        if not mask.any():
+            raise ValueError("thermostat mask selects no substrate atom")
+        self.thermostat_mask = mask.copy()
 
     # -- semi-grand-canonical substrate ------------------------------------------
     def set_sgc_species(self, species: Sequence[str], canonical: bool = False) -> None:

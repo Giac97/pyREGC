@@ -332,7 +332,8 @@ The rest of Part I covers each step in detail.
 ### 2.1 `slab_geometry_from_atoms`
 
 ```python
-geometry = slab_geometry_from_atoms(atoms, n_frozen_layers=None, headroom=5.0, layer_tol=1e-3)
+geometry = slab_geometry_from_atoms(atoms, n_frozen_layers=None, headroom=5.0, layer_tol=1e-3,
+                                    n_thermostat_layers=None)
 ```
 
 This takes an ASE `Atoms` slab and returns a `SlabGeometry`.
@@ -351,6 +352,10 @@ This takes an ASE `Atoms` slab and returns a `SlabGeometry`.
   `ase.build` surface functions produce. Oblique cells, such as a
   hexagonal fcc(111) cell, work. A cell in any other orientation raises
   `ValueError: ... a1 along x ...`.
+- **`n_thermostat_layers`**: splits the displaceable layers into a
+  thermostatted block right above the frozen layers and a free top (at
+  least one layer). See §2.1.1. The default `None` thermostats every
+  moving atom.
 
 Useful attributes of `SlabGeometry`:
 
@@ -377,6 +382,61 @@ system = geometry.make_system(calc, "H", mass_of_species={"H": 1.008},
 weights them, to a z window. Use it when the interesting region is a
 thin layer above the surface. Insertions and deletions then only happen
 inside the window. The default is the whole box.
+
+#### 2.1.1 Fixed, thermostatted and free layers: `surface_slab`
+
+The usual layout for MD of a surface has three regions, counted from
+the bottom:
+
+| Region | What it does | Role |
+|---|---|---|
+| fixed | never moves | stands for the bulk below |
+| thermostat | coupled to the MD thermostat (Bussi or Langevin) | the heat bath |
+| free | plain Newtonian (NVE) dynamics, with the adsorbates | the surface |
+
+The free layers and the gas atoms are not damped by the thermostat.
+Their energy, for example the heat released by an adsorption, flows
+through the lattice into the thermostatted layers, as on a real surface.
+
+`surface_slab` builds this template in one call:
+
+```python
+from regc import surface_slab, cubic_lattice_constant
+
+a = cubic_lattice_constant(ase_calc, "Pd", "fcc")
+geometry = surface_slab("Pd", "fcc100", size=(5, 5), layers=(2, 2, 2), a=a, headroom=5.0)
+print(geometry.summary())
+# 50 fixed + 50 thermostatted + 50 free slab atoms (2 / 2 / 2 layers), 25 per surface layer, ...
+system = geometry.make_system(calc, "O")      # the thermostat region comes with it
+```
+
+- `layers` is `(fixed, thermostat, free)` or the dict
+  `{"fixed": 2, "thermostat": 2, "free": 2}`, each at least 1. Their sum
+  is the slab depth.
+- `size` is the lateral `(nx, ny)` only.
+- Other keywords go to the `ase.build` function, for example
+  `orthogonal=True`.
+- For a slab you already have, use
+  `slab_geometry_from_atoms(atoms, n_frozen_layers=2, n_thermostat_layers=2)`.
+- On any system, `system.set_thermostat_region(mask)` (one bool per
+  substrate atom) does the same. `None` restores thermostatting every
+  moving atom.
+
+**What it changes.** Only MD diffusion (`diffusion="md"`, ASE or
+native LAMMPS) uses the split:
+
+- Each step is thermostat(dt/2), velocity Verlet(dt), thermostat(dt/2),
+  with the thermostat acting on the bath atoms only.
+- Bussi uses the bath's 3·n degrees of freedom; in LAMMPS this is
+  `fix temp/csvr` or `fix langevin` on a `gcmc_bath` group, with
+  `fix nve` on every moving atom.
+- Every segment still starts from fresh Maxwell–Boltzmann velocities
+  for all moving atoms, so the sampled ensemble is still canonical.
+- In short REGC diffusion segments (tens of steps) the split barely
+  matters. It matters for long MD and for reading the dynamics.
+
+MC and HMC moves, and the subsurface NCMC kernel, see only "fixed" versus
+"displaceable".
 
 ### 2.2 Building the slab
 
@@ -2505,6 +2565,7 @@ nanoparticle).
 | `cluster` | – | A mapping for an `ase.cluster` function (below). |
 | `geometry` | `cluster` with a `cluster` block, else `slab` | `slab` or `cluster`. Needed only to read a cluster from `file`. |
 | `n_frozen_layers` | all layers | Slab only: bottom layers kept rigid; the rest are displaceable. |
+| `layers` | – | Slab only, instead of `n_frozen_layers`: `{fixed: 2, thermostat: 2, free: 2}`. Rigid bottom, thermostatted middle, NVE top (§2.1.1). With `build`, give `size: [nx, ny]` and the layers set the depth. A warning is printed unless `diffusion: md`. |
 | `layer_tol` | 0.001 | Slab only: z tolerance (Å) for grouping atoms into layers. |
 | `frozen` | `center` | Cluster only: `center` (the central atom), `core` (fully coordinated atoms), `none`, or a number of central atoms (§2.6). |
 | `full_coordination` | 12 | Cluster only: coordination of an interior atom; fewer neighbours means a surface atom. Use 14 for bcc. |
@@ -2516,8 +2577,19 @@ nanoparticle).
 |---|---|
 | `surface` | The `ase.build` function: `fcc111`, `fcc100`, `fcc110`, `bcc100`, `bcc110`, `hcp0001`, ... |
 | `symbol` | Element. |
-| `size` | `[nx, ny, nlayers]` |
+| `size` | `[nx, ny, nlayers]`, or `[nx, ny]` with `structure.layers` |
 | `a` | Lattice constant in Å, or `auto` to fit it to the potential (fcc and bcc only; needs a calculator with an ASE counterpart: EMT, LAMMPS or ASE). |
+
+A realistic surface (fixed / thermostat / free, §2.1.1):
+
+```yaml
+structure:
+  build: {surface: fcc100, symbol: Pd, size: [5, 5], a: auto}   # depth from the layers
+  layers: {fixed: 2, thermostat: 2, free: 2}
+replica_exchange:
+  diffusion: md
+  md: {timestep_fs: 1.0, thermostat: bussi, taut_fs: 50.0}
+```
 | `a_range` | Search range for `a: auto`. Default: 0.8–1.2 times the experimental lattice constant (§2.3). |
 | *anything else* | Passed to the `ase.build` function, e.g. `orthogonal: true`, `vacuum: null`, `c`. |
 

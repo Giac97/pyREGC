@@ -201,6 +201,40 @@ def test_native_md_kinetic_temperature_of_few_atoms(thermostat):
     assert ratio == pytest.approx(1.0, abs=0.12)
 
 
+@pytest.mark.parametrize("thermostat", ["bussi", "langevin"])
+def test_native_md_thermostat_region(thermostat):
+    """Fixed / thermostat / free: with no forces (pair_style zero) the free
+    substrate and mobile atoms keep their initial Maxwell-Boltzmann speeds
+    (only wall reflections flip signs), the bath atoms do not; the bath
+    group is removed again, so segments repeat."""
+    from regc.lammps_backend import _id_ranges
+    assert _id_ranges([4, 5, 6, 9, 11, 12]) == "4:6 9 11:12"
+    calc = LammpsCalculator(["pair_style zero 3.0", "pair_coeff * *"], ["Fe", "H"])
+    a = 2.62
+    layer = np.array([[i * a, j * a, 0.0] for i in range(3) for j in range(3)])
+    sub = layer[:6] + [0.3, 0.3, 1.5]
+    rng = np.random.default_rng(0)
+    h = np.column_stack([rng.random((3, 2)) * 3 * a, 4.0 + rng.random(3)])
+    system = SlabLJSystem(3 * a, 3 * a, 12.0, calc, exchange_species="H",
+                          frozen_positions=layer, frozen_species=np.array(["Fe"] * 9),
+                          substrate_positions=sub, substrate_species=np.array(["Fe"] * 6),
+                          positions=h)
+    system.set_thermostat_region([True, True, True, False, False, False])
+    T = kelvin_to_eV(500.0)
+    for seed in (7, 8):
+        calc.run_md(system, 30, T, 1.0, 5.0, seed=seed, thermostat=thermostat,
+                    friction_per_fs=0.5)
+        n_fr, n_tot = 9, 9 + 6 + 3
+        species = ["Fe"] * 6 + ["H"] * 3
+        masses = np.array([calc._mass(sp) for sp in species])
+        s = int(seed) % 900000000 + 1
+        v0 = (np.random.default_rng(s).standard_normal((n_tot - n_fr, 3))
+              * np.sqrt(T / (masses * MVV2E_METAL))[:, None])
+        v = calc._gather("v", n_tot)[n_fr:]
+        assert np.allclose(np.abs(v[3:]), np.abs(v0[3:]))     # free substrate + H: NVE
+        assert not np.allclose(np.abs(v[:3]), np.abs(v0[:3]))  # bath: thermostatted
+
+
 def test_native_md_with_a_single_moving_atom():
     """One moving atom over a frozen block: ``velocity create`` used to abort
     ("Attempting to rescale a 0.0 temperature")."""

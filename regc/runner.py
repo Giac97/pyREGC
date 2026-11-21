@@ -10,7 +10,9 @@ surface phase diagram, all from one YAML or JSON file.
    surface function (``structure.build``, lattice constant optionally
    fitted to the potential, ``a: auto``), and laid out with
    `slab_geometry_from_atoms` (bottom ``n_frozen_layers`` rigid, the rest
-   displaceable, ``headroom_angstrom`` of space above); orthogonal and
+   displaceable, ``headroom_angstrom`` of space above; or ``layers: {fixed,
+   thermostat, free}``, the three-region substrate whose free top layers MD
+   integrates without a thermostat, see `surface_slab`); orthogonal and
    oblique (e.g. hexagonal fcc(111)) cells both work. A cluster is built
    with an ``ase.cluster`` function (``structure.cluster``, e.g.
    ``Icosahedron``) or read from a file with ``geometry: cluster``, and laid
@@ -104,7 +106,8 @@ def _available_cpus() -> int:
         return os.cpu_count() or 1
 
 _SECTIONS = {
-    "structure": {"file", "build", "cluster", "geometry", "n_frozen_layers", "headroom_angstrom",
+    "structure": {"file", "build", "cluster", "geometry", "n_frozen_layers", "layers",
+                  "headroom_angstrom",
                   "layer_tol", "frozen", "full_coordination", "alloy", "alloy_seed", "alloy_per_layer"},
     "sgc": {"species", "dmu_eV", "attempts_per_step", "bulk_composition", "ensemble"},
     "subsurface": {"z_cut_below_surface", "depth_angstrom", "species", "delta_angstrom",
@@ -488,8 +491,24 @@ def validate_config(config: Dict[str, Any]) -> None:
     kind = _geometry_kind(struct)
     if kind == "cluster" and "build" in struct:
         raise ValueError("structure.build makes a slab; use structure.cluster for a cluster")
-    wrong = ({"n_frozen_layers", "layer_tol"} if kind == "cluster"
+    wrong = ({"n_frozen_layers", "layers", "layer_tol"} if kind == "cluster"
              else {"frozen", "full_coordination"}) & set(struct)
+    if kind == "slab" and "layers" in struct:
+        from .structures import substrate_layers
+        if "n_frozen_layers" in struct:
+            raise ValueError("structure.layers already sets the fixed (frozen) layers: "
+                             "drop structure.n_frozen_layers")
+        n_layers = sum(substrate_layers(struct["layers"]))
+        size = (struct.get("build") or {}).get("size")
+        if size is not None and len(size) == 3 and int(size[2]) != n_layers:
+            raise ValueError(f"structure.build.size has {size[2]} layers but structure.layers "
+                             f"adds up to {n_layers}; give size as [nx, ny] and the layers "
+                             f"set the depth")
+        re_cfg = config.get("replica_exchange") or {}
+        if _scheme(re_cfg) != "regc" or re_cfg.get("diffusion", "mc") != "md":
+            warnings.warn("structure.layers: the thermostat / free split acts only on MD "
+                          "diffusion (scheme: regc, diffusion: md); other moves see fixed vs "
+                          "displaceable layers only", stacklevel=2)
     wrong_gas = {"insertion_z_range_above_surface" if kind == "cluster"
                  else "insertion_shell_around_cluster"} & set(config["gas"])
     if wrong or wrong_gas:
@@ -847,6 +866,9 @@ def _build_structure(struct_cfg: Dict[str, Any], calc_spec_of: Callable[[List[st
                                     symbol, alloy, calc_spec, "structure.build")
         if "size" in build:
             build["size"] = tuple(int(n) for n in build["size"])
+            if "layers" in struct_cfg and len(build["size"]) == 2:   # the layers set the depth
+                from .structures import substrate_layers
+                build["size"] += (sum(substrate_layers(struct_cfg["layers"])),)
         atoms = builder(symbol, a=a, **build) if a is not None else builder(symbol, **build)
     if alloy:
         if struct_cfg.get("alloy_per_layer") and "cluster" in struct_cfg:
@@ -1685,12 +1707,19 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
             insertion_shell = geometry.shell(*_floats(shell, "gas.insertion_shell_around_cluster"))
         region = {"insertion_shell": insertion_shell}
     else:
-        nfl = struct_cfg.get("n_frozen_layers")
+        nfl, n_th = struct_cfg.get("n_frozen_layers"), None
+        if "layers" in struct_cfg:
+            from .structures import substrate_layers
+            nfl, n_th, n_free = substrate_layers(struct_cfg["layers"])
         geometry = slab_geometry_from_atoms(
             atoms, n_frozen_layers=None if nfl is None else int(nfl),
             headroom=_as_float(struct_cfg.get("headroom_angstrom", 5.0),
                                "structure.headroom_angstrom"),
-            layer_tol=_as_float(struct_cfg.get("layer_tol", 1e-3), "structure.layer_tol"))
+            layer_tol=_as_float(struct_cfg.get("layer_tol", 1e-3), "structure.layer_tol"),
+            n_thermostat_layers=n_th)
+        if n_th is not None and geometry.layers[2] != n_free:
+            raise ValueError(f"structure.layers adds up to {nfl + n_th + n_free} layers but the "
+                             f"slab has {len(geometry.layer_z)}")
         cell, pbc = np.zeros((3, 3)), (True, True, False)
         cell[:2, :2], cell[2, 2] = geometry.cell_xy, geometry.Lz
         region = {"insertion_z_range": None}

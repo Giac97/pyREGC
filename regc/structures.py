@@ -9,7 +9,11 @@ Building simulation cells from a potential and an ASE structure.
   the layout the package uses: the frozen block at z <= 0 (its top layer at
   z = 0, the box's hard wall), displaceable substrate layers above it, and a
   headroom for the exchanged species; `SlabGeometry.make_system` then builds
-  the `SlabSystem` for any calculator.
+  the `SlabSystem` for any calculator. With ``n_thermostat_layers`` the
+  displaceable layers split further into a thermostatted block and a free
+  (NVE) top: the classic fixed / thermostat / free substrate.
+* `surface_slab` -- that three-region substrate as a ready template: element,
+  ``ase.build`` surface, lateral size and ``layers=(fixed, thermostat, free)``.
 * `cluster_geometry_from_atoms` / `ClusterGeometry` -- the same for a
   nanoparticle (``ase.cluster.Icosahedron``, ``Octahedron``, ... or a file):
   centred in a cubic box with no periodicity, its central atom (or core)
@@ -139,6 +143,14 @@ class SlabGeometry:
         z of every atomic layer, ascending (after the shift).
     n_surface : int
         Number of atoms in the top layer (for coverages per surface atom).
+    thermostat_mask : numpy.ndarray or None
+        Which displaceable atoms the MD thermostat acts on (bool, one per
+        substrate atom), for the fixed / thermostat / free layout; the rest
+        (and the exchanged species) are integrated NVE. None (default):
+        every moving atom is thermostatted.
+    layers : tuple of int or None
+        ``(fixed, thermostat, free)`` layer counts when `thermostat_mask`
+        comes from layers (`slab_geometry_from_atoms`), else None.
     """
 
     cell_xy: np.ndarray
@@ -150,6 +162,8 @@ class SlabGeometry:
     substrate_species: np.ndarray
     layer_z: np.ndarray = field(repr=False)
     n_surface: int = 0
+    thermostat_mask: Optional[np.ndarray] = field(default=None, repr=False)
+    layers: Optional[Tuple[int, int, int]] = None
 
     @property
     def orthogonal(self) -> bool:
@@ -191,8 +205,12 @@ class SlabGeometry:
                   substrate_species=self.substrate_species, mass_of_species=mass_of_species,
                   insertion_z_range=insertion_z_range)
         if self.orthogonal:
-            return SlabSystem(self.cell_xy[0, 0], self.cell_xy[1, 1], self.Lz, calculator, **kw)
-        return SlabSystem(None, None, self.Lz, calculator, cell_xy=self.cell_xy, **kw)
+            system = SlabSystem(self.cell_xy[0, 0], self.cell_xy[1, 1], self.Lz, calculator, **kw)
+        else:
+            system = SlabSystem(None, None, self.Lz, calculator, cell_xy=self.cell_xy, **kw)
+        if self.thermostat_mask is not None:
+            system.set_thermostat_region(self.thermostat_mask)
+        return system
 
     def summary(self) -> str:
         """
@@ -204,14 +222,23 @@ class SlabGeometry:
             Atom counts, cell and box height.
         """
         a1, a2 = (np.linalg.norm(v) for v in self.cell_xy)
-        return (f"{len(self.frozen_positions)} frozen + {len(self.substrate_positions)} displaceable "
-                f"slab atoms, {self.n_surface} per surface layer, cell |a1| = {a1:.3f} A, "
+        if self.thermostat_mask is not None:
+            n_th = int(np.sum(self.thermostat_mask))
+            atoms = (f"{len(self.frozen_positions)} fixed + {n_th} thermostatted + "
+                     f"{len(self.substrate_positions) - n_th} free")
+            if self.layers is not None:
+                atoms += " ({} / {} / {} layers)".format(*self.layers)
+        else:
+            atoms = (f"{len(self.frozen_positions)} frozen + {len(self.substrate_positions)} "
+                     f"displaceable")
+        return (f"{atoms} slab atoms, {self.n_surface} per surface layer, cell |a1| = {a1:.3f} A, "
                 f"|a2| = {a2:.3f} A ({'rectangular' if self.orthogonal else 'oblique'}), "
                 f"mobile species in z in (0, {self.Lz:.2f}] A")
 
 
 def slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headroom: float = 5.0,
-                             layer_tol: float = 1e-3) -> SlabGeometry:
+                             layer_tol: float = 1e-3,
+                             n_thermostat_layers: Optional[int] = None) -> SlabGeometry:
     """
     Lay out an ASE slab for `SlabSystem`.
 
@@ -233,6 +260,12 @@ def slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headr
         Default 5.0.
     layer_tol : float, optional
         z tolerance (A) for grouping atoms into layers. Default 1e-3.
+    n_thermostat_layers : int, optional
+        Split the displaceable layers into a thermostatted block (these
+        many layers right above the frozen ones) and a free top (the rest,
+        at least one layer), integrated NVE by MD diffusion together with
+        the exchanged species: the fixed / thermostat / free substrate.
+        Default None: every moving atom is thermostatted.
 
     Returns
     -------
@@ -243,7 +276,7 @@ def slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headr
     ------
     ValueError
         If the cell is not in the restricted (a1 along x, a2 in xy) form, or
-        `n_frozen_layers` is out of range.
+        `n_frozen_layers` or `n_thermostat_layers` is out of range.
     """
     cell = np.array(atoms.cell[:], dtype=float)
     if abs(cell[0, 1]) > 1e-8 or abs(cell[0, 2]) > 1e-8 or abs(cell[1, 2]) > 1e-8:
@@ -263,10 +296,123 @@ def slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headr
     pos[:, 2] -= shift
     frozen = layer_of < n_frozen_layers
     top_z = float(pos[:, 2].max())
+    mask = regions = None
+    if n_thermostat_layers is not None:
+        n_th = int(n_thermostat_layers)
+        n_free = n_layers - n_frozen_layers - n_th
+        if n_th < 1 or n_free < 1:
+            raise ValueError(f"n_thermostat_layers must leave at least one free layer above it: "
+                             f"1..{n_layers - n_frozen_layers - 1} for {n_layers} layers with "
+                             f"{n_frozen_layers} frozen, got {n_thermostat_layers}")
+        mask = layer_of[~frozen] < n_frozen_layers + n_th
+        regions = (int(n_frozen_layers), n_th, int(n_free))
     return SlabGeometry(cell_xy=cell[:2, :2].copy(), Lz=top_z + headroom, top_z=top_z,
                         frozen_positions=pos[frozen], frozen_species=species[frozen],
                         substrate_positions=pos[~frozen], substrate_species=species[~frozen],
-                        layer_z=layers - shift, n_surface=int(np.sum(layer_of == n_layers - 1)))
+                        layer_z=layers - shift, n_surface=int(np.sum(layer_of == n_layers - 1)),
+                        thermostat_mask=mask, layers=regions)
+
+
+def substrate_layers(layers) -> Tuple[int, int, int]:
+    """
+    Normalise a fixed / thermostat / free layer specification.
+
+    Parameters
+    ----------
+    layers : sequence of int or dict
+        ``(fixed, thermostat, free)`` or ``{'fixed': ..., 'thermostat': ...,
+        'free': ...}``, counted from the bottom of the slab.
+
+    Returns
+    -------
+    tuple of int
+        ``(fixed, thermostat, free)``.
+
+    Raises
+    ------
+    ValueError
+        If keys are missing or unknown, or a count is below 1.
+    """
+    names = ("fixed", "thermostat", "free")
+    if isinstance(layers, dict):
+        unknown, missing = set(layers) - set(names), set(names) - set(layers)
+        if unknown or missing:
+            raise ValueError(f"layers needs exactly the keys fixed, thermostat, free; "
+                             f"unknown {sorted(unknown)}, missing {sorted(missing)}")
+        layers = [layers[k] for k in names]
+    counts = tuple(int(n) for n in layers)
+    if len(counts) != 3 or any(float(n) != int(n) for n in layers):
+        raise ValueError(f"layers must be three whole numbers (fixed, thermostat, free), "
+                         f"got {layers!r}")
+    if min(counts) < 1:
+        raise ValueError(f"every region needs at least one layer, got "
+                         f"fixed={counts[0]}, thermostat={counts[1]}, free={counts[2]}")
+    return counts
+
+
+def surface_slab(symbol: str, surface: str = "fcc111", size: Sequence[int] = (4, 4),
+                 layers=(2, 2, 2), a: Optional[float] = None, headroom: float = 5.0,
+                 layer_tol: float = 1e-3, **build_kwargs) -> SlabGeometry:
+    """
+    A realistic surface template: fixed, thermostatted and free substrate layers.
+
+    Builds ``ase.build.<surface>(symbol, size=(nx, ny, fixed + thermostat +
+    free), a=a)`` and lays it out with `slab_geometry_from_atoms`: the
+    bottom ``fixed`` layers are rigid (they stand for the bulk), the next
+    ``thermostat`` layers are coupled to the MD thermostat (the heat bath),
+    and the top ``free`` layers move with plain Newtonian (NVE) dynamics
+    together with the exchanged species, so adsorption energy and surface
+    motion are carried away through the lattice rather than damped at the
+    surface. The split matters for MD diffusion (``diffusion='md'``); MC and
+    HMC moves see fixed vs. displaceable only.
+
+    Parameters
+    ----------
+    symbol : str
+        Element, e.g. ``'Pd'``.
+    surface : str, optional
+        An ``ase.build`` surface function, e.g. ``'fcc100'``, ``'fcc111'``,
+        ``'bcc110'``, ``'hcp0001'``. Default ``'fcc111'``.
+    size : sequence of int, optional
+        Lateral repeats ``(nx, ny)``. Default ``(4, 4)``.
+    layers : sequence of int or dict, optional
+        ``(fixed, thermostat, free)`` layer counts, bottom to top, each at
+        least 1 (or a dict with those keys). Default ``(2, 2, 2)``.
+    a : float, optional
+        Lattice constant in A; default None (ASE's tabulated value). Use
+        `cubic_lattice_constant` for the potential's own.
+    headroom : float, optional
+        Space (A) for the exchanged species above the topmost atom.
+        Default 5.0.
+    layer_tol : float, optional
+        z tolerance (A) for grouping atoms into layers. Default 1e-3.
+    **build_kwargs
+        Passed on to the ``ase.build`` function (e.g. ``orthogonal=True``).
+
+    Returns
+    -------
+    SlabGeometry
+        The geometry; `SlabGeometry.make_system` builds the system.
+
+    Raises
+    ------
+    ValueError
+        If `size` is not two integers, `layers` is malformed, or
+        ``ase.build`` has no such surface function.
+    """
+    import ase.build
+    fixed, thermostat, free = substrate_layers(layers)
+    builder = getattr(ase.build, surface, None)
+    if builder is None:
+        raise ValueError(f"ase.build has no surface function {surface!r}")
+    size = tuple(int(n) for n in size)
+    if len(size) != 2:
+        raise ValueError(f"size is the lateral (nx, ny), got {size}; the layers give nz")
+    if a is not None:
+        build_kwargs["a"] = float(a)
+    atoms = builder(symbol, size=size + (fixed + thermostat + free,), **build_kwargs)
+    return slab_geometry_from_atoms(atoms, n_frozen_layers=fixed, headroom=headroom,
+                                    layer_tol=layer_tol, n_thermostat_layers=thermostat)
 
 
 @dataclass

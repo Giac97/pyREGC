@@ -242,6 +242,29 @@ def _f(x) -> str:
     return repr(float(x))
 
 
+def _id_ranges(ids) -> str:
+    """
+    Atom ids as LAMMPS ``group id`` ranges.
+
+    Parameters
+    ----------
+    ids : array_like of int
+        Atom ids (1-based), ascending.
+
+    Returns
+    -------
+    str
+        e.g. ``'51:75 101:110'`` (runs of consecutive ids as ``lo:hi``).
+    """
+    ids = [int(i) for i in ids]
+    out, start = [], ids[0]
+    for prev, cur in zip(ids, ids[1:] + [None]):
+        if cur != prev + 1:
+            out.append(f"{start}:{prev}" if prev > start else str(start))
+            start = cur
+    return " ".join(out)
+
+
 def eam_pair_commands(potential_file: str, species: Sequence[str]) -> list:
     """
     LAMMPS pair commands for an EAM file, inferring the style from its name.
@@ -758,7 +781,10 @@ class LammpsCalculator(Calculator):
         cluster box), frozen atoms excluded from integration. The Bussi
         thermostat's temperature counts 3N degrees of freedom (``extra/dof
         0``): frozen atoms and walls break momentum conservation, and the
-        ASE path (`Replica._diffuse_md`) counts the same.
+        ASE path (`Replica._diffuse_md`) counts the same. With a thermostat
+        region (``system.thermostat_mask``, the fixed / thermostat / free
+        slab) the thermostat acts on those substrate atoms only (3 of their
+        degrees of freedom each) and the other moving atoms run NVE.
 
         Parameters
         ----------
@@ -809,14 +835,19 @@ class LammpsCalculator(Calculator):
         else:
             cmds += ["group mobile union all"]
         cmds += [f"timestep {_f(timestep_fs / 1000.0)}", "fix gcmc_nve mobile nve"]
+        mask = getattr(system, "thermostat_mask", None)
+        bath = "mobile"
+        if mask is not None:   # LAMMPS ids are 1-based: frozen, then substrate, then mobile
+            cmds.append("group gcmc_bath id " + _id_ranges(n_fr + 1 + np.flatnonzero(mask)))
+            bath = "gcmc_bath"
         if thermostat == "bussi":
-            cmds += ["compute gcmc_temp mobile temp", "compute_modify gcmc_temp extra/dof 0",
-                     f"fix gcmc_thermo mobile temp/csvr {_f(T_K)} {_f(T_K)} "
+            cmds += [f"compute gcmc_temp {bath} temp", "compute_modify gcmc_temp extra/dof 0",
+                     f"fix gcmc_thermo {bath} temp/csvr {_f(T_K)} {_f(T_K)} "
                      f"{_f(taut_fs / 1000.0)} {seed + 1}",
                      "fix_modify gcmc_thermo temp gcmc_temp"]
         else:
             damp_fs = taut_fs if friction_per_fs is None else 1.0 / friction_per_fs
-            cmds.append(f"fix gcmc_thermo mobile langevin {_f(T_K)} {_f(T_K)} "
+            cmds.append(f"fix gcmc_thermo {bath} langevin {_f(T_K)} {_f(T_K)} "
                         f"{_f(damp_fs / 1000.0)} {seed + 1}")
         pbc = self._pbc(system)
         faces = [f"{ax}lo {_f(b[0])} {ax}hi {_f(b[1])}"
@@ -835,5 +866,6 @@ class LammpsCalculator(Calculator):
         lmp.commands_list(["unfix gcmc_nve", "unfix gcmc_thermo"]
                           + (["unfix gcmc_walls"] if faces else [])
                           + (["uncompute gcmc_temp"] if thermostat == "bussi" else [])
-                          + ["group mobile delete"] + (["group frozen delete"] if n_fr else []))
+                          + ["group mobile delete"] + (["group frozen delete"] if n_fr else [])
+                          + (["group gcmc_bath delete"] if mask is not None else []))
         return x[n_fr:]

@@ -27,6 +27,7 @@ reservoir       MonatomicIdealGasReservoir, DiatomicReservoir (e.g. H2), Molecul
 molecules       MoleculeMove -- molecular insertion/deletion on top of atomic exchange
 subsurface      Subsurface -- site-biased NCMC insertion/removal in subsurface sites
 structures      cubic_lattice_constant, slab_geometry_from_atoms, SlabGeometry,
+                surface_slab (fixed / thermostat / free substrate template),
                 cluster_geometry_from_atoms, ClusterGeometry, coordination_numbers,
                 insertion_energy_scan  (needs ase)
 lammps_backend  LammpsCalculator (any LAMMPS pair style; native MD),
@@ -109,6 +110,8 @@ from .structures import (
     insertion_energy_scan,
     reference_lattice_constant,
     slab_geometry_from_atoms,
+    substrate_layers,
+    surface_slab,
 )
 from .io import SampleSet, load_samples, save_samples
 from .driver import EXIT_RESUBMIT, RunStatus, run_with_checkpoints
@@ -136,7 +139,7 @@ __all__ = [
     # structures
     "cubic_lattice_constant", "slab_geometry_from_atoms", "SlabGeometry", "insertion_energy_scan",
     "cluster_geometry_from_atoms", "ClusterGeometry", "coordination_numbers",
-    "reference_lattice_constant",
+    "reference_lattice_constant", "surface_slab", "substrate_layers",
     # running and analysis
     "run_with_checkpoints", "RunStatus", "EXIT_RESUBMIT",
     "save_samples", "load_samples", "SampleSet",

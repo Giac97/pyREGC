@@ -9,7 +9,7 @@ Everything below is importable as `from regc import <name>`, except the runner f
 - [Calculators (`regc.calculators`)](#calculators-regccalculators): `Calculator`, `LJCalculator`, `PairLJCalculator`, `ASECalculatorAdapter`
 - [LAMMPS backend (`regc.lammps_backend`)](#lammps-backend-regclammps_backend): `LammpsCalculator`, `eam_pair_commands`, `lammps_ase_calculator`, `open_lammps`
 - [Systems (`regc.systems`)](#systems-regcsystems): `ParticleSystem`, `BulkSystem`, `SlabSystem`, `ClusterSystem`, `LJSystem`, `SlabLJSystem`
-- [Structures and slab geometry (`regc.structures`)](#structures-and-slab-geometry-regcstructures): `cubic_lattice_constant`, `slab_geometry_from_atoms`, `SlabGeometry`, `insertion_energy_scan`, `cluster_geometry_from_atoms`, `ClusterGeometry`, `coordination_numbers`, `reference_lattice_constant`
+- [Structures and slab geometry (`regc.structures`)](#structures-and-slab-geometry-regcstructures): `cubic_lattice_constant`, `slab_geometry_from_atoms`, `SlabGeometry`, `insertion_energy_scan`, `cluster_geometry_from_atoms`, `ClusterGeometry`, `coordination_numbers`, `reference_lattice_constant`, `surface_slab`, `substrate_layers`
 - [Thermodynamic state (`regc.state`)](#thermodynamic-state-regcstate): `ThermoState`
 - [Replicas (`regc.replica`)](#replicas-regcreplica): `Replica`
 - [The replica-exchange engine (`regc.engine`)](#the-replica-exchange-engine-regcengine): `ReplicaExchangeGCMC`, `SWAP_TYPES`
@@ -17,7 +17,7 @@ Everything below is importable as `from regc import <name>`, except the runner f
 - [Sample I/O (`regc.io`)](#sample-io-regcio): `save_samples`, `load_samples`, `SampleSet`
 - [Units (`regc.units`)](#units-regcunits): `kelvin_to_eV`, `eV_to_kelvin`, `pascal_per`, `PRESSURE_UNITS`, `ThermalWavelengthCubed`, `SpeciesLambdaCubed`, `thermal_wavelength_angstrom`, `thermal_wavelength_cubed_angstrom3`, `default_mass_amu`
 - [Reduced-unit pressure conventions (`regc.pressure`)](#reduced-unit-pressure-conventions-regcpressure): `p0_reduced_units`, `p0_ideal_gas_wavelength`, `mu_from_pressure`, `pressure_from_mu`, `mu_grid_from_pressures`, `invert_mu_of_Tp`
-- [Gas reservoirs (`regc.reservoir`)](#gas-reservoirs-regcreservoir): `Reservoir`, `MonatomicIdealGasReservoir`, `DiatomicReservoir`, `diatomic_dissociation_energy_eV`, `diatomic_gas_mu_eV`, `mu_atomic_from_diatomic_reservoir_eV`, `pressure_from_atomic_mu_reservoir_pascal`, `H2_BOND_LENGTH_ANGSTROM`, `H2_VIBRATIONAL_WAVENUMBER_CM`, `H_MASS_AMU`, `H2_MASS_AMU`, `H2_D0_EXPERIMENTAL_EV`
+- [Gas reservoirs (`regc.reservoir`)](#gas-reservoirs-regcreservoir): `Reservoir`, `MonatomicIdealGasReservoir`, `DiatomicReservoir`, `MolecularGas`, `MolecularGasFeed`, `diatomic_dissociation_energy_eV`, `diatomic_gas_mu_eV`, `mu_atomic_from_diatomic_reservoir_eV`, `pressure_from_atomic_mu_reservoir_pascal`, `H2_BOND_LENGTH_ANGSTROM`, `H2_VIBRATIONAL_WAVENUMBER_CM`, `H_MASS_AMU`, `H2_MASS_AMU`, `H2_D0_EXPERIMENTAL_EV`
 - [MBAR analysis (`regc.analysis`)](#mbar-analysis-regcanalysis): `MBARSurfaceAnalysis`, `heat_capacity_ridges`, `export_phase_configurations`
 - [Plotting (`regc.plotting`)](#plotting-regcplotting): `plot_phase_diagram`, `plot_map`, `plot_radial_distribution`
 - [Per-sample records and other potentials (`regc.records`)](#per-sample-records-and-other-potentials-regcrecords): `RecordWriter`, `Records`, `attach_energies`, `reevaluate`
@@ -471,7 +471,10 @@ or `langevin`), `fix wall/reflect` at the system's hard walls
 cluster box), frozen atoms excluded from integration. The Bussi
 thermostat's temperature counts 3N degrees of freedom (`extra/dof
 0`): frozen atoms and walls break momentum conservation, and the
-ASE path (`Replica._diffuse_md`) counts the same.
+ASE path (`Replica._diffuse_md`) counts the same. With a thermostat
+region (`system.thermostat_mask`, the fixed / thermostat / free
+slab) the thermostat acts on those substrate atoms only (3 of their
+degrees of freedom each) and the other moving atoms run NVE.
 
 **Parameters**
 
@@ -613,6 +616,268 @@ Construct a particle system.
 **Raises**
 
 - *ValueError*: If `exchange_species` is an empty or repeated sequence, names several species while `positions` is given without `species`, or is a single species while `species` contains other labels.
+
+#### `ParticleSystem.set_thermostat_region`
+
+```python
+ParticleSystem.set_thermostat_region(mask: Optional[Sequence[bool]]) -> None
+```
+
+Thermostat only these substrate atoms during MD diffusion.
+
+The fixed / thermostat / free layout: frozen atoms never move, the
+masked substrate atoms are coupled to the MD thermostat (Bussi or
+Langevin), and every other moving atom -- the rest of the substrate
+and all mobile particles -- follows plain Newtonian dynamics. MC
+and HMC moves are unaffected. Segments still start from fresh
+Maxwell-Boltzmann velocities for every moving atom.
+
+**Parameters**
+
+- `mask` (*sequence of bool or None*): One flag per substrate atom (True: thermostatted). None restores the default, every moving atom thermostatted.
+
+**Returns**
+
+- *None*
+
+**Raises**
+
+- *ValueError*: If `mask` does not have one entry per substrate atom, or selects none.
+
+#### `ParticleSystem.set_sgc_species`
+
+```python
+ParticleSystem.set_sgc_species(species: Sequence[str], canonical: bool = False) -> None
+```
+
+Make the displaceable substrate semi-grand-canonical (or canonical).
+
+Substrate atoms of these species may change identity among them
+(`Replica._move_identity`), at fixed total number, under the
+chemical-potential differences `ThermoState.sgc_dmu`. Frozen atoms
+keep their species. The first species is the reference (its
+sgc_dmu entry is 0).
+
+**Parameters**
+
+- `species` (*sequence of str*): At least two distinct labels; an empty sequence switches it off.
+- `canonical` (*bool, optional*): If True, identity moves exchange the species of two atoms (`Replica._move_pair_swap`), so every species count stays fixed and no chemical-potential field is needed: a canonical alloy, e.g. a free nanoparticle of fixed composition. Default False.
+
+**Raises**
+
+- *ValueError*: On one species, or repeated labels.
+
+#### `ParticleSystem.sgc_candidates`
+
+```python
+ParticleSystem.sgc_candidates() -> np.ndarray
+```
+
+Indices (into the substrate arrays) of the atoms that may change identity.
+
+**Returns**
+
+- *numpy.ndarray*: Substrate atoms whose species is one of `sgc_species`; empty when the substrate is not semi-grand-canonical. Identity swaps keep this set fixed, so a uniform pick from it is a symmetric proposal.
+
+#### `ParticleSystem.sgc_counts`
+
+```python
+ParticleSystem.sgc_counts() -> np.ndarray
+```
+
+Number of swappable substrate atoms of each `sgc_species`.
+
+**Returns**
+
+- *numpy.ndarray*: Integer array in `sgc_species` order (empty when off). Their sum is constant along a run.
+
+#### `ParticleSystem.generic_identity_dU`
+
+```python
+ParticleSystem.generic_identity_dU(i: int, new_species: str) -> float
+```
+
+Energy change of turning substrate atom `i` into `new_species`.
+
+Via clone-mutate-recompute: correct for any calculator that sees
+the substrate. Positions do not change, so the external field does
+not either.
+
+**Parameters**
+
+- `i` (*int*): Index into the substrate arrays.
+- `new_species` (*str*): The trial species.
+
+**Returns**
+
+- *float*: U(new) - U(old).
+
+#### `ParticleSystem.generic_pair_swap_dU`
+
+```python
+ParticleSystem.generic_pair_swap_dU(i: int, j: int) -> float
+```
+
+Energy change of exchanging the species of substrate atoms `i` and `j`.
+
+Clone-mutate-recompute, as `generic_identity_dU`.
+
+**Parameters**
+
+- `i, j` (*int*): Indices into the substrate arrays.
+
+**Returns**
+
+- *float*: U(swapped) - U(current).
+
+#### `ParticleSystem.apply_pair_swap`
+
+```python
+ParticleSystem.apply_pair_swap(i: int, j: int) -> None
+```
+
+Commit an accepted exchange of the species of substrate atoms `i` and `j`.
+
+**Parameters**
+
+- `i, j` (*int*): Indices into the substrate arrays.
+
+#### `ParticleSystem.apply_identity`
+
+```python
+ParticleSystem.apply_identity(i: int, new_species: str) -> None
+```
+
+Commit an accepted identity swap of substrate atom `i`.
+
+**Parameters**
+
+- `i` (*int*): Index into the substrate arrays.
+- `new_species` (*str*): Its new species.
+
+#### `ParticleSystem.set_molecules`
+
+```python
+ParticleSystem.set_molecules(molecules: Sequence, atomic_exchange: Optional[Sequence[str]] = None) -> None
+```
+
+Exchange molecules as blocks of atoms (`regc.molecules.MoleculeMove`).
+
+GC moves then pick a channel -- one per molecule (relative weight
+`molecule.weight`) and one per atomically exchanged species
+(weight 1) -- and insert or delete through it. The atoms keep their
+elemental chemical potentials (`ThermoState.mu`), so every element
+of every molecule must be an exchanged species.
+
+**Parameters**
+
+- `molecules` (*sequence of MoleculeMove*): The molecular moves; an empty sequence switches them off (and atomic exchange of every species is restored).
+- `atomic_exchange` (*sequence of str, optional*): Exchanged species that also get single-atom insertions and deletions. Default None: none (with molecules).
+
+**Raises**
+
+- *ValueError*: On a molecule element or atomic species that is not exchanged, repeated molecule names, or a shell beyond the minimum-image radius.
+
+#### `ParticleSystem.in_exchange_zone`
+
+```python
+ParticleSystem.in_exchange_zone(positions: np.ndarray) -> np.ndarray
+```
+
+Whether positions lie in the insertion/deletion zone.
+
+The same region `random_insertion_position` samples and
+`exchange_zone_indices` tests; the base-class zone is everything.
+
+**Parameters**
+
+- `positions` (*numpy.ndarray*): Positions, shape (n, 3).
+
+**Returns**
+
+- *numpy.ndarray*: Boolean array, shape (n,).
+
+#### `ParticleSystem.wrap_position`
+
+```python
+ParticleSystem.wrap_position(pos: np.ndarray) -> np.ndarray
+```
+
+A position mapped into the primary cell, as `apply_insert` stores it.
+
+**Parameters**
+
+- `pos` (*numpy.ndarray*): The (3,) position.
+
+**Returns**
+
+- *numpy.ndarray*: The wrapped position (unchanged without periodicity).
+
+#### `ParticleSystem.generic_insert_many_dU`
+
+```python
+ParticleSystem.generic_insert_many_dU(positions: np.ndarray, species: Sequence[str]) -> float
+```
+
+Energy change of inserting several mobile atoms at once.
+
+**Parameters**
+
+- `positions` (*numpy.ndarray*): Their positions, shape (m, 3).
+- `species` (*sequence of str*): Their species.
+
+**Returns**
+
+- *float*: The total energy change (calculator + external field); `numpy.inf` if any position is forbidden (the calculator is then not called).
+
+#### `ParticleSystem.generic_delete_many_dU`
+
+```python
+ParticleSystem.generic_delete_many_dU(indices: Sequence[int]) -> float
+```
+
+Energy change of deleting several mobile atoms at once.
+
+**Parameters**
+
+- `indices` (*sequence of int*): Their indices into `positions`.
+
+**Returns**
+
+- *float*: The total energy change (calculator + external field).
+
+#### `ParticleSystem.apply_insert_many`
+
+```python
+ParticleSystem.apply_insert_many(positions: np.ndarray, species: Sequence[str]) -> None
+```
+
+Commit the insertion of several mobile atoms (appended in order).
+
+**Parameters**
+
+- `positions` (*numpy.ndarray*): Their positions, shape (m, 3).
+- `species` (*sequence of str*): Their species.
+
+**Returns**
+
+- *None*
+
+#### `ParticleSystem.apply_delete_many`
+
+```python
+ParticleSystem.apply_delete_many(indices: Sequence[int]) -> None
+```
+
+Commit the deletion of several mobile atoms.
+
+**Parameters**
+
+- `indices` (*sequence of int*): Their indices into `positions`.
+
+**Returns**
+
+- *None*
 
 #### `ParticleSystem.n` (property)
 
@@ -1243,6 +1508,47 @@ they diffuse back in.
 
 - *numpy.ndarray*: Integer indices into `self.positions`.
 
+#### `SlabSystem.set_subsurface`
+
+```python
+SlabSystem.set_subsurface(settings) -> None
+```
+
+Add subsurface NCMC channels and confine the instantaneous moves above z_c.
+
+The exchange zone's lower bound is raised to `settings.z_cut` (if
+it is lower), so the existing insertion and deletion moves (atomic
+and molecular) act only in the gas region z >= z_c (a zone that
+starts higher is kept: the gap is not exchanged); the subsurface
+region below is
+handled by the NCMC channels (`regc.subsurface`,
+`Replica._move_insert_subsurface`). Calling it again with None
+restores the original zone.
+
+**Parameters**
+
+- `settings` (*regc.subsurface.Subsurface or None*): The channels (None: off).
+
+**Raises**
+
+- *ValueError*: If a subsurface species is not exchanged, z_cut is not below the top of the original zone, or the region leaves the box.
+
+#### `SlabSystem.in_exchange_zone`
+
+```python
+SlabSystem.in_exchange_zone(positions: np.ndarray) -> np.ndarray
+```
+
+Whether positions have `z_lo <= z < z_hi` (the insertion range).
+
+**Parameters**
+
+- `positions` (*numpy.ndarray*): Positions, shape (n, 3).
+
+**Returns**
+
+- *numpy.ndarray*: Boolean array, shape (n,).
+
 #### `SlabSystem.volume` (property)
 
 float: The accessible volume, `area * (z_hi - z_lo)` over
@@ -1471,6 +1777,22 @@ Indices of the mobile particles inside the insertion shell.
 
 - *numpy.ndarray*: Integer indices into `self.positions` (every particle when there is no shell).
 
+#### `ClusterSystem.in_exchange_zone`
+
+```python
+ClusterSystem.in_exchange_zone(positions: np.ndarray) -> np.ndarray
+```
+
+Whether positions lie in the insertion shell (everywhere without one).
+
+**Parameters**
+
+- `positions` (*numpy.ndarray*): Positions, shape (n, 3).
+
+**Returns**
+
+- *numpy.ndarray*: Boolean array, shape (n,).
+
 #### `ClusterSystem.md_z_bounds`
 
 ```python
@@ -1592,7 +1914,7 @@ a finer scan around it is fitted with a parabola.
 ### `slab_geometry_from_atoms`
 
 ```python
-slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headroom: float = 5.0, layer_tol: float = 0.001) -> SlabGeometry
+slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headroom: float = 5.0, layer_tol: float = 0.001, n_thermostat_layers: Optional[int] = None) -> SlabGeometry
 ```
 
 Lay out an ASE slab for `SlabSystem`.
@@ -1608,6 +1930,7 @@ layers above (subsurface sites included).
 - `n_frozen_layers` (*int, optional*): Number of bottom layers kept rigid; the rest are displaceable substrate. Default None: all layers frozen (a rigid surface).
 - `headroom` (*float, optional*): Space (A) for the exchanged species above the topmost atom. Default 5.0.
 - `layer_tol` (*float, optional*): z tolerance (A) for grouping atoms into layers. Default 1e-3.
+- `n_thermostat_layers` (*int, optional*): Split the displaceable layers into a thermostatted block (these many layers right above the frozen ones) and a free top (the rest, at least one layer), integrated NVE by MD diffusion together with the exchanged species: the fixed / thermostat / free substrate. Default None: every moving atom is thermostatted.
 
 **Returns**
 
@@ -1615,14 +1938,14 @@ layers above (subsurface sites included).
 
 **Raises**
 
-- *ValueError*: If the cell is not in the restricted (a1 along x, a2 in xy) form, or `n_frozen_layers` is out of range.
+- *ValueError*: If the cell is not in the restricted (a1 along x, a2 in xy) form, or `n_frozen_layers` or `n_thermostat_layers` is out of range.
 
 ---
 
 ### `SlabGeometry`
 
 ```python
-SlabGeometry(cell_xy: np.ndarray, Lz: float, top_z: float, frozen_positions: np.ndarray, frozen_species: np.ndarray, substrate_positions: np.ndarray, substrate_species: np.ndarray, layer_z: np.ndarray, n_surface: int = 0) -> None
+SlabGeometry(cell_xy: np.ndarray, Lz: float, top_z: float, frozen_positions: np.ndarray, frozen_species: np.ndarray, substrate_positions: np.ndarray, substrate_species: np.ndarray, layer_z: np.ndarray, n_surface: int = 0, thermostat_mask: Optional[np.ndarray] = None, layers: Optional[Tuple[int, int, int]] = None) -> None
 ```
 
 A slab laid out for `SlabSystem`: frozen block at z <= 0, substrate above.
@@ -1636,6 +1959,8 @@ A slab laid out for `SlabSystem`: frozen block at z <= 0, substrate above.
 - `frozen_species, substrate_species` (*numpy.ndarray*): Their species labels.
 - `layer_z` (*numpy.ndarray*): z of every atomic layer, ascending (after the shift).
 - `n_surface` (*int*): Number of atoms in the top layer (for coverages per surface atom).
+- `thermostat_mask` (*numpy.ndarray or None*): Which displaceable atoms the MD thermostat acts on (bool, one per substrate atom), for the fixed / thermostat / free layout; the rest (and the exchanged species) are integrated NVE. None (default): every moving atom is thermostatted.
+- `layers` (*tuple of int or None*): `(fixed, thermostat, free)` layer counts when `thermostat_mask` comes from layers (`slab_geometry_from_atoms`), else None.
 
 #### `SlabGeometry.orthogonal` (property)
 
@@ -1850,12 +2175,73 @@ The experimental cubic lattice constant of an element, from ASE's tables.
 
 - *float or None*: `ase.data.reference_states` lattice constant (A) when the element's reference structure is `crystal`, else None.
 
+---
+
+### `surface_slab`
+
+```python
+surface_slab(symbol: str, surface: str = 'fcc111', size: Sequence[int] = (4, 4), layers=(2, 2, 2), a: Optional[float] = None, headroom: float = 5.0, layer_tol: float = 0.001, **build_kwargs) -> SlabGeometry
+```
+
+A realistic surface template: fixed, thermostatted and free substrate layers.
+
+Builds `ase.build.<surface>(symbol, size=(nx, ny, fixed + thermostat +
+free), a=a)` and lays it out with `slab_geometry_from_atoms`: the
+bottom `fixed` layers are rigid (they stand for the bulk), the next
+`thermostat` layers are coupled to the MD thermostat (the heat bath),
+and the top `free` layers move with plain Newtonian (NVE) dynamics
+together with the exchanged species, so adsorption energy and surface
+motion are carried away through the lattice rather than damped at the
+surface. The split matters for MD diffusion (`diffusion='md'`); MC and
+HMC moves see fixed vs. displaceable only.
+
+**Parameters**
+
+- `symbol` (*str*): Element, e.g. `'Pd'`.
+- `surface` (*str, optional*): An `ase.build` surface function, e.g. `'fcc100'`, `'fcc111'`, `'bcc110'`, `'hcp0001'`. Default `'fcc111'`.
+- `size` (*sequence of int, optional*): Lateral repeats `(nx, ny)`. Default `(4, 4)`.
+- `layers` (*sequence of int or dict, optional*): `(fixed, thermostat, free)` layer counts, bottom to top, each at least 1 (or a dict with those keys). Default `(2, 2, 2)`.
+- `a` (*float, optional*): Lattice constant in A; default None (ASE's tabulated value). Use `cubic_lattice_constant` for the potential's own.
+- `headroom` (*float, optional*): Space (A) for the exchanged species above the topmost atom. Default 5.0.
+- `layer_tol` (*float, optional*): z tolerance (A) for grouping atoms into layers. Default 1e-3.
+- `**build_kwargs`: Passed on to the `ase.build` function (e.g. `orthogonal=True`).
+
+**Returns**
+
+- *SlabGeometry*: The geometry; `SlabGeometry.make_system` builds the system.
+
+**Raises**
+
+- *ValueError*: If `size` is not two integers, `layers` is malformed, or `ase.build` has no such surface function.
+
+---
+
+### `substrate_layers`
+
+```python
+substrate_layers(layers) -> Tuple[int, int, int]
+```
+
+Normalise a fixed / thermostat / free layer specification.
+
+**Parameters**
+
+- `layers` (*sequence of int or dict*): `(fixed, thermostat, free)` or `{'fixed': ..., 'thermostat': ..., 'free': ...}`, counted from the bottom of the slab.
+
+**Returns**
+
+- *tuple of int*: `(fixed, thermostat, free)`.
+
+**Raises**
+
+- *ValueError*: If keys are missing or unknown, or a count is below 1.
+
 ## Thermodynamic state (`regc.state`)
 
 ### `ThermoState`
 
 ```python
-ThermoState(temperature: float, mu: Union[float, np.ndarray], label: Tuple[int, int], lambda_cubed: Union[float, np.ndarray] = 1.0) -> None
+ThermoState(temperature: float, mu: Union[float, np.ndarray], label: Tuple[int, int], lambda_cubed: Union[float, np.ndarray] = 1.0, sgc_dmu: Optional[np.ndarray] = None) -> None
 ```
 
 The thermodynamic label attached to one replica-exchange grid point.
@@ -1875,6 +2261,7 @@ exactly as before.
 - `mu` (*float or numpy.ndarray*): Chemical potential, in the same units as `temperature`; one per exchanged species if there are several.
 - `label` (*tuple of int*): The (temperature_index, mu_index) position of this state in the replica-exchange grid.
 - `lambda_cubed` (*float or numpy.ndarray, optional*): Thermal de Broglie wavelength cubed, in whatever length units the system's volume/positions use (one per exchanged species if there are several). Default is 1.0, the correct, self-consistent choice in reduced Lennard-Jones units (it's equivalent to defining the LJ length unit sigma as the wavelength scale too) -- but it is NOT generally correct when a Calculator works in real physical units (e.g. ASE's EMT or a real EAM/MLIP, which report energies in eV using positions in Angstrom). There, supply the real value (see `regc.units.thermal_wavelength_cubed_angstrom3`) so the insertion/deletion acceptance formulas in `replica.py` stay dimensionally correct.
+- `sgc_dmu` (*numpy.ndarray, optional*): Semi-grand-canonical field of the substrate (see `ParticleSystem.sgc_species`): one chemical-potential difference mu_k - mu_ref per entry of `system.sgc_species`, in the units of `temperature`; the first (reference) entry is 0. The weight of a configuration gains exp(beta * sum_k sgc_dmu[k] * N_k), N_k the number of swappable substrate atoms of species k. Configurational (mass-free): a T-independent value describes equilibrium with a bulk alloy whose excess free energy is T-independent (regular solution). Default None: no identity swaps.
 
 #### `ThermoState.beta` (property)
 
@@ -1974,8 +2361,9 @@ detailed balance requires.
 Replica.regc_local_step(gc: bool, mode: str, n: int, **kwargs) -> Replica
 ```
 
-The per-replica part of one REGC step: optional GC attempt, then
-diffusion.
+The per-replica part of one REGC step: optional GC attempt, the
+`identity_attempts` semi-grand-canonical identity swaps (if the
+substrate is semi-grand-canonical), then diffusion.
 
 **Parameters**
 
@@ -2107,7 +2495,7 @@ Compute the acceptance rate of each move type attempted so far.
 ### `ReplicaExchangeGCMC`
 
 ```python
-ReplicaExchangeGCMC(temperatures: List[float], mus, system_factory: Callable[[np.random.Generator], ParticleSystem], seed: int = 0, max_disp: float = 0.2, n_workers: int = 1, lambda_cubed_of_T: Callable[[float], float] = <function ReplicaExchangeGCMC.<lambda>>, hmc_enabled: bool = False, hmc_leapfrog_steps: int = 10, hmc_dt: float = 0.005, adsorbed_cutoff: Optional[float] = None, observables: Optional[Sequence[Observable]] = None, configurations_dir: Optional[str] = None, configurations_every: int = 1, skip_empty_swaps: bool = True, records_path: Optional[str] = None, records_potential: str = 'sampling', records_every: int = 1)
+ReplicaExchangeGCMC(temperatures: List[float], mus, system_factory: Callable[[np.random.Generator], ParticleSystem], seed: int = 0, max_disp: float = 0.2, n_workers: int = 1, lambda_cubed_of_T: Callable[[float], float] = <function ReplicaExchangeGCMC.<lambda>>, hmc_enabled: bool = False, hmc_leapfrog_steps: int = 10, hmc_dt: float = 0.005, adsorbed_cutoff: Optional[float] = None, observables: Optional[Sequence[Observable]] = None, configurations_dir: Optional[str] = None, configurations_every: int = 1, skip_empty_swaps: bool = True, records_path: Optional[str] = None, records_potential: str = 'sampling', records_every: int = 1, sgc_dmu: Optional[Sequence[float]] = None, sgc_attempts: int = 1, sgc_log_ratio: Optional[Sequence[float]] = None)
 ```
 
 Manages a 2D ladder of replicas over (temperature, chemical potential).
@@ -2176,6 +2564,9 @@ Construct the replica-exchange ladder.
 - `records_path` (*str, optional*): If given, every recorded sample is appended to this HDF5 file (`regc.records`): grid point, sample index, walker, N, the energy under the sampling potential and (every `records_every`-th sample) the configuration, so the samples can later be re-evaluated with another potential (`regc.records.reevaluate`) and reweighted to it (`MBARSurfaceAnalysis.with_potential`). Needs h5py. Default None (off); see also `save_records`.
 - `records_potential` (*str, optional*): Name of the sampling potential in the records file. Default `'sampling'`.
 - `records_every` (*int, optional*): Store the configuration of every this many samples (the energy and N of all of them). Default 1.
+- `sgc_dmu` (*sequence of float, optional*): Semi-grand-canonical substrate: the field mu_k - mu_ref, one value per `system.sgc_species` (reference first, 0), the same at every grid point (`ThermoState.sgc_dmu`). Required when the systems have `sgc_species`, ignored otherwise; with canonical pair swaps (`system.sgc_canonical`) None or zeros. Each sample then also records the counts (`regc.observables.SGCCounts`, carrying the field for the analysis), and replica exchange includes the -(beta_a dmu_a - beta_b dmu_b) . (N_a - N_b) term (docs/REGC_algorithm.md, Sec. 9). Default None.
+- `sgc_attempts` (*int, optional*): Identity-swap attempts per replica per REGC step (`Replica._move_identity`). Default 1.
+- `sgc_log_ratio` (*sequence of float, optional*): Ideal-mixing part of the field, ln(x_k / x_ref) of the bulk reservoir, one per species: the field at temperature T is then `sgc_dmu + T * sgc_log_ratio` (docs Sec. 9). It is the same for every grid point in units of kT, so it drops out of replica exchange and MBAR and acts only in the identity moves. Default None (zero: a 50-50 reservoir, or `sgc_dmu` the full field).
 
 **Raises**
 
@@ -2192,6 +2583,38 @@ Shut down the worker pool, if one was created.
 **Returns**
 
 - *None*
+
+#### `ReplicaExchangeGCMC.swap_log_acceptance` (staticmethod)
+
+```python
+ReplicaExchangeGCMC.swap_log_acceptance(ra: Replica, rb: Replica) -> float
+```
+
+Log of the acceptance ratio of swapping two replicas' configurations.
+
+docs/REGC_algorithm.md, Eq. (8), summed over exchanged species
+(Sec. 8), plus the semi-grand-canonical substrate term (Sec. 9):
+
+    (beta_a - beta_b)(U_a - U_b)
+    - sum_s (beta_a mu_s,a - beta_b mu_s,b)(N_s,a - N_s,b)
+    + sum_s (N_s,a - N_s,b) ln(Lambda_s,a^3 / Lambda_s,b^3)
+    - sum_k (beta_a dmu_k,a - beta_b dmu_k,b)(N_k,a - N_k,b).
+
+The Lambda^3 prefactor uses the same lambda_cubed the insert/delete
+moves use, so it reduces to the paper's (beta_a/beta_b)^(3/2 dN)
+for a physical Lambda(T) and to 1 for the reduced-units Lambda = 1.
+The substrate term needs no Lambda: identity swaps keep the total
+count, and Lambda_k,a / Lambda_k,b = (T_b / T_a)^(1/2) is the same
+for every species, so it cancels, and so does the reference
+chemical potential.
+
+**Parameters**
+
+- `ra, rb` (*Replica*): The two grid slots (their states and current configurations).
+
+**Returns**
+
+- *float*: The log acceptance ratio (accept with min(1, exp of it)).
 
 #### `ReplicaExchangeGCMC.swap_pairs`
 
@@ -2310,10 +2733,14 @@ substrate motion already happens via HMC's joint trajectory when
 
 - *None*
 
+**Raises**
+
+- *ValueError*: If the substrate is semi-grand-canonical (identity swaps need `run_regc`).
+
 #### `ReplicaExchangeGCMC.run_regc`
 
 ```python
-ReplicaExchangeGCMC.run_regc(n_steps: int, x0: float = 0.99, diffusion: str = 'mc', diffusion_steps: int = 10, record_every: int = 100, burn_in_steps: int = 0, swap_types: Tuple[str, ...] = ('T', 'mu', 'cross_left', 'cross_right'), convergence_every: Optional[int] = None, convergence_tol: float = 0.05, convergence_bins: int = 30, verbose: bool = True, trajectory_dir: Optional[str] = None, trajectory_every: Optional[int] = None, **diffusion_kwargs) -> bool
+ReplicaExchangeGCMC.run_regc(n_steps: int, x0: float = 0.99, diffusion: str = 'mc', diffusion_steps: int = 10, record_every: int = 100, burn_in_steps: int = 0, swap_types: Tuple[str, ...] = ('T', 'mu', 'cross_left', 'cross_right'), convergence_every: Optional[int] = None, convergence_tol: Optional[float] = None, convergence_bins: Optional[int] = None, verbose: bool = True, convergence_mode: str = 'blocks', convergence_min_neff: float = 10.0, convergence_median_tol: float = 1.3, convergence_discard: float = 0.2, trajectory_dir: Optional[str] = None, trajectory_every: Optional[int] = None, **diffusion_kwargs) -> bool
 ```
 
 Run the REGC scheme exactly as in [ZSG] Sec. II A / Fig. 1.
@@ -2355,8 +2782,12 @@ that convention pass `1 - x0`.
 - `burn_in_steps` (*int, optional*): Steps before recording starts. Default is 0.
 - `swap_types` (*tuple of str, optional*): Swap patterns to draw from. Default is all four of `SWAP_TYPES` (including the diagonals).
 - `convergence_every` (*int, optional*): Check convergence every this many steps (rounded to a multiple of `record_every`). Default is None (no check; run `n_steps`).
-- `convergence_tol` (*float, optional*): Converged when the largest total-variation distance between the rho(u) of the two latest inter-check blocks, over all grid points, is below this. Default is 0.05. Two blocks of n samples from the same distribution still differ by roughly sqrt(convergence_bins / (pi n)) from sampling noise alone, so the tolerance must lie above that floor (fewer bins or longer blocks). The first verdict needs three checks.
-- `convergence_bins` (*int, optional*): Histogram bins for rho(u). Default is 30.
+- `convergence_tol` (*float, optional*): `convergence_mode='blocks'`: converged when the largest total-variation distance between the rho(u) of the two latest inter-check blocks, over all grid points, is below this (default 0.05). Two blocks of n samples from the same distribution still differ by roughly sqrt(convergence_bins / (pi n)) from sampling noise alone, and correlated samples count less, so with short blocks this can never be met; the first verdict needs three checks. `convergence_mode='noise'`: the largest ratio of that distance (first vs second half of all samples) to its expected noise floor (`rho_u_noise_check`); default 3.0.
+- `convergence_bins` (*int, optional*): Histogram bins for rho(u). Default 30 (blocks) or 10 (noise).
+- `convergence_mode` (*str, optional*): `'blocks'` ([ZSG]'s criterion on consecutive fixed blocks; the default, unchanged) or `'noise'` (growing halves, tolerance in units of the noise floor, see `rho_u_noise_check`).
+- `convergence_min_neff` (*float, optional*): `'noise'` only: every replica's halves must hold at least this many independent samples before the run may stop. Default 10.
+- `convergence_median_tol` (*float, optional*): `'noise'` only: the median ratio over the grid must also be below this. Default 1.3.
+- `convergence_discard` (*float, optional*): `'noise'` only: fraction of the earliest samples left out of the halves (equilibration). Default 0.2.
 - `verbose` (*bool, optional*): Print progress about ten times over the run. Default is True.
 - `trajectory_dir` (*str, optional*): As in `run`. Default is None.
 - `trajectory_every` (*int, optional*): As in `run`; defaults to `record_every`.
@@ -2368,7 +2799,35 @@ that convention pass `1 - x0`.
 
 **Raises**
 
-- *ValueError*: If `x0` is outside [0, 1] or `swap_types` contains an unknown pattern.
+- *ValueError*: If `x0` is outside [0, 1], `swap_types` contains an unknown pattern or `convergence_mode` is unknown.
+
+#### `ReplicaExchangeGCMC.rho_u_noise_check`
+
+```python
+ReplicaExchangeGCMC.rho_u_noise_check(bins: int = 10, tol: float = 3.0, min_neff: float = 10.0, median_tol: float = 1.3, discard: float = 0.2) -> dict
+```
+
+Noise-aware rho(u) convergence: both halves of every replica agree within sampling noise.
+
+For every grid point the reduced energies of all recorded samples are
+split into a first and a second half and compared by
+`regc.diagnostics.rho_u_noise_tv`: the total-variation distance in
+units of the distance two halves of a stationary chain with the same
+statistical inefficiency would show. The halves grow with the run,
+so the noise floor falls as 1/sqrt(n) (consecutive fixed blocks,
+`rho_u_change`, keep a constant floor however long the run).
+
+**Parameters**
+
+- `bins` (*int, optional*): Histogram bins. Default 10.
+- `tol` (*float, optional*): Converged when every ratio is below this (strong drift in any replica). Default 3.0: for a stationary chain each ratio is about 1 with a 95th percentile near 2 when samples are correlated, so the largest of 64 is typically 2.3-2.5.
+- `min_neff` (*float, optional*): ... every half holds at least this many independent samples (otherwise the floor is so high that any chain passes). Default 10.
+- `median_tol` (*float, optional*): ... and the median ratio over the grid is below this (weak drift shared by many replicas, which the maximum cannot resolve). Default 1.3.
+- `discard` (*float, optional*): Fraction of the earliest samples left out before halving (the equilibration transient). Default 0.2.
+
+**Returns**
+
+- *dict*: `max_ratio`, `median_ratio`, `worst` (grid point of the largest ratio), `min_neff`, `n_samples`, `converged` and `ratios` (one per grid point, in grid-key order).
 
 #### `ReplicaExchangeGCMC.rho_u_change`
 
@@ -2519,6 +2978,43 @@ at every checkpoint.
 
 - *ValueError*: If `every` is not positive.
 
+#### `ReplicaExchangeGCMC.save_status`
+
+```python
+ReplicaExchangeGCMC.save_status(path: Optional[str], interval_s: float = 5.0, extra: Optional[dict] = None) -> None
+```
+
+Write a JSON heartbeat of the running simulation from now on (or stop).
+
+At most every `interval_s` seconds (and at the end of every run
+call) the file is replaced atomically with the progress, the
+per-replica sample counts and averages, the latest stretch of every
+replica's N and U, the swap statistics and the convergence history:
+what `regc.monitor` shows while the run is going.
+
+**Parameters**
+
+- `path` (*str or None*): The status file (`status.json`); None stops writing it.
+- `interval_s` (*float, optional*): Minimum time between writes. Default 5 s.
+- `extra` (*dict, optional*): Copied into the file under `'labels'` (e.g. the ladder in kelvin and the pressures, for the monitor's axes). Default None.
+
+#### `ReplicaExchangeGCMC.status`
+
+```python
+ReplicaExchangeGCMC.status(step: int = 0, n_steps: int = 0, scheme: str = 'regc') -> dict
+```
+
+A JSON-serialisable snapshot of the simulation's progress and data.
+
+**Parameters**
+
+- `step, n_steps` (*int, optional*): Progress of the current run call (offset by the steps a checkpointed driver already did). Default 0.
+- `scheme` (*str, optional*): `'regc'` or `'sweep'`. Default `'regc'`.
+
+**Returns**
+
+- *dict*: See `save_status`.
+
 #### `ReplicaExchangeGCMC.n_substrate` (property)
 
 int: Displaceable (non-frozen) substrate atoms per replica (for the kinetic heat capacity).
@@ -2552,7 +3048,7 @@ SWAP_TYPES = ('T', 'mu', 'cross_left', 'cross_right')
 ### `run_with_checkpoints`
 
 ```python
-run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000, x0: float = 0.99, diffusion: str = 'mc', diffusion_steps: int = 10, record_every: int = 100, convergence_every: Optional[int] = None, convergence_tol: float = 0.05, time_limit: Optional[float] = None, resume: bool = True, overwrite: bool = False, metadata: Optional[dict] = None, progress: Optional[Callable[[str], None]] = <built-in function print>, energy_tol: float = 1e-06, **diffusion_kwargs) -> RunStatus
+run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000, x0: float = 0.99, diffusion: str = 'mc', diffusion_steps: int = 10, record_every: int = 100, convergence_every: Optional[int] = None, convergence_tol: Optional[float] = None, time_limit: Optional[float] = None, resume: bool = True, overwrite: bool = False, metadata: Optional[dict] = None, progress: Optional[Callable[[str], None]] = <built-in function print>, energy_tol: float = 1e-06, convergence_mode: str = 'blocks', convergence_bins: Optional[int] = None, convergence_min_neff: float = 10.0, convergence_median_tol: float = 1.3, convergence_discard: float = 0.2, **diffusion_kwargs) -> RunStatus
 ```
 
 Run `sim.run_regc` in checkpointed chunks.
@@ -2565,7 +3061,12 @@ Run `sim.run_regc` in checkpointed chunks.
 - `chunk` (*int, optional*): Steps between checkpoints; a multiple of `record_every` (and of `trajectory_every` if given). Default 1000.
 - `x0, diffusion, diffusion_steps, record_every`: Passed to `ReplicaExchangeGCMC.run_regc`.
 - `convergence_every` (*int, optional*): Check rho(u) convergence every this many steps (rounded up to a multiple of `chunk`); also at the end. Default None: no checks.
-- `convergence_tol` (*float, optional*): Converged when rho(u) of the samples since the last check and of the interval before it differ (largest total-variation distance) by less than this; see `ReplicaExchangeGCMC.rho_u_change` for the noise floor. Default 0.05.
+- `convergence_tol` (*float, optional*): `convergence_mode='blocks'`: converged when rho(u) of the samples since the last check and of the interval before it differ (largest total-variation distance) by less than this; see `ReplicaExchangeGCMC.rho_u_change` for the noise floor. Default 0.05. `'noise'`: the largest ratio of the distance between the two halves of all samples to its noise floor (`ReplicaExchangeGCMC.rho_u_noise_check`). Default 3.0.
+- `convergence_mode` (*str, optional*): `'blocks'` (default) or `'noise'`.
+- `convergence_bins` (*int, optional*): Histogram bins. Default 30 (blocks) or 10 (noise).
+- `convergence_min_neff` (*float, optional*): `'noise'`: independent samples every half must hold. Default 10.
+- `convergence_median_tol` (*float, optional*): `'noise'`: the median ratio over the grid must be below this. Default 1.3.
+- `convergence_discard` (*float, optional*): `'noise'`: fraction of the earliest samples left out (equilibration). Default 0.2.
 - `time_limit` (*float, optional*): Seconds: stop (`finished=False`) before starting a chunk that is expected to end later than this, measured from the call. Default None (no limit).
 - `resume` (*bool, optional*): Continue the run saved in `out_dir` if there is one. Default True.
 - `overwrite` (*bool, optional*): Start afresh even if `out_dir` holds a run (with `resume=False`). Default False.
@@ -3412,6 +3913,335 @@ calculator; D0 does too unless `d0` says otherwise.
 **Raises**
 
 - *ValueError*: If spectroscopic constants are missing for a non-H element, or `d0` is `'experimental'` for a non-H element or unknown.
+
+---
+
+### `MolecularGas`
+
+```python
+MolecularGas(name: str, symbols: Tuple[str, ...], positions_angstrom: Sequence, energy_eV: float, vib_wavenumbers_cm: Tuple[float, ...], symmetry_number: int, spin_multiplicity: int = 1, masses_amu: Optional[Tuple[float, ...]] = None, calculator_info: Optional[dict] = None) -> None
+```
+
+An ideal polyatomic (or monatomic) gas, referenced to the simulation potential.
+
+The molecule's energy is that of its relaxed geometry with the same
+potential that evaluates the adsorbed atoms (the role D0 and e_atom
+play for `DiatomicReservoir`); translation, rotation, vibration and
+spin are standard ideal-gas statistical mechanics
+(`molecular_gas_mu_eV`). The relaxed template also defines the shape
+of the molecular insertion move (`regc.molecules.MoleculeMove`).
+
+**Parameters**
+
+- `name` (*str*): Label, e.g. `'CO'`.
+- `symbols` (*sequence of str*): Element of every atom.
+- `positions_angstrom` (*sequence*): Relaxed positions, shape (n, 3), Angstrom.
+- `energy_eV` (*float*): Energy of the relaxed molecule with the potential, eV.
+- `vib_wavenumbers_cm` (*sequence of float*): Vibrational wavenumbers, cm^-1.
+- `symmetry_number` (*int*): Rotational symmetry number.
+- `spin_multiplicity` (*int, optional*): Electronic ground-state degeneracy. Default 1.
+- `masses_amu` (*sequence of float, optional*): Atomic masses. Default None: ASE's table.
+- `calculator_info` (*dict, optional*): Diagnostics from `from_calculator`. Default None.
+
+#### `MolecularGas.composition` (property)
+
+dict: Number of atoms of each element.
+
+#### `MolecularGas.mass_exchanged_amu` (property)
+
+float: Molecular mass, amu.
+
+#### `MolecularGas.principal_moments`
+
+```python
+MolecularGas.principal_moments() -> np.ndarray
+```
+
+Principal moments of inertia of the relaxed geometry.
+
+**Returns**
+
+- *numpy.ndarray*: Three moments, ascending, amu A^2.
+
+#### `MolecularGas.mu_eV`
+
+```python
+MolecularGas.mu_eV(T_kelvin: float, p_pascal: float) -> float
+```
+
+Chemical potential of the molecule at (T, p).
+
+**Parameters**
+
+- `T_kelvin` (*float*): Temperature, in Kelvin.
+- `p_pascal` (*float*): Partial pressure, in Pascal.
+
+**Returns**
+
+- *float*: mu, in eV on the potential's energy scale.
+
+#### `MolecularGas.pressure_pascal`
+
+```python
+MolecularGas.pressure_pascal(T_kelvin: float, mu_eV: float) -> float
+```
+
+Partial pressure giving the molecular chemical potential `mu_eV`.
+
+**Parameters**
+
+- `T_kelvin` (*float*): Temperature, in Kelvin.
+- `mu_eV` (*float*): Chemical potential of the molecule, in eV.
+
+**Returns**
+
+- *float*: Pressure, in Pascal.
+
+#### `MolecularGas.to_dict`
+
+```python
+MolecularGas.to_dict() -> dict
+```
+
+JSON-able form (diagnostics dropped).
+
+**Returns**
+
+- *dict*: The constructor arguments, plus `type: molecular`.
+
+#### `MolecularGas.from_dict` (classmethod)
+
+```python
+MolecularGas.from_dict(d: dict) -> MolecularGas
+```
+
+Rebuild a gas written by `to_dict`.
+
+**Parameters**
+
+- `d` (*dict*): The dict.
+
+**Returns**
+
+- *MolecularGas*: The gas.
+
+#### `MolecularGas.from_calculator` (classmethod)
+
+```python
+MolecularGas.from_calculator(ase_calculator, template, name: Optional[str] = None, symmetry_number: Optional[int] = None, spin_multiplicity: Optional[int] = None, vib_wavenumbers_cm: Optional[Sequence[float]] = None, fmax: float = 0.001, steps: int = 1000, delta: float = 0.005, cell: float = 20.0) -> MolecularGas
+```
+
+Relax a gas molecule with a potential and take its vibrations from the Hessian.
+
+**Parameters**
+
+- `ase_calculator` (*ase.calculators.calculator.Calculator*): The simulation's potential, as an ASE calculator (forces needed).
+- `template` (*str or ase.Atoms*): A name of `ase.build.molecule` (`'CO'`, `'CH4'`, ...) or a starting geometry.
+- `name` (*str, optional*): Label. Default None: the template name or chemical formula.
+- `symmetry_number` (*int, optional*): Default None: from `SYMMETRY_NUMBERS`.
+- `spin_multiplicity` (*int, optional*): Default None: from `SPIN_MULTIPLICITIES` (3 for O2), else 1.
+- `vib_wavenumbers_cm` (*sequence of float, optional*): Use these instead of the potential's (e.g. experimental ones). Default None.
+- `fmax` (*float, optional*): Force tolerance of the relaxation, eV/A. Default 1e-3.
+- `steps` (*int, optional*): Maximum relaxation steps. Default 1000.
+- `delta` (*float, optional*): Finite-difference displacement for the Hessian, A. Default 0.005.
+- `cell` (*float, optional*): Edge of the (non-periodic) box the molecule sits in, A. Default 20.
+
+**Returns**
+
+- *MolecularGas*: The gas, with `calculator_info` (relaxed energy, all Hessian frequencies, the largest residual force).
+
+**Raises**
+
+- *ValueError*: If the symmetry number is unknown and not given, or the relaxed geometry is not a minimum (imaginary vibrational modes).
+
+---
+
+### `MolecularGasFeed`
+
+```python
+MolecularGasFeed(elements: Sequence[str], gases: Sequence[MolecularGas], fractions: Sequence[float], element_masses_amu: Optional[Dict[str, float]] = None)
+```
+
+A gas mixture at fixed mole fractions, as elemental chemical potentials.
+
+The simulation exchanges atoms with chemical potentials mu_e (one per
+element); a gas g of composition nu_g fixes nu_g . mu = mu_g(T, x_g p).
+With one gas per independent composition this is the constrained
+equilibrium of atomistic thermodynamics (Reuter and Scheffler): the
+surface is in equilibrium with every gas, the gases not necessarily
+with each other. The mu_e are the minimum-norm solution; where fewer
+gases than elements leave them underdetermined (pure CO fixes only
+mu_C + mu_O), only combinations that the moves use -- checked by
+`check_moves` -- enter the sampling, and those are unique.
+
+**Parameters**
+
+- `elements` (*sequence of str*): The exchanged elements, in `ParticleSystem.exchange_species` order.
+- `gases` (*sequence of MolecularGas*): The gases.
+- `fractions` (*sequence of float*): Their mole fractions (normalised here).
+- `element_masses_amu` (*dict, optional*): Atomic masses for Lambda_e. Default None: ASE's table.
+
+**Raises**
+
+- *ValueError*: If a gas contains an element that is not exchanged, or the gas compositions are linearly dependent (e.g. CO, O2 and CO2: their chemical potentials agree only at gas-phase equilibrium).
+
+**Constructor**
+
+Build the composition matrix and its pseudo-inverse.
+
+**Parameters**
+
+- `elements, gases, fractions, element_masses_amu`: See the class docstring.
+
+**Raises**
+
+- *ValueError*: See the class docstring.
+
+#### `MolecularGasFeed.reservoirs` (property)
+
+list of MolecularGas: The gases (the name `GasFeed` uses).
+
+#### `MolecularGasFeed.determines`
+
+```python
+MolecularGasFeed.determines(composition: Dict[str, int]) -> bool
+```
+
+Whether the feed fixes the chemical potential of a composition uniquely.
+
+**Parameters**
+
+- `composition` (*dict*): `{element: count}` of a move (one atom, or a molecule).
+
+**Returns**
+
+- *bool*: True if the composition is a combination of the gases'.
+
+#### `MolecularGasFeed.check_moves`
+
+```python
+MolecularGasFeed.check_moves(compositions: Dict[str, Dict[str, int]]) -> None
+```
+
+Check that every exchange move's chemical potential is fixed by the gases.
+
+**Parameters**
+
+- `compositions` (*dict*): `{move label: {element: count}}`.
+
+**Raises**
+
+- *ValueError*: Naming the moves whose chemical potential the feed leaves undetermined (e.g. atomic C with a pure CO feed).
+
+#### `MolecularGasFeed.gas_mus_eV`
+
+```python
+MolecularGasFeed.gas_mus_eV(T_kelvin: float, p_pascal: float) -> np.ndarray
+```
+
+Chemical potential of every gas at its partial pressure.
+
+**Parameters**
+
+- `T_kelvin` (*float*): Temperature, in Kelvin.
+- `p_pascal` (*float*): Total pressure, in Pascal.
+
+**Returns**
+
+- *numpy.ndarray*: mu_g, one per gas, eV.
+
+#### `MolecularGasFeed.mu_elements_eV`
+
+```python
+MolecularGasFeed.mu_elements_eV(T_kelvin: float, p_pascal: float) -> np.ndarray
+```
+
+Elemental chemical potentials at (T, total p).
+
+**Parameters**
+
+- `T_kelvin` (*float*): Temperature, in Kelvin.
+- `p_pascal` (*float*): Total pressure, in Pascal.
+
+**Returns**
+
+- *numpy.ndarray*: mu_e, one per element (minimum-norm solution), eV.
+
+#### `MolecularGasFeed.mu_at_T_eV`
+
+```python
+MolecularGasFeed.mu_at_T_eV(T_eV: float, p: float, unit: str = 'Pa')
+```
+
+Elemental chemical potential(s) at temperature k_B*T and total pressure p.
+
+**Parameters**
+
+- `T_eV` (*float*): k_B * T, in eV.
+- `p` (*float*): Total pressure, in `unit`.
+- `unit` (*str, optional*): Pressure unit. Default `'Pa'`.
+
+**Returns**
+
+- *float or numpy.ndarray*: mu (eV) for one element, an array of one per element otherwise.
+
+#### `MolecularGasFeed.mu_grid`
+
+```python
+MolecularGasFeed.mu_grid(temperatures_K: Sequence[float], pressures: Sequence[float], unit: str = 'Pa') -> np.ndarray
+```
+
+Elemental chemical potentials of a (temperature x pressure) ladder.
+
+**Parameters**
+
+- `temperatures_K` (*sequence of float*): Temperatures, in Kelvin.
+- `pressures` (*sequence of float*): Total pressures, in `unit`.
+- `unit` (*str, optional*): Pressure unit. Default `'Pa'`.
+
+**Returns**
+
+- *numpy.ndarray*: Shape (n_T, n_p) for one element, (n_T, n_p, n_elements) otherwise.
+
+#### `MolecularGasFeed.lambda_cubed_of_T`
+
+```python
+MolecularGasFeed.lambda_cubed_of_T()
+```
+
+Lambda^3(T) of every exchanged element (atoms are the sampled particles).
+
+**Returns**
+
+- *ThermalWavelengthCubed or SpeciesLambdaCubed*: For `ReplicaExchangeGCMC`'s `lambda_cubed_of_T`.
+
+#### `MolecularGasFeed.to_dict`
+
+```python
+MolecularGasFeed.to_dict() -> dict
+```
+
+JSON-able form, for `run_metadata.json`.
+
+**Returns**
+
+- *dict*: Elements, gases, fractions and element masses.
+
+#### `MolecularGasFeed.from_dict` (classmethod)
+
+```python
+MolecularGasFeed.from_dict(d: dict) -> MolecularGasFeed
+```
+
+Rebuild a feed written by `to_dict`.
+
+**Parameters**
+
+- `d` (*dict*): The dict.
+
+**Returns**
+
+- *MolecularGasFeed*: The feed.
 
 ---
 
@@ -4781,7 +5611,223 @@ sample), so that reweighting over the evaluated samples stays unbiased.
 
 - *ValueError*: If `name` is the sampling potential.
 
+## `regc.molecules`
+
+### `MoleculeMove`
+
+```python
+MoleculeMove(name: str, symbols: Sequence[str], positions, anchor: Optional[str] = None, shell: Optional[Tuple[float, float]] = None, bond_sigma: float = 0.05, angle_sigma_deg: float = 10.0, weight: float = 1.0)
+```
+
+Insertion/deletion of a star-shaped molecule as a block of atoms.
+
+**Parameters**
+
+- `name` (*str*): Label (e.g. `'CO'`), used in move statistics and observables.
+- `symbols` (*sequence of str*): Element of every atom of the gas-phase template.
+- `positions` (*array_like*): Template positions, shape (n_atoms, 3), Angstrom (relaxed with the simulation's potential, ideally).
+- `anchor` (*str, optional*): Element of the anchor atom. Default None: the element with the fewest atoms in the template (alphabetically first on a tie), e.g. C in CO, CO2 and CH4, N in NO, O in H2O and O2.
+- `shell` (*tuple of float, optional*): `(r_min, r_max)` in Angstrom: partners lie at these distances from the anchor, both in proposals and in the definition of a deletable unit. Default None: 0.75 times the shortest and 1.25 times the longest anchor-partner distance of the template.
+- `bond_sigma` (*float, optional*): Width of the Gaussian bond-length proposal, Angstrom. Default 0.05.
+- `angle_sigma_deg` (*float, optional*): Angular width of the direction proposals (second partner's angle, von Mises-Fisher concentration 1 / sigma^2 for the others), in degrees. Default 10.
+- `weight` (*float, optional*): Relative frequency among the GC move channels (each atomically exchanged species is a channel of weight 1). Default 1.
+
+**Raises**
+
+- *ValueError*: On a single-atom template, an anchor element not in the template, a molecule that is not star-shaped within the shell, or bad widths.
+
+**Constructor**
+
+Build the move from a gas-phase template.
+
+**Parameters**
+
+- `name, symbols, positions, anchor, shell, bond_sigma, angle_sigma_deg, weight`: See the class docstring.
+
+**Raises**
+
+- *ValueError*: See the class docstring.
+
+#### `MoleculeMove.symbols` (property)
+
+tuple of str: Elements in proposal order, anchor first then the partner roles.
+
+#### `MoleculeMove.n_atoms` (property)
+
+int: Atoms per molecule.
+
+#### `MoleculeMove.signature`
+
+```python
+MoleculeMove.signature() -> tuple
+```
+
+Hashable description, for checking that every replica uses the same move.
+
+**Returns**
+
+- *tuple*: Name, symbols, rounded template, shell, widths and weight.
+
+#### `MoleculeMove.metadata`
+
+```python
+MoleculeMove.metadata() -> dict
+```
+
+JSON-able description.
+
+**Returns**
+
+- *dict*: Name, anchor, partners, template vectors, shell, widths, weight.
+
+#### `MoleculeMove.propose`
+
+```python
+MoleculeMove.propose(rng: np.random.Generator) -> np.ndarray
+```
+
+Draw partner positions relative to the anchor.
+
+**Parameters**
+
+- `rng` (*numpy.random.Generator*): Random number generator.
+
+**Returns**
+
+- *numpy.ndarray*: Vectors from the anchor to each partner role, shape (k, 3); their density is exp(`log_q_roles`).
+
+#### `MoleculeMove.log_q_roles`
+
+```python
+MoleculeMove.log_q_roles(vecs: np.ndarray) -> float
+```
+
+Log proposal density of partner vectors in role order.
+
+**Parameters**
+
+- `vecs` (*numpy.ndarray*): Anchor-to-partner vectors (minimum image), shape (k, 3), the j-th assigned to role j.
+
+**Returns**
+
+- *float*: log prod_j q_j (per Angstrom^3 per partner); -inf if a partner lies outside the shell.
+
+#### `MoleculeMove.log_unit_density`
+
+```python
+MoleculeMove.log_unit_density(positions: np.ndarray, species: np.ndarray, in_zone: np.ndarray, unit: Sequence[int], min_image: Callable[[np.ndarray], np.ndarray], volume: float) -> float
+```
+
+Log of the forward proposal density Q(u) of a unit of atoms.
+
+Sums (1 / V) prod_j q_j over every way the insertion could have
+produced the unit: every atom of the anchor element inside the
+zone as the anchor, every assignment of the others to the partner
+roles of their element.
+
+**Parameters**
+
+- `positions` (*numpy.ndarray*): All mobile positions, shape (n, 3).
+- `species` (*numpy.ndarray*): Their elements, shape (n,).
+- `in_zone` (*numpy.ndarray*): Whether each lies in the exchange zone, shape (n,).
+- `unit` (*sequence of int*): Indices of the unit's atoms.
+- `min_image` (*callable*): The geometry's minimum-image map of displacement vectors.
+- `volume` (*float*): Volume of the exchange zone (the anchor's proposal region).
+
+**Returns**
+
+- *float*: log Q(u); -inf if no assignment is valid.
+
+#### `MoleculeMove.count_units`
+
+```python
+MoleculeMove.count_units(positions: np.ndarray, species: np.ndarray, in_zone: np.ndarray, min_image: Callable[[np.ndarray], np.ndarray], zone_only: bool = True) -> int
+```
+
+Number M of units (deletable molecules) in a configuration.
+
+**Parameters**
+
+- `positions, species, in_zone, min_image`: As in `log_unit_density`.
+- `zone_only` (*bool, optional*): Count only units with the anchor in the exchange zone (what the deletion move picks from). Default True.
+
+**Returns**
+
+- *int*: M.
+
+#### `MoleculeMove.random_unit`
+
+```python
+MoleculeMove.random_unit(positions: np.ndarray, species: np.ndarray, in_zone: np.ndarray, min_image: Callable[[np.ndarray], np.ndarray], rng: np.random.Generator) -> Tuple[Optional[Tuple[int, ...]], int]
+```
+
+Pick a deletable unit uniformly at random.
+
+**Parameters**
+
+- `positions, species, in_zone, min_image`: As in `log_unit_density`.
+- `rng` (*numpy.random.Generator*): Random number generator.
+
+**Returns**
+
+- *tuple*: `(unit, M)`: the unit's indices (None if there is none) and the number of units it was drawn from.
+
 ## `regc.observables`
+
+### `MoleculeCounts`
+
+```python
+MoleculeCounts(molecules: Sequence)
+```
+
+Number of intact molecules of each exchanged molecule type.
+
+Recorded automatically by `ReplicaExchangeGCMC` when molecules are
+exchanged (`ParticleSystem.set_molecules`), under the reserved name
+`MOLECULE_COUNTS_NAME`. A molecule is a unit as the deletion move
+defines it (`regc.molecules.MoleculeMove.count_units`): atoms with the
+molecule's composition, all partners within the shell around the
+anchor -- here anywhere in the system, not only in the exchange zone.
+Comparing it with the element counts tells intact from dissociated
+adsorbates (CO against C + O).
+
+**Parameters**
+
+- `molecules` (*sequence of MoleculeMove*): The exchanged molecules.
+
+**Constructor**
+
+Set up the counter.
+
+**Parameters**
+
+- `molecules` (*sequence of MoleculeMove*): The exchanged molecules.
+
+#### `MoleculeCounts.labels`
+
+```python
+MoleculeCounts.labels() -> List[str]
+```
+
+Names of the components.
+
+**Returns**
+
+- *list of str*: The molecule names.
+
+#### `MoleculeCounts.metadata`
+
+```python
+MoleculeCounts.metadata() -> dict
+```
+
+JSON-able description.
+
+**Returns**
+
+- *dict*: Type, labels and every molecule's definition.
+
+---
 
 ### `Observable`
 
@@ -5072,6 +6118,138 @@ JSON-able description.
 **Returns**
 
 - *dict*: Type, labels and the function's qualified name.
+
+## `regc.subsurface`
+
+### `Subsurface`
+
+```python
+Subsurface(z_cut: float, z_min: float, species: Tuple[str, ...], delta: float = 0.3, ncmc_steps: int = 10, kernel: str = 'hmc', kernel_steps: int = 1, leapfrog_steps: int = 5, dt: float = 0.0982, friction: float = 0.509, max_disp: float = 0.1, weight: float = 1.0, site_min_distance: float = 1.0) -> None
+```
+
+Settings of the subsurface NCMC channels of a slab.
+
+**Parameters**
+
+- `z_cut` (*float*): z_c, the fixed height separating the subsurface (z < z_c) from the gas region (z >= z_c), in the slab's coordinates (A).
+- `z_min` (*float*): Lower bound of the subsurface region (A).
+- `species` (*sequence of str*): Exchanged species that get a subsurface channel.
+- `delta` (*float, optional*): Radius of the insertion ball around a site (A). Default 0.3.
+- `ncmc_steps` (*int, optional*): Number T of lambda steps of the switching protocol. Default 10.
+- `kernel` (*str, optional*): Propagation at fixed lambda between steps: `'hmc'` (one HMC trajectory of all displaceable atoms, full momentum refresh), `'langevin'` (BAOAB Langevin dynamics whose momenta persist through the whole switch; the shadow work enters the acceptance) or `'mc'` (single-atom Metropolis displacements). Default `'hmc'`.
+- `kernel_steps` (*int, optional*): HMC trajectories, Langevin segments, or MC displacement attempts per displaceable atom, per lambda step. Default 1.
+- `leapfrog_steps` (*int, optional*): Integration steps per HMC trajectory or Langevin segment. Default 5.
+- `dt` (*float, optional*): HMC/Langevin time step in internal units (A sqrt(amu/eV); 1 fs = 0.0982). Default 0.0982 (1 fs).
+- `friction` (*float, optional*): Langevin friction gamma in inverse internal time units (0.05 /fs = 0.509). Default 0.509.
+- `max_disp` (*float, optional*): MC kernel displacement per axis (A). Default 0.1.
+- `weight` (*float, optional*): Relative frequency of each subsurface channel among the GC channels (an atomic gas channel has weight 1). Default 1.
+- `site_min_distance` (*float, optional*): Sites closer than this to a metal atom are dropped (A). Default 1.0.
+
+**Raises**
+
+- *ValueError*: On an empty or inverted region, no species, or bad parameters.
+
+#### `Subsurface.v_delta` (property)
+
+float: Volume of the insertion ball, 4/3 pi delta^3.
+
+#### `Subsurface.signature`
+
+```python
+Subsurface.signature() -> tuple
+```
+
+Hashable description, for checking that every replica uses the same settings.
+
+**Returns**
+
+- *tuple*: Every setting.
+
+#### `Subsurface.metadata`
+
+```python
+Subsurface.metadata() -> dict
+```
+
+JSON-able description.
+
+**Returns**
+
+- *dict*: The settings.
+
+#### `Subsurface.in_region`
+
+```python
+Subsurface.in_region(positions: np.ndarray) -> np.ndarray
+```
+
+Whether positions lie in the subsurface region, z_min <= z < z_cut.
+
+**Parameters**
+
+- `positions` (*numpy.ndarray*): Positions, shape (n, 3).
+
+**Returns**
+
+- *numpy.ndarray*: Boolean array, shape (n,).
+
+#### `Subsurface.sites`
+
+```python
+Subsurface.sites(system) -> np.ndarray
+```
+
+Interstitial sites of the metal: Voronoi vertices of its atoms in the region.
+
+The substrate and frozen atoms, with their periodic images in x and
+y, are tessellated; the vertices in the region and at least
+`site_min_distance` from every metal atom are kept, wrapped into
+the primary cell, and vertices closer than `SITE_MERGE_TOL`
+(minimum image) merged in a deterministic order. A deterministic function of the metal atoms,
+as the proposal density requires.
+
+**Parameters**
+
+- `system` (*SlabSystem*): The configuration.
+
+**Returns**
+
+- *numpy.ndarray*: Site positions, shape (K, 3) (K may be 0).
+
+#### `Subsurface.log_q`
+
+```python
+Subsurface.log_q(y: np.ndarray, sites: np.ndarray, system) -> float
+```
+
+Log density of proposing position y from these sites.
+
+**Parameters**
+
+- `y` (*numpy.ndarray*): The (3,) position.
+- `sites` (*numpy.ndarray*): The sites, shape (K, 3).
+- `system` (*SlabSystem*): For the minimum image.
+
+**Returns**
+
+- *float*: log[(1/K) sum_{k: |y - s_k| < delta} 1/V_delta]; -inf if no site is within delta or y is outside the region.
+
+#### `Subsurface.propose`
+
+```python
+Subsurface.propose(sites: np.ndarray, rng: np.random.Generator) -> np.ndarray
+```
+
+Draw an insertion point: a uniform site, then uniform in its delta-ball.
+
+**Parameters**
+
+- `sites` (*numpy.ndarray*): The sites, shape (K >= 1, 3).
+- `rng` (*numpy.random.Generator*): Random number generator.
+
+**Returns**
+
+- *numpy.ndarray*: The (3,) point (not wrapped).
 
 ## Config runner (`regc.runner`)
 
