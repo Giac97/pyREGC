@@ -365,3 +365,72 @@ def test_shell_composition_splits_core_and_surface():
     f = composition_fractions(meta, {"shells": counts[None], "sgc_counts": np.array([[53.0, 2.0]])},
                               species="Rh")
     assert f["top"][0] == pytest.approx(1 / 42)
+
+
+def test_species_updates_keep_incremental_energies_exact():
+    """Accepted identity / pair swaps replace the species array (PairLJ caches
+    species codes by array identity), so the fast pair-energy path stays exact."""
+    from regc import SlabSystem
+    from regc.calculators import PairLJCalculator
+    calc = PairLJCalculator({("X", "A"): (1.0, 1.0), ("X", "B"): (0.1, 1.0),
+                             ("A", "A"): (0.0, 1.0)})
+    s = SlabSystem(8.0, 8.0, 6.0, calc, exchange_species="X",
+                   substrate_positions=np.array([[2.0, 2.0, 0.0], [4.0, 4.0, 0.0]]),
+                   substrate_species=np.array(["A", "A"]),
+                   positions=np.array([[2.0, 2.0, 1.1]]), species=np.array(["X"]))
+    s.set_sgc_species(["A", "B"])
+    pos = s.positions[0].copy()
+
+    def exact():
+        u_with = calc.total_energy(s)
+        saved = (s.positions, s.species)
+        s.positions, s.species = np.zeros((0, 3)), np.array([], dtype="<U2")
+        u_without = calc.total_energy(s)
+        s.positions, s.species = saved
+        return u_with - u_without
+
+    s.pair_energy_of(pos, exclude=0)                     # warm the cache
+    u0 = calc.total_energy(s)
+    du = s.generic_identity_dU(0, "B")
+    assert s.pair_energy_of(pos, exclude=0) == pytest.approx(exact())   # trial left no trace
+    s.apply_identity(0, "B")
+    assert calc.total_energy(s) - u0 == pytest.approx(du)
+    assert s.pair_energy_of(pos, exclude=0) == pytest.approx(exact())
+    s.apply_pair_swap(0, 1)
+    assert s.pair_energy_of(pos, exclude=0) == pytest.approx(exact())
+
+
+def test_calculator_knows_sgc_species_absent_at_start(tmp_path, monkeypatch):
+    """A pure Pd slab with sgc.species [Pd, Pt]: the calculator (LAMMPS type
+    list, masses, pair_coeff) must already know Pt before the first swap."""
+    import regc.runner as runner
+    seen = []
+
+    class Stop(Exception):
+        pass
+
+    def spy(cfg, species, masses):
+        seen.append(list(species))
+        raise Stop
+    monkeypatch.setattr(runner, "_CalculatorSpec", spy)
+    cfg = {"structure": {"build": {"surface": "fcc111", "symbol": "Pd", "size": [2, 2, 3],
+                                   "a": 3.9}, "n_frozen_layers": 2},
+           "gas": {"species": "O"}, "calculator": {"type": "EMT"},
+           "sgc": {"species": ["Pd", "Pt"], "dmu_eV": {"Pt": 0.1}},
+           "replica_exchange": {"temperatures_K": [300], "mu_eV": [-1.0], "scheme": "regc",
+                                "n_steps": 2},
+           "output": {"directory": str(tmp_path / "out")}}
+    with pytest.raises(Stop):
+        runner.setup_from_config(cfg, verbose=False)
+    assert seen and "Pt" in seen[0] and seen[0][-1] == "O"
+
+
+def test_merge_refuses_different_sgc_settings():
+    from regc.io import merge_samples
+    a = _sim(dmu=(0.0, 9.3), seed=1)
+    b = _sim(dmu=(0.0, 9.5), seed=2)
+    for sim in (a, b):
+        sim.run_regc(n_steps=20, x0=0.5, diffusion="mc", diffusion_steps=1, record_every=5,
+                     verbose=False)
+    with pytest.raises(ValueError, match="semi-grand-canonical"):
+        merge_samples(a, b)

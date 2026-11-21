@@ -23,6 +23,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
+from .engine import NOISE_CONSECUTIVE, NOISE_MIN_NEFF, NOISE_MIN_ROUND_TRIPS
 from .io import save_samples
 
 #: Exit code for "stopped for the time limit, resubmit to continue" (sysexits EX_TEMPFAIL).
@@ -134,8 +135,11 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
                          metadata: Optional[dict] = None,
                          progress: Optional[Callable[[str], None]] = print,
                          energy_tol: float = 1e-6, convergence_mode: str = "blocks",
-                         convergence_bins: Optional[int] = None, convergence_min_neff: float = 10.0,
+                         convergence_bins: Optional[int] = None,
+                         convergence_min_neff: float = NOISE_MIN_NEFF,
                          convergence_median_tol: float = 1.3, convergence_discard: float = 0.2,
+                         convergence_consecutive: int = NOISE_CONSECUTIVE,
+                         convergence_min_round_trips: int = NOISE_MIN_ROUND_TRIPS,
                          **diffusion_kwargs) -> RunStatus:
     """
     Run `sim.run_regc` in checkpointed chunks.
@@ -171,11 +175,15 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
     convergence_bins : int, optional
         Histogram bins. Default 30 (blocks) or 10 (noise).
     convergence_min_neff : float, optional
-        ``'noise'``: independent samples every half must hold. Default 10.
+        ``'noise'``: independent samples every half must hold. Default 50.
     convergence_median_tol : float, optional
         ``'noise'``: the median ratio over the grid must be below this. Default 1.3.
     convergence_discard : float, optional
         ``'noise'``: fraction of the earliest samples left out (equilibration). Default 0.2.
+    convergence_consecutive : int, optional
+        ``'noise'``: checks in a row the criterion must pass. Default 2.
+    convergence_min_round_trips : int, optional
+        ``'noise'``: T round trips every walker must have completed. Default 1.
     time_limit : float, optional
         Seconds: stop (``finished=False``) before starting a chunk that is
         expected to end later than this, measured from the call. Default
@@ -251,6 +259,8 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
                                     "min_neff": float(convergence_min_neff),
                                     "median_tol": float(convergence_median_tol),
                                     "discard": float(convergence_discard),
+                                    "consecutive": int(convergence_consecutive),
+                                    "min_round_trips": int(convergence_min_round_trips),
                                     "every": int(convergence_every)}
     t0, last_chunk = time.time(), 0.0
     while done < n_steps and not converged:
@@ -276,7 +286,8 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
         if (convergence_every is not None and mode == "noise"
                 and (done % convergence_every == 0 or done >= n_steps)):
             detail = sim.rho_u_noise_check(convergence_bins, convergence_tol, convergence_min_neff,
-                                           convergence_median_tol, convergence_discard)
+                                           convergence_median_tol, convergence_discard,
+                                           convergence_consecutive, convergence_min_round_trips)
             detail["step"] = int(done)
             changes.append(detail["max_ratio"])
             converged = detail["converged"]
@@ -309,7 +320,9 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
                 d = sim.convergence_details[-1]
                 conv = (f"  rho(u) halves: TV/noise max {d['max_ratio']:.2f} (tol {convergence_tol:g})"
                         f" median {d['median_ratio']:.2f} (tol {convergence_median_tol:g}),"
-                        f" min n_eff {d['min_neff']:.1f}")
+                        f" min n_eff {d['min_neff']:.1f}"
+                        + (f", T round trips {d['min_round_trips_T']}"
+                           if d.get("min_round_trips_T") is not None else ""))
             elif changes:
                 conv = f"  rho(u) change {changes[-1]:.3f}"
             progress(f"{done:8d}/{n_steps} steps  {time.time() - t0:8.0f} s  mean N = {mean_n:7.2f}"

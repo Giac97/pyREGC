@@ -76,7 +76,8 @@ replica_exchange:
   hmc: {leapfrog_steps: 10, timestep_fs: 1.0}     # used with diffusion: hmc
   record_every: 10
   convergence_every: 2000
-  convergence_tol: 0.05
+  # noise-aware rho(u) stop rule (convergence_mode: noise, the default): stops when
+  # both halves of every replica agree within sampling noise; see MANUAL §6.1
   adsorbed_cutoff: 2.6          # record N_ads: O within 2.6 A of a Pt atom (Pt-O ~ 2.0 A)
   max_disp: 0.3
   seed: 0

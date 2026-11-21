@@ -50,7 +50,8 @@ replica_exchange:
   hmc: {leapfrog_steps: 10, timestep_fs: 0.5}     # used with diffusion: hmc
   record_every: 10
   convergence_every: 2000
-  convergence_tol: 0.05
+  # noise-aware rho(u) stop rule (convergence_mode: noise, the default): stops when
+  # both halves of every replica agree within sampling noise; see MANUAL §6.1
   adsorbed_cutoff: 2.5          # record N_ads: H within 2.5 A of an Fe atom
   max_disp: 0.3
   seed: 0

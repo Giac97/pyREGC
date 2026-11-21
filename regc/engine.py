@@ -82,6 +82,11 @@ def _call_worker(payload: Tuple[Replica, str, dict]) -> Replica:
 # 'cross_right' = (l, m) <-> (l+1, m+1).
 SWAP_TYPES = ('T', 'mu', 'cross_left', 'cross_right')
 
+# defaults of the noise-aware rho(u) stop rule (`ReplicaExchangeGCMC.rho_u_noise_check`)
+NOISE_MIN_NEFF = 50.0          # independent samples per half
+NOISE_CONSECUTIVE = 2          # checks in a row that must pass
+NOISE_MIN_ROUND_TRIPS = 1      # T round trips every walker must have made
+
 
 class ReplicaExchangeGCMC:
     """
@@ -917,8 +922,11 @@ class ReplicaExchangeGCMC:
                  swap_types: Tuple[str, ...] = SWAP_TYPES,
                  convergence_every: Optional[int] = None, convergence_tol: Optional[float] = None,
                  convergence_bins: Optional[int] = None, verbose: bool = True,
-                 convergence_mode: str = "blocks", convergence_min_neff: float = 10.0,
+                 convergence_mode: str = "blocks",
+                 convergence_min_neff: float = NOISE_MIN_NEFF,
                  convergence_median_tol: float = 1.3, convergence_discard: float = 0.2,
+                 convergence_consecutive: int = NOISE_CONSECUTIVE,
+                 convergence_min_round_trips: int = NOISE_MIN_ROUND_TRIPS,
                  trajectory_dir: Optional[str] = None, trajectory_every: Optional[int] = None,
                  **diffusion_kwargs) -> bool:
         """
@@ -994,13 +1002,18 @@ class ReplicaExchangeGCMC:
             units of the noise floor, see `rho_u_noise_check`).
         convergence_min_neff : float, optional
             ``'noise'`` only: every replica's halves must hold at least this
-            many independent samples before the run may stop. Default 10.
+            many independent samples before the run may stop. Default 50.
         convergence_median_tol : float, optional
             ``'noise'`` only: the median ratio over the grid must also be below
             this. Default 1.3.
         convergence_discard : float, optional
             ``'noise'`` only: fraction of the earliest samples left out of the
             halves (equilibration). Default 0.2.
+        convergence_consecutive : int, optional
+            ``'noise'`` only: checks in a row the criterion must pass. Default 2.
+        convergence_min_round_trips : int, optional
+            ``'noise'`` only: T round trips every walker must have completed.
+            Default 1.
         verbose : bool, optional
             Print progress about ten times over the run. Default is True.
         trajectory_dir : str, optional
@@ -1040,6 +1053,8 @@ class ReplicaExchangeGCMC:
                                          "min_neff": float(convergence_min_neff),
                                          "median_tol": float(convergence_median_tol),
                                          "discard": float(convergence_discard),
+                                         "consecutive": int(convergence_consecutive),
+                                         "min_round_trips": int(convergence_min_round_trips),
                                          "every": int(convergence_every)}
         n_at_last_check = n_at_check_before = None
 
@@ -1124,7 +1139,8 @@ class ReplicaExchangeGCMC:
                     and step % convergence_every == 0 and mode == "noise"):
                 res = self.rho_u_noise_check(convergence_bins, convergence_tol,
                                              convergence_min_neff, convergence_median_tol,
-                                             convergence_discard)
+                                             convergence_discard, convergence_consecutive,
+                                             convergence_min_round_trips)
                 res["step"] = int(self._status_offset + step)
                 self.convergence_history.append(res["max_ratio"])
                 self.convergence_details.append(res)
@@ -1211,8 +1227,10 @@ class ReplicaExchangeGCMC:
         return (r.state.beta * U
                 + N_s @ (np.log(r.state.lambda_cubed_vec) - r.state.beta * r.state.mu_vec))
 
-    def rho_u_noise_check(self, bins: int = 10, tol: float = 3.0, min_neff: float = 10.0,
-                          median_tol: float = 1.3, discard: float = 0.2) -> dict:
+    def rho_u_noise_check(self, bins: int = 10, tol: float = 3.0,
+                          min_neff: float = NOISE_MIN_NEFF, median_tol: float = 1.3,
+                          discard: float = 0.2, consecutive: int = NOISE_CONSECUTIVE,
+                          min_round_trips: int = NOISE_MIN_ROUND_TRIPS) -> dict:
         """
         Noise-aware rho(u) convergence: both halves of every replica agree within sampling noise.
 
@@ -1235,7 +1253,8 @@ class ReplicaExchangeGCMC:
             largest of 64 is typically 2.3-2.5.
         min_neff : float, optional
             ... every half holds at least this many independent samples
-            (otherwise the floor is so high that any chain passes). Default 10.
+            (otherwise the floor is so high that any chain passes, and the
+            inefficiency itself is underestimated). Default 50.
         median_tol : float, optional
             ... and the median ratio over the grid is below this (weak drift
             shared by many replicas, which the maximum cannot resolve).
@@ -1243,13 +1262,26 @@ class ReplicaExchangeGCMC:
         discard : float, optional
             Fraction of the earliest samples left out before halving (the
             equilibration transient). Default 0.2.
+        consecutive : int, optional
+            ... and the criterion held at this many checks in a row, this
+            one included (the previous ones from `convergence_details`), so
+            a single lucky check does not stop the run. Default 2.
+        min_round_trips : int, optional
+            ... and every walker has completed at least this many round
+            trips along T (a halves test of one state cannot see a walker
+            stuck in a metastable phase for the whole run). Ignored with a
+            single temperature or without walker tracking. Default 1.
 
         Returns
         -------
         dict
             ``max_ratio``, ``median_ratio``, ``worst`` (grid point of the
-            largest ratio), ``min_neff``, ``n_samples``, ``converged`` and
-            ``ratios`` (one per grid point, in grid-key order).
+            largest ratio), ``min_neff``, ``n_constant`` (grid points with a
+            constant u, e.g. empty on a rigid surface: no information, left
+            out of the median and of `min_neff`), ``min_round_trips_T``
+            (None when not tracked), ``n_samples``, ``passed`` (this check's
+            criterion), ``converged`` (passed `consecutive` times in a row)
+            and ``ratios`` (one per grid point, in grid-key order).
         """
         from .diagnostics import rho_u_noise_tv
         keys = sorted(self.grid)
@@ -1258,13 +1290,27 @@ class ReplicaExchangeGCMC:
             u = self._reduced_energies(k)
             res[k] = rho_u_noise_tv(u[int(discard * len(u)):], bins)
         ratios = np.array([res[k]["ratio"] for k in keys])
-        neff = np.array([res[k]["n_eff"] for k in keys])
+        live = np.array([not res[k]["constant"] for k in keys])
+        neff = np.array([res[k]["n_eff"] for k in keys])[live]
         worst = keys[int(np.argmax(ratios))]
-        return {"max_ratio": float(ratios.max()), "median_ratio": float(np.median(ratios)),
-                "worst": list(worst), "min_neff": float(neff.min()),
+        median = float(np.median(ratios[live])) if live.any() else 0.0
+        min_neff_now = float(neff.min()) if live.any() else 0.0
+        rt = None
+        if self.mu_grid.shape[0] >= 2 and getattr(self, "round_trips", None):
+            rt = int(self.round_trip_counts()["T"].min())
+        passed = bool(ratios.max() < tol and median < median_tol
+                      and (min_neff_now >= min_neff or not live.any())
+                      and (rt is None or rt >= min_round_trips))
+        previous = [bool(d.get("passed", d.get("converged", False)))
+                    for d in self.convergence_details[len(self.convergence_details)
+                                                      - (int(consecutive) - 1):]
+                    ] if consecutive > 1 else []
+        converged = passed and len(previous) == int(consecutive) - 1 and all(previous)
+        return {"max_ratio": float(ratios.max()), "median_ratio": median,
+                "worst": list(worst), "min_neff": min_neff_now,
+                "n_constant": int((~live).sum()), "min_round_trips_T": rt,
                 "n_samples": int(len(self.samples[keys[0]]['U'])),
-                "converged": bool(ratios.max() < tol and np.median(ratios) < median_tol
-                                  and neff.min() >= min_neff),
+                "passed": passed, "converged": bool(converged),
                 "ratios": [float(x) for x in ratios]}
 
     def rho_u_change(self, n_prev: int, bins: int = 30, n_start: int = 0) -> float:
@@ -1418,6 +1464,17 @@ class ReplicaExchangeGCMC:
             raise ValueError(f"checkpoint {path}: adsorbed_cutoff was {saved_cutoff}, now "
                              f"{self.adsorbed_cutoff}; N_ads would mix two definitions")
         saved_obs = st.get("observables_meta", {})
+        from .observables import SUBSURFACE_COUNTS_NAME
+        if (SUBSURFACE_COUNTS_NAME in self.observables_meta
+                and SUBSURFACE_COUNTS_NAME not in saved_obs
+                and saved_obs == {k: v for k, v in self.observables_meta.items()
+                                  if k != SUBSURFACE_COUNTS_NAME}):
+            # written before the subsurface count was recorded automatically: continue
+            # without it rather than refuse (it can't be backfilled for the old samples)
+            warnings.warn(f"checkpoint {path} predates the automatic subsurface count; "
+                          f"continuing without the '{SUBSURFACE_COUNTS_NAME}' observable",
+                          stacklevel=2)
+            self.observables = [o for o in self.observables if o.name != SUBSURFACE_COUNTS_NAME]
         if saved_obs != self.observables_meta:
             raise ValueError(f"checkpoint {path} recorded observables {sorted(saved_obs)}, this "
                              f"simulation {sorted(self.observables_meta)} (with the same "

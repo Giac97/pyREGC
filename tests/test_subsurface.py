@@ -277,3 +277,22 @@ def test_engine_records_subsurface_counts_and_status(tmp_path):
     for key in ("mean_N_sub", "current_N_sub", "sub_accepted", "sub_acceptance"):
         assert key in reps and np.shape(reps[key]) == (2, 1)
     assert sum(r.n_accepts.get("insert_sub:X", 0) for r in sim.grid.values()) > 0
+
+
+def test_checkpoint_from_before_the_automatic_count_resumes(tmp_path):
+    """Checkpoints written before the subsurface count was recorded automatically
+    continue (with a warning, without the count) instead of being refused."""
+    from regc.observables import SUBSURFACE_COUNTS_NAME
+
+    def factory(rng):
+        return _slab(ncmc_steps=2, kernel_steps=0, weight=5.0)
+    old = ReplicaExchangeGCMC([1.0, 1.5], np.array([[-1.0], [-1.5]]), factory, seed=0)
+    old.observables = [o for o in old.observables if o.name != SUBSURFACE_COUNTS_NAME]
+    old.run_regc(40, x0=0.95, diffusion="mc", diffusion_steps=1, record_every=10, verbose=False)
+    old.save_checkpoint(str(tmp_path / "ckpt.pkl"))
+    new = ReplicaExchangeGCMC([1.0, 1.5], np.array([[-1.0], [-1.5]]), factory, seed=0)
+    with pytest.warns(UserWarning, match="predates the automatic subsurface count"):
+        new.load_checkpoint(str(tmp_path / "ckpt.pkl"))
+    assert SUBSURFACE_COUNTS_NAME not in new.observables_meta
+    new.run_regc(20, x0=0.95, diffusion="mc", diffusion_steps=1, record_every=10, verbose=False)
+    assert len(new.samples[(0, 0)]["U"]) == 6

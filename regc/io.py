@@ -213,7 +213,8 @@ def merge_samples(*sets, labels: Optional[Sequence[str]] = None) -> SampleSet:
     Raises
     ------
     ValueError
-        With fewer than two sets, or if they are not compatible.
+        With fewer than two sets, or if they are not compatible (other
+        species, Lambda^3 convention, substrate, or SGC settings).
     """
     if len(sets) < 2:
         raise ValueError("merge_samples needs at least two runs")
@@ -234,6 +235,11 @@ def merge_samples(*sets, labels: Optional[Sequence[str]] = None) -> SampleSet:
     metas = [dict(getattr(s, "observables_meta", None) or {}) for s in sets]
     common = {name: m for name, m in metas[0].items() if all(mm.get(name) == m for mm in metas[1:])}
     dropped = sorted(set().union(*metas) - set(common))
+    from .observables import SGC_COUNTS_NAME
+    if SGC_COUNTS_NAME in dropped:   # the field term -beta dmu N_k would silently vanish
+        raise ValueError("runs differ in their semi-grand-canonical settings (sgc species, "
+                         "dmu or bulk composition, or SGC in some runs only): they sample "
+                         "different ensembles and cannot be merged")
     if dropped:
         warnings.warn(f"observables {dropped} are not recorded identically by every run: dropped "
                       f"from the merged set", stacklevel=2)

@@ -2777,7 +2777,7 @@ substrate motion already happens via HMC's joint trajectory when
 #### `ReplicaExchangeGCMC.run_regc`
 
 ```python
-ReplicaExchangeGCMC.run_regc(n_steps: int, x0: float = 0.99, diffusion: str = 'mc', diffusion_steps: int = 10, record_every: int = 100, burn_in_steps: int = 0, swap_types: Tuple[str, ...] = ('T', 'mu', 'cross_left', 'cross_right'), convergence_every: Optional[int] = None, convergence_tol: Optional[float] = None, convergence_bins: Optional[int] = None, verbose: bool = True, convergence_mode: str = 'blocks', convergence_min_neff: float = 10.0, convergence_median_tol: float = 1.3, convergence_discard: float = 0.2, trajectory_dir: Optional[str] = None, trajectory_every: Optional[int] = None, **diffusion_kwargs) -> bool
+ReplicaExchangeGCMC.run_regc(n_steps: int, x0: float = 0.99, diffusion: str = 'mc', diffusion_steps: int = 10, record_every: int = 100, burn_in_steps: int = 0, swap_types: Tuple[str, ...] = ('T', 'mu', 'cross_left', 'cross_right'), convergence_every: Optional[int] = None, convergence_tol: Optional[float] = None, convergence_bins: Optional[int] = None, verbose: bool = True, convergence_mode: str = 'blocks', convergence_min_neff: float = 50.0, convergence_median_tol: float = 1.3, convergence_discard: float = 0.2, convergence_consecutive: int = 2, convergence_min_round_trips: int = 1, trajectory_dir: Optional[str] = None, trajectory_every: Optional[int] = None, **diffusion_kwargs) -> bool
 ```
 
 Run the REGC scheme exactly as in [ZSG] Sec. II A / Fig. 1.
@@ -2822,9 +2822,11 @@ that convention pass `1 - x0`.
 - `convergence_tol` (*float, optional*): `convergence_mode='blocks'`: converged when the largest total-variation distance between the rho(u) of the two latest inter-check blocks, over all grid points, is below this (default 0.05). Two blocks of n samples from the same distribution still differ by roughly sqrt(convergence_bins / (pi n)) from sampling noise alone, and correlated samples count less, so with short blocks this can never be met; the first verdict needs three checks. `convergence_mode='noise'`: the largest ratio of that distance (first vs second half of all samples) to its expected noise floor (`rho_u_noise_check`); default 3.0.
 - `convergence_bins` (*int, optional*): Histogram bins for rho(u). Default 30 (blocks) or 10 (noise).
 - `convergence_mode` (*str, optional*): `'blocks'` ([ZSG]'s criterion on consecutive fixed blocks; the default, unchanged) or `'noise'` (growing halves, tolerance in units of the noise floor, see `rho_u_noise_check`).
-- `convergence_min_neff` (*float, optional*): `'noise'` only: every replica's halves must hold at least this many independent samples before the run may stop. Default 10.
+- `convergence_min_neff` (*float, optional*): `'noise'` only: every replica's halves must hold at least this many independent samples before the run may stop. Default 50.
 - `convergence_median_tol` (*float, optional*): `'noise'` only: the median ratio over the grid must also be below this. Default 1.3.
 - `convergence_discard` (*float, optional*): `'noise'` only: fraction of the earliest samples left out of the halves (equilibration). Default 0.2.
+- `convergence_consecutive` (*int, optional*): `'noise'` only: checks in a row the criterion must pass. Default 2.
+- `convergence_min_round_trips` (*int, optional*): `'noise'` only: T round trips every walker must have completed. Default 1.
 - `verbose` (*bool, optional*): Print progress about ten times over the run. Default is True.
 - `trajectory_dir` (*str, optional*): As in `run`. Default is None.
 - `trajectory_every` (*int, optional*): As in `run`; defaults to `record_every`.
@@ -2841,7 +2843,7 @@ that convention pass `1 - x0`.
 #### `ReplicaExchangeGCMC.rho_u_noise_check`
 
 ```python
-ReplicaExchangeGCMC.rho_u_noise_check(bins: int = 10, tol: float = 3.0, min_neff: float = 10.0, median_tol: float = 1.3, discard: float = 0.2) -> dict
+ReplicaExchangeGCMC.rho_u_noise_check(bins: int = 10, tol: float = 3.0, min_neff: float = 50.0, median_tol: float = 1.3, discard: float = 0.2, consecutive: int = 2, min_round_trips: int = 1) -> dict
 ```
 
 Noise-aware rho(u) convergence: both halves of every replica agree within sampling noise.
@@ -2858,13 +2860,15 @@ so the noise floor falls as 1/sqrt(n) (consecutive fixed blocks,
 
 - `bins` (*int, optional*): Histogram bins. Default 10.
 - `tol` (*float, optional*): Converged when every ratio is below this (strong drift in any replica). Default 3.0: for a stationary chain each ratio is about 1 with a 95th percentile near 2 when samples are correlated, so the largest of 64 is typically 2.3-2.5.
-- `min_neff` (*float, optional*): ... every half holds at least this many independent samples (otherwise the floor is so high that any chain passes). Default 10.
+- `min_neff` (*float, optional*): ... every half holds at least this many independent samples (otherwise the floor is so high that any chain passes, and the inefficiency itself is underestimated). Default 50.
 - `median_tol` (*float, optional*): ... and the median ratio over the grid is below this (weak drift shared by many replicas, which the maximum cannot resolve). Default 1.3.
 - `discard` (*float, optional*): Fraction of the earliest samples left out before halving (the equilibration transient). Default 0.2.
+- `consecutive` (*int, optional*): ... and the criterion held at this many checks in a row, this one included (the previous ones from `convergence_details`), so a single lucky check does not stop the run. Default 2.
+- `min_round_trips` (*int, optional*): ... and every walker has completed at least this many round trips along T (a halves test of one state cannot see a walker stuck in a metastable phase for the whole run). Ignored with a single temperature or without walker tracking. Default 1.
 
 **Returns**
 
-- *dict*: `max_ratio`, `median_ratio`, `worst` (grid point of the largest ratio), `min_neff`, `n_samples`, `converged` and `ratios` (one per grid point, in grid-key order).
+- *dict*: `max_ratio`, `median_ratio`, `worst` (grid point of the largest ratio), `min_neff`, `n_constant` (grid points with a constant u, e.g. empty on a rigid surface: no information, left out of the median and of `min_neff`), `min_round_trips_T` (None when not tracked), `n_samples`, `passed` (this check's criterion), `converged` (passed `consecutive` times in a row) and `ratios` (one per grid point, in grid-key order).
 
 #### `ReplicaExchangeGCMC.rho_u_change`
 
@@ -3085,7 +3089,7 @@ SWAP_TYPES = ('T', 'mu', 'cross_left', 'cross_right')
 ### `run_with_checkpoints`
 
 ```python
-run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000, x0: float = 0.99, diffusion: str = 'mc', diffusion_steps: int = 10, record_every: int = 100, convergence_every: Optional[int] = None, convergence_tol: Optional[float] = None, time_limit: Optional[float] = None, resume: bool = True, overwrite: bool = False, metadata: Optional[dict] = None, progress: Optional[Callable[[str], None]] = <built-in function print>, energy_tol: float = 1e-06, convergence_mode: str = 'blocks', convergence_bins: Optional[int] = None, convergence_min_neff: float = 10.0, convergence_median_tol: float = 1.3, convergence_discard: float = 0.2, **diffusion_kwargs) -> RunStatus
+run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000, x0: float = 0.99, diffusion: str = 'mc', diffusion_steps: int = 10, record_every: int = 100, convergence_every: Optional[int] = None, convergence_tol: Optional[float] = None, time_limit: Optional[float] = None, resume: bool = True, overwrite: bool = False, metadata: Optional[dict] = None, progress: Optional[Callable[[str], None]] = <built-in function print>, energy_tol: float = 1e-06, convergence_mode: str = 'blocks', convergence_bins: Optional[int] = None, convergence_min_neff: float = 50.0, convergence_median_tol: float = 1.3, convergence_discard: float = 0.2, convergence_consecutive: int = 2, convergence_min_round_trips: int = 1, **diffusion_kwargs) -> RunStatus
 ```
 
 Run `sim.run_regc` in checkpointed chunks.
@@ -3101,9 +3105,11 @@ Run `sim.run_regc` in checkpointed chunks.
 - `convergence_tol` (*float, optional*): `convergence_mode='blocks'`: converged when rho(u) of the samples since the last check and of the interval before it differ (largest total-variation distance) by less than this; see `ReplicaExchangeGCMC.rho_u_change` for the noise floor. Default 0.05. `'noise'`: the largest ratio of the distance between the two halves of all samples to its noise floor (`ReplicaExchangeGCMC.rho_u_noise_check`). Default 3.0.
 - `convergence_mode` (*str, optional*): `'blocks'` (default) or `'noise'`.
 - `convergence_bins` (*int, optional*): Histogram bins. Default 30 (blocks) or 10 (noise).
-- `convergence_min_neff` (*float, optional*): `'noise'`: independent samples every half must hold. Default 10.
+- `convergence_min_neff` (*float, optional*): `'noise'`: independent samples every half must hold. Default 50.
 - `convergence_median_tol` (*float, optional*): `'noise'`: the median ratio over the grid must be below this. Default 1.3.
 - `convergence_discard` (*float, optional*): `'noise'`: fraction of the earliest samples left out (equilibration). Default 0.2.
+- `convergence_consecutive` (*int, optional*): `'noise'`: checks in a row the criterion must pass. Default 2.
+- `convergence_min_round_trips` (*int, optional*): `'noise'`: T round trips every walker must have completed. Default 1.
 - `time_limit` (*float, optional*): Seconds: stop (`finished=False`) before starting a chunk that is expected to end later than this, measured from the call. Default None (no limit).
 - `resume` (*bool, optional*): Continue the run saved in `out_dir` if there is one. Default True.
 - `overwrite` (*bool, optional*): Start afresh even if `out_dir` holds a run (with `resume=False`). Default False.

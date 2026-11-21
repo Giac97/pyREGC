@@ -68,7 +68,36 @@ def test_drift_is_detected():
 
 def test_short_or_constant_series():
     assert rho_u_noise_tv(np.arange(5.0))["n_eff"] == 0.0
-    assert rho_u_noise_tv(np.ones(100))["ratio"] == 0.0
+    const = rho_u_noise_tv(np.ones(100))
+    assert const["ratio"] == 0.0 and const["constant"] and const["n_eff"] == np.inf
+
+
+def test_constant_replicas_do_not_block_convergence():
+    """Empty replicas of an ideal gas keep u exactly constant: no information,
+    so they must neither block the stop (n_eff) nor pull the median down."""
+    sim = ReplicaExchangeGCMC([1.0, 1.5], [[-1.0, -40.0], [-1.5, -60.0]],
+                              lambda rng: LJSystem(3.0, ZeroCalculator()), seed=0)
+    converged = sim.run_regc(n_steps=200000, x0=0.9, diffusion='mc', diffusion_steps=0,
+                             record_every=5, convergence_every=5000, convergence_mode="noise",
+                             convergence_min_neff=30, verbose=False)
+    last = sim.convergence_details[-1]
+    assert converged and last["n_constant"] == 2 and last["min_neff"] >= 30
+
+
+def test_stop_needs_consecutive_passes_and_round_trips():
+    sim = _ideal_sim()
+    converged = sim.run_regc(n_steps=200000, x0=0.9, diffusion='mc', diffusion_steps=0,
+                             record_every=5, convergence_every=5000, convergence_mode="noise",
+                             convergence_min_neff=30, convergence_consecutive=3, verbose=False)
+    passed = [c["passed"] for c in sim.convergence_details]
+    assert converged and passed[-3:] == [True] * 3
+    assert not any(c["converged"] for c in sim.convergence_details[:-1])
+    assert sim.convergence_details[-1]["min_round_trips_T"] >= 1
+    sim = _ideal_sim()
+    assert not sim.run_regc(n_steps=30000, x0=0.9, diffusion='mc', diffusion_steps=0,
+                            record_every=5, convergence_every=5000, convergence_mode="noise",
+                            convergence_min_neff=30, convergence_min_round_trips=10 ** 6,
+                            verbose=False)
 
 
 def test_fixed_blocks_do_not_shrink_but_the_noise_floor_does():
@@ -147,7 +176,8 @@ def test_runner_convergence_keys():
     assert _convergence_settings({})["convergence_mode"] == "noise"
     assert _convergence_settings({"convergence_mode": "blocks", "convergence_tol": 0.05}) == {
         "convergence_mode": "blocks", "convergence_tol": 0.05, "convergence_bins": None,
-        "convergence_min_neff": 10.0, "convergence_median_tol": 1.3, "convergence_discard": 0.2}
+        "convergence_min_neff": 50.0, "convergence_median_tol": 1.3, "convergence_discard": 0.2,
+        "convergence_consecutive": 2, "convergence_min_round_trips": 1}
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         _convergence_settings({"convergence_every": 1000, "convergence_tol": 0.0})

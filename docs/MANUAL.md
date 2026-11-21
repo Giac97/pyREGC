@@ -850,8 +850,18 @@ One REGC step:
      second halves of all samples are compared, in units of the
      distance a stationary chain would show. The run stops when the
      largest ratio is below `convergence_tol` (3.0), the median below
-     `convergence_median_tol` (1.3), and every half holds at least
-     `convergence_min_neff` (10) independent samples.
+     `convergence_median_tol` (1.3), every half holds at least
+     `convergence_min_neff` (50) independent samples, and every walker
+     has made `convergence_min_round_trips` (1) round trips along T. All
+     of this must hold at `convergence_consecutive` (2) checks in a row.
+     The independent samples come from the statistical inefficiency of
+     the whole window, not of each half: short halves underestimate it.
+     Replicas whose u never changes, for example empty ones on a rigid
+     surface, carry no information and are left out.
+   - Comparing halves only sees changes inside the window. A relaxation
+     slower than the whole run looks stationary, and a state held by one
+     walker stuck in a metastable phase passes. The n_eff, round-trip and
+     consecutive-check conditions guard against stopping on such a run.
    Fixed blocks cannot pass when samples are strongly correlated: with
    200-sample blocks and a statistical inefficiency of 60 the distance
    stays near 0.4 however long the run.
@@ -2779,7 +2789,8 @@ The ladder: give `temperatures_K` and **exactly one** of `pressures` or
 | `convergence_every` | off | ρ(u) convergence checks every this many steps. |
 | `convergence_mode` | `noise` | `noise`: halves of all samples, in units of the noise floor; `blocks`: consecutive blocks, absolute tolerance. |
 | `convergence_tol` | 3.0 (noise), 0.05 (blocks) | Largest replica ratio (noise) or largest change (blocks). |
-| `convergence_median_tol`, `convergence_min_neff`, `convergence_bins` | 1.3, 10, 10 | Noise mode: median ratio, independent samples per half, histogram bins (30 for blocks). |
+| `convergence_median_tol`, `convergence_min_neff`, `convergence_bins` | 1.3, 50, 10 | Noise mode: median ratio, independent samples per half, histogram bins (30 for blocks). |
+| `convergence_consecutive`, `convergence_min_round_trips` | 2, 1 | Noise mode: checks in a row that must pass; T round trips every walker must have made. |
 | `convergence_discard` | 0.2 | Noise mode: fraction of the earliest samples left out before halving (equilibration). |
 | `swap_types` | all four | Subset of `[T, mu, cross_left, cross_right]`. |
 | `displace_substrate` | false | With `mc`: move displaceable substrate atoms too. |
@@ -2925,7 +2936,7 @@ Per-sample records for re-evaluation with other potentials ([§9.6](#96-other-po
 | `heat_capacity` | false | Compute C_V/k_B ([§9.2](#92-heat-capacity)) and its ridges; writes `<plot>_heat_capacity.png`. |
 | `rdf_states` | – | `[[T_K, p], ...]`: plot every `rdf` observable at these states (`<plot>_rdf_<name>.png`). |
 | `export_configurations` | – | `phases` or `grid`, or `{mode, n_T, n_p, min_cells, tile}` (grid defaults 5 × 6, `tile: true`): write `configurations_<mode>.extxyz` (+ `_tiled`) from the stored configurations ([§9.3](#93-the-structures-behind-the-phase-diagram)). Needs `configurations: {save: true}`. |
-| `merge` | – | Output directories of other runs of the same system (same structure, calculator, species, reservoirs, checked from `run_metadata.json`): their samples are analysed together with this run's ([§9.5](#95-filling-ladder-gaps-merged-runs-and-the-ladder-advisor)), and the structure export reads every run's configurations. |
+| `merge` | – | Output directories of other runs of the same system (same structure, calculator, species, reservoirs and `sgc` settings, checked from `run_metadata.json`): their samples are analysed together with this run's ([§9.5](#95-filling-ladder-gaps-merged-runs-and-the-ladder-advisor)), and the structure export reads every run's configurations. |
 | `suggest_ladder` | – | `true`, or `{target_overlap: 0.1, max_insert: 4}`: write `ladder_suggestion.yaml`, the fill runs (temperatures and pressures or μ) that would lift every neighbouring pair to the target overlap. |
 | `potentials` | – | Names of potentials evaluated with `regc-reevaluate`: for each, the coverage map reweighted to it (`<plot>_<name>.png`), its difference from the sampling potential's (`_difference`), and its effective sample size (`_ess`); `theta_<name>` and `ess_<name>` in `phase_diagram_data.npz`. Cells with fewer than `max(min_ess, 1)` effective samples are greyed. |
 | `bootstrap` | – | `true`, or `{n: 100, seed: 0, level: 0.95, min_agreement: 0.8, min_support: 0.95}`: block-bootstrap the coverage, most-probable-N and (with `heat_capacity`) C_V maps ([§9.4](#94-reliability)). Writes the intervals and `<plot>_uncertainty.png`; hatches most-probable cells whose label is kept in fewer than `min_agreement` of the resamples; shows only C_V peaks with support ≥ `min_support` that are not on the sampled pressures. |

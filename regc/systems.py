@@ -274,12 +274,14 @@ class ParticleSystem:
             U(new) - U(old).
         """
         u0 = self.calculator.total_energy(self)
-        old = self.substrate_species[i]
-        self.substrate_species[i] = new_species
+        old = self.substrate_species
+        trial = old.copy()       # never mutate in place: calculators cache by array identity
+        trial[i] = new_species
+        self.substrate_species = trial
         try:
             u1 = self.calculator.total_energy(self)
         finally:
-            self.substrate_species[i] = old
+            self.substrate_species = old
         return u1 - u0
 
     def generic_pair_swap_dU(self, i: int, j: int) -> float:
@@ -299,12 +301,14 @@ class ParticleSystem:
             U(swapped) - U(current).
         """
         u0 = self.calculator.total_energy(self)
-        si, sj = self.substrate_species[i], self.substrate_species[j]
-        self.substrate_species[i], self.substrate_species[j] = sj, si
+        old = self.substrate_species
+        trial = old.copy()       # never mutate in place: calculators cache by array identity
+        trial[[i, j]] = old[[j, i]]
+        self.substrate_species = trial
         try:
             u1 = self.calculator.total_energy(self)
         finally:
-            self.substrate_species[i], self.substrate_species[j] = si, sj
+            self.substrate_species = old
         return u1 - u0
 
     def apply_pair_swap(self, i: int, j: int) -> None:
@@ -316,8 +320,9 @@ class ParticleSystem:
         i, j : int
             Indices into the substrate arrays.
         """
-        si, sj = self.substrate_species[i], self.substrate_species[j]
-        self.substrate_species[i], self.substrate_species[j] = sj, si
+        sp = self.substrate_species.copy()   # a new array: calculators cache by identity
+        sp[[i, j]] = sp[[j, i]]
+        self.substrate_species = sp
 
     def apply_identity(self, i: int, new_species: str) -> None:
         """
@@ -330,7 +335,9 @@ class ParticleSystem:
         new_species : str
             Its new species.
         """
-        self.substrate_species[i] = new_species
+        sp = self.substrate_species.copy()   # a new array: calculators cache by identity
+        sp[i] = new_species
+        self.substrate_species = sp
 
     # -- molecular insertion / deletion (regc.molecules) ---------------------------------
     def set_molecules(self, molecules: Sequence, atomic_exchange: Optional[Sequence[str]] = None

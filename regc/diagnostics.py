@@ -107,14 +107,22 @@ def rho_u_noise_tv(u, bins: int = 10) -> Dict[str, float]:
     -------
     dict
         ``tv``, ``floor``, ``ratio`` (tv / floor), ``g`` (statistical
-        inefficiency of u, mean of the two halves) and ``n_eff`` (the smaller
-        number of independent samples of the two halves, N / g). For fewer
-        than 8 samples or a constant series: ratio 0 and n_eff 0.
+        inefficiency of the whole series) and ``n_eff`` (independent samples
+        per half, N / (2 g); g over the whole series rather than within each
+        half, which is biased low for short halves and blind to a shift
+        between them), and ``constant`` (bool). Fewer than 8 samples: ratio
+        0 and n_eff 0. A constant series (e.g. an empty replica on a rigid
+        surface) carries no information either way: ratio 0, n_eff inf and
+        ``constant`` True.
     """
     u = np.asarray(u, dtype=float)
     n = u.size
-    if n < 8 or np.ptp(u) == 0.0:
-        return {"tv": 0.0, "floor": float("inf"), "ratio": 0.0, "g": 1.0, "n_eff": 0.0}
+    if n < 8:
+        return {"tv": 0.0, "floor": float("inf"), "ratio": 0.0, "g": 1.0, "n_eff": 0.0,
+                "constant": False}
+    if np.ptp(u) <= 1e-12 * max(1.0, float(np.abs(u).max())):
+        return {"tv": 0.0, "floor": float("inf"), "ratio": 0.0, "g": 1.0,
+                "n_eff": float("inf"), "constant": True}
     h = n // 2
     halves = (u[:h], u[h:])
     edges = np.histogram_bin_edges(u, bins=bins)
@@ -129,10 +137,11 @@ def rho_u_noise_tv(u, bins: int = 10) -> Dict[str, float]:
         g2 = statistical_inefficiency((idx[1] == k).astype(float))
         var[k] = p[k] * (1.0 - p[k]) * (g1 / len(halves[0]) + g2 / len(halves[1]))
     floor = float(0.5 * np.sqrt(2.0 / np.pi) * np.sqrt(var).sum())
-    g = 0.5 * (statistical_inefficiency(halves[0]) + statistical_inefficiency(halves[1]))
+    g = statistical_inefficiency(u)
     n_eff = min(len(halves[0]), len(halves[1])) / g
     ratio = tv / floor if floor > 0 else 0.0
-    return {"tv": tv, "floor": floor, "ratio": float(ratio), "g": float(g), "n_eff": float(n_eff)}
+    return {"tv": tv, "floor": floor, "ratio": float(ratio), "g": float(g), "n_eff": float(n_eff),
+            "constant": False}
 
 
 def replica_inefficiencies(source, lambda_cubed_of_T: Optional[Callable] = None) -> Dict:

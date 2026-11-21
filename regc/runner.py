@@ -150,7 +150,8 @@ _RE_COMMON = {"temperatures_K", "mu_eV", "pressures", "pressure_unit", "scheme",
 _RE_SCHEME = {
     "regc": {"n_steps", "x0", "diffusion", "diffusion_steps", "burn_in_steps",
              "convergence_every", "convergence_tol", "convergence_mode", "convergence_bins",
-             "convergence_min_neff", "convergence_median_tol", "convergence_discard", "swap_types",
+             "convergence_min_neff", "convergence_median_tol", "convergence_discard",
+             "convergence_consecutive", "convergence_min_round_trips", "swap_types",
              "displace_substrate",
              "md"},
     "sweep": {"n_cycles", "sweeps_per_cycle", "exchange_every", "burn_in_cycles",
@@ -1686,8 +1687,12 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
     masses = _gas_masses(gas_cfg, species)
     calc_cfg = config.get("calculator", {"type": "EMT"})
 
+    # species the slab can turn into by SGC swaps, even if absent at the start
+    sgc_species = [str(x) for x in (config.get("sgc") or {}).get("species", [])]
+
     def calc_spec_of(slab_species):
-        return _CalculatorSpec(calc_cfg, list(dict.fromkeys(list(slab_species) + species)), masses)
+        return _CalculatorSpec(calc_cfg, list(dict.fromkeys(list(slab_species) + sgc_species
+                                                            + species)), masses)
 
     # ---- structure -----------------------------------------------------------
     struct_cfg = config["structure"]
@@ -1993,7 +1998,8 @@ def _convergence_settings(re_cfg: Dict[str, Any]) -> Dict[str, Any]:
     -------
     dict
         ``convergence_mode``, ``convergence_tol``, ``convergence_bins``,
-        ``convergence_min_neff``, ``convergence_median_tol``, ``convergence_discard`` for
+        ``convergence_min_neff``, ``convergence_median_tol``, ``convergence_discard``,
+        ``convergence_consecutive``, ``convergence_min_round_trips`` for
         `run_with_checkpoints` / `run_regc`.
 
     Raises
@@ -2001,6 +2007,7 @@ def _convergence_settings(re_cfg: Dict[str, Any]) -> Dict[str, Any]:
     ValueError
         On an unknown mode.
     """
+    from .engine import NOISE_CONSECUTIVE, NOISE_MIN_NEFF, NOISE_MIN_ROUND_TRIPS
     mode = str(re_cfg.get("convergence_mode", "noise")).lower()
     if mode not in ("noise", "blocks"):
         raise ValueError(f"replica_exchange.convergence_mode must be noise or blocks, got {mode!r}")
@@ -2015,8 +2022,14 @@ def _convergence_settings(re_cfg: Dict[str, Any]) -> Dict[str, Any]:
     bins = re_cfg.get("convergence_bins")
     return {"convergence_mode": mode, "convergence_tol": tol,
             "convergence_bins": None if bins is None else int(bins),
-            "convergence_min_neff": _as_float(re_cfg.get("convergence_min_neff", 10.0),
+            "convergence_min_neff": _as_float(re_cfg.get("convergence_min_neff", NOISE_MIN_NEFF),
                                               "replica_exchange.convergence_min_neff"),
+            "convergence_consecutive": int(_as_float(
+                re_cfg.get("convergence_consecutive", NOISE_CONSECUTIVE),
+                "replica_exchange.convergence_consecutive")),
+            "convergence_min_round_trips": int(_as_float(
+                re_cfg.get("convergence_min_round_trips", NOISE_MIN_ROUND_TRIPS),
+                "replica_exchange.convergence_min_round_trips")),
             "convergence_median_tol": _as_float(re_cfg.get("convergence_median_tol", 1.3),
                                                 "replica_exchange.convergence_median_tol"),
             "convergence_discard": _as_float(re_cfg.get("convergence_discard", 0.2),
@@ -2612,7 +2625,7 @@ def _merge_runs(config: Dict[str, Any], out_dir: str, meta: Dict[str, Any], samp
         with open(mpath) as f:
             om = json.load(f)
         for key in ("species", "structure", "calculator", "reservoirs", "lattice_constant_angstrom",
-                    "masses_amu", "geometry"):
+                    "masses_amu", "geometry", "sgc"):
             if om.get(key) != meta.get(key):
                 raise ValueError(f"phase_diagram.merge: {other} differs in '{key}'; only runs of "
                                  f"the same system and potential can be merged")
