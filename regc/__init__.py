@@ -21,7 +21,8 @@ pressure     simple (reduced-units) mu <-> p conventions
 
 Real units, potentials and gas reservoirs
 -----------------------------------------
-reservoir       MonatomicIdealGasReservoir, DiatomicReservoir (e.g. H2), MolecularGas
+reservoir       MonatomicIdealGasReservoir, DiatomicReservoir (e.g. H2), MolecularGas,
+                BulkSolidReservoir (bulk metal, for exchanged surface atoms)
                 (CO, CH4, ...), MolecularGasFeed (elemental mu of a gas mixture), and the
                 low-level diatomic functions
 molecules       MoleculeMove -- molecular insertion/deletion on top of atomic exchange
@@ -92,6 +93,7 @@ from .reservoir import (
     H2_MASS_AMU,
     H2_VIBRATIONAL_WAVENUMBER_CM,
     H_MASS_AMU,
+    BulkSolidReservoir,
     DiatomicReservoir,
     MolecularGas,
     MolecularGasFeed,
@@ -133,6 +135,7 @@ __all__ = [
     "mu_from_pressure", "pressure_from_mu", "mu_grid_from_pressures", "invert_mu_of_Tp",
     # reservoirs
     "Reservoir", "MonatomicIdealGasReservoir", "DiatomicReservoir", "MolecularGas",
+    "BulkSolidReservoir",
     "MolecularGasFeed", "MoleculeMove", "MoleculeCounts", "Subsurface",
     "diatomic_dissociation_energy_eV", "diatomic_gas_mu_eV",
     "mu_atomic_from_diatomic_reservoir_eV", "pressure_from_atomic_mu_reservoir_pascal",

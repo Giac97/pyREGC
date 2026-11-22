@@ -661,6 +661,168 @@ class MonatomicIdealGasReservoir(Reservoir):
 
 
 @dataclass
+class BulkSolidReservoir(Reservoir):
+    """
+    The bulk crystal of the exchanged element as its reservoir (e.g. bulk Pd).
+
+    Removing a surface metal atom puts it back into the bulk, as when a
+    surface oxide forms that holds fewer metal atoms than the bare surface
+    (Pd(100)-(sqrt5 x sqrt5)R27-O has one Pd fewer per cell; Rogal, Reuter,
+    Scheffler, PRB 75, 205433 (2007)). The chemical potential is the free
+    energy per atom of the classical harmonic crystal, independent of the
+    gas pressure:
+
+        mu(T) = e_bulk + 3 k_B T ln(hbar omega_g / k_B T),
+
+    omega_g the geometric mean of its phonon frequencies. Classical, like
+    the sampled atoms (whose momenta give the Lambda^3 of the GC weight), so
+    the classical momentum and vibrational terms of reservoir and surface
+    are counted the same way; pV of the solid is neglected.
+
+    Parameters
+    ----------
+    mass_amu : float
+        Atomic mass, in amu.
+    e_bulk_eV : float
+        Potential energy per atom of the relaxed crystal, in eV (same
+        potential and energy zero as the simulation).
+    mean_wavenumber_cm : float
+        Geometric-mean phonon wavenumber, in cm^-1 (`from_calculator`
+        computes it from the potential's Hessian).
+    info : dict, optional
+        Diagnostics (crystal, lattice constant, supercell). Default empty.
+    """
+
+    mass_amu: float
+    e_bulk_eV: float
+    mean_wavenumber_cm: float
+    info: dict = field(default_factory=dict, compare=False)
+
+    @property
+    def mass_exchanged_amu(self) -> float:
+        """float: The atom's mass."""
+        return self.mass_amu
+
+    def mu_eV(self, T_kelvin: float, p_pascal: float = 0.0) -> float:
+        """
+        Chemical potential of an atom in the bulk crystal at T.
+
+        Parameters
+        ----------
+        T_kelvin : float
+            Temperature, in Kelvin.
+        p_pascal : float, optional
+            Ignored (a solid reservoir has no gas pressure). Default 0.
+
+        Returns
+        -------
+        float
+            mu, in eV.
+        """
+        kT = kelvin_to_eV(T_kelvin)
+        hw = (PLANCK_H * SPEED_OF_LIGHT_CM_PER_S * self.mean_wavenumber_cm) / EV_IN_JOULES
+        return self.e_bulk_eV + 3.0 * kT * math.log(hw / kT)
+
+    def pressure_pascal(self, T_kelvin: float, mu_eV: float) -> float:
+        """
+        Not defined: a solid reservoir has no pressure.
+
+        Parameters
+        ----------
+        T_kelvin : float
+            Temperature, in Kelvin.
+        mu_eV : float
+            Chemical potential, in eV.
+
+        Returns
+        -------
+        float
+            Never returns.
+
+        Raises
+        ------
+        ValueError
+            Always.
+        """
+        raise ValueError("a bulk-solid reservoir has a fixed mu(T), no pressure")
+
+    @classmethod
+    def from_calculator(cls, ase_calculator, symbol: str, crystal: str = "fcc",
+                        a: Optional[float] = None, supercell: int = 2, delta: float = 0.01,
+                        mass_amu: Optional[float] = None) -> "BulkSolidReservoir":
+        """
+        Energy per atom and mean phonon frequency of the bulk crystal, from a potential.
+
+        Builds the cubic cell of `crystal` repeated `supercell` times, takes
+        its energy per atom, and the Gamma-point phonons of that supercell
+        from a finite-difference Hessian (3 translations dropped). A 2x2x2
+        cubic fcc cell (32 atoms) gives the geometric-mean frequency to a
+        few per cent, i.e. mu to about 3 kT x 0.03.
+
+        Parameters
+        ----------
+        ase_calculator : ase.calculators.calculator.Calculator
+            The potential.
+        symbol : str
+            The element.
+        crystal : str, optional
+            ``ase.build.bulk`` crystal structure. Default ``'fcc'``.
+        a : float, optional
+            Lattice constant (A); default None: ASE's tabulated one. Pass the
+            slab's own (the potential's equilibrium) lattice constant.
+        supercell : int, optional
+            Repetitions of the cubic cell. Default 2.
+        delta : float, optional
+            Finite-difference displacement, A. Default 0.01.
+        mass_amu : float, optional
+            Atomic mass; default None: ASE's.
+
+        Returns
+        -------
+        BulkSolidReservoir
+            The reservoir.
+
+        Raises
+        ------
+        ValueError
+            If the crystal has imaginary modes at this lattice constant.
+        """
+        from ase.build import bulk
+        atoms = bulk(symbol, crystal, a=a, cubic=True).repeat(int(supercell))
+        if mass_amu is not None:
+            atoms.set_masses([float(mass_amu)] * len(atoms))
+        atoms.calc = ase_calculator
+        n = len(atoms)
+        e_bulk = float(atoms.get_potential_energy()) / n
+        x0 = atoms.get_positions()
+        hess = np.zeros((3 * n, 3 * n))
+        for i in range(n):
+            for k in range(3):
+                f = []
+                for sgn in (1.0, -1.0):
+                    x = x0.copy()
+                    x[i, k] += sgn * delta
+                    atoms.set_positions(x)
+                    f.append(atoms.get_forces().ravel())
+                hess[3 * i + k] = -(f[0] - f[1]) / (2.0 * delta)
+        atoms.set_positions(x0)
+        hess = 0.5 * (hess + hess.T)
+        m3 = np.repeat(atoms.get_masses(), 3)
+        lam = np.sort(np.linalg.eigvalsh(hess / np.sqrt(np.outer(m3, m3))))
+        modes = lam[np.argsort(np.abs(lam))][3:]                 # drop the 3 translations
+        if np.any(modes <= 0.0):
+            raise ValueError(f"bulk {symbol} ({crystal}, a = {a}) has imaginary modes with this "
+                             f"potential: not a minimum at this lattice constant")
+        omega = np.sqrt(modes * EV_IN_JOULES / (1.0e-20 * AMU))
+        wn = omega / (2.0 * math.pi * SPEED_OF_LIGHT_CM_PER_S)
+        mean_wn = float(np.exp(np.mean(np.log(wn))))
+        info = {"crystal": crystal, "a_angstrom": None if a is None else float(a),
+                "supercell": int(supercell), "n_atoms": n,
+                "max_wavenumber_cm": float(wn.max()), "min_wavenumber_cm": float(wn.min())}
+        return cls(float(atoms.get_masses()[0]), e_bulk, mean_wn, info)
+
+
+@dataclass
 class DiatomicReservoir(Reservoir):
     """
     A homonuclear diatomic gas (e.g. H2) exchanging single atoms.

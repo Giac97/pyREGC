@@ -17,7 +17,7 @@ Everything below is importable as `from regc import <name>`, except the runner f
 - [Sample I/O (`regc.io`)](#sample-io-regcio): `save_samples`, `load_samples`, `SampleSet`
 - [Units (`regc.units`)](#units-regcunits): `kelvin_to_eV`, `eV_to_kelvin`, `pascal_per`, `PRESSURE_UNITS`, `ThermalWavelengthCubed`, `SpeciesLambdaCubed`, `thermal_wavelength_angstrom`, `thermal_wavelength_cubed_angstrom3`, `default_mass_amu`
 - [Reduced-unit pressure conventions (`regc.pressure`)](#reduced-unit-pressure-conventions-regcpressure): `p0_reduced_units`, `p0_ideal_gas_wavelength`, `mu_from_pressure`, `pressure_from_mu`, `mu_grid_from_pressures`, `invert_mu_of_Tp`
-- [Gas reservoirs (`regc.reservoir`)](#gas-reservoirs-regcreservoir): `Reservoir`, `MonatomicIdealGasReservoir`, `DiatomicReservoir`, `MolecularGas`, `MolecularGasFeed`, `diatomic_dissociation_energy_eV`, `diatomic_gas_mu_eV`, `mu_atomic_from_diatomic_reservoir_eV`, `pressure_from_atomic_mu_reservoir_pascal`, `H2_BOND_LENGTH_ANGSTROM`, `H2_VIBRATIONAL_WAVENUMBER_CM`, `H_MASS_AMU`, `H2_MASS_AMU`, `H2_D0_EXPERIMENTAL_EV`
+- [Gas reservoirs (`regc.reservoir`)](#gas-reservoirs-regcreservoir): `Reservoir`, `MonatomicIdealGasReservoir`, `DiatomicReservoir`, `MolecularGas`, `BulkSolidReservoir`, `MolecularGasFeed`, `diatomic_dissociation_energy_eV`, `diatomic_gas_mu_eV`, `mu_atomic_from_diatomic_reservoir_eV`, `pressure_from_atomic_mu_reservoir_pascal`, `H2_BOND_LENGTH_ANGSTROM`, `H2_VIBRATIONAL_WAVENUMBER_CM`, `H_MASS_AMU`, `H2_MASS_AMU`, `H2_D0_EXPERIMENTAL_EV`
 - [MBAR analysis (`regc.analysis`)](#mbar-analysis-regcanalysis): `MBARSurfaceAnalysis`, `heat_capacity_ridges`, `export_phase_configurations`
 - [Plotting (`regc.plotting`)](#plotting-regcplotting): `plot_phase_diagram`, `plot_map`, `plot_radial_distribution`
 - [Per-sample records and other potentials (`regc.records`)](#per-sample-records-and-other-potentials-regcrecords): `RecordWriter`, `Records`, `attach_energies`, `reevaluate`
@@ -1914,7 +1914,7 @@ a finer scan around it is fitted with a parabola.
 ### `slab_geometry_from_atoms`
 
 ```python
-slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headroom: float = 5.0, layer_tol: float = 0.001, n_thermostat_layers: Optional[int] = None, planes_per_layer: int = 1) -> SlabGeometry
+slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headroom: float = 5.0, layer_tol: float = 0.001, n_thermostat_layers: Optional[int] = None, planes_per_layer: int = 1, n_exchangeable_layers: int = 0) -> SlabGeometry
 ```
 
 Lay out an ASE slab for `SlabSystem`.
@@ -1935,6 +1935,7 @@ layers above (subsurface sites included).
 - `layer_tol` (*float, optional*): z tolerance (A) for grouping atoms into layers. Default 1e-3.
 - `n_thermostat_layers` (*int, optional*): Split the displaceable layers into a thermostatted block (these many layers right above the frozen ones) and a free top (the rest, at least one layer), integrated NVE by MD diffusion together with the exchanged species: the fixed / thermostat / free substrate. Default None: every moving atom is thermostatted.
 - `planes_per_layer` (*int, optional*): Atomic z-planes per layer, counted from the bottom; the number of planes must be a multiple of it. Default 1 (a layer is a plane). `layer_planes` gives the value for an `ase.build` slab.
+- `n_exchangeable_layers` (*int, optional*): The top layers start as exchangeable particles (`SlabGeometry.mobile_positions`) instead of substrate: grand-canonical moves can then remove slab atoms into their reservoir (e.g. bulk metal, for surface oxides that need fewer metal atoms than the bare surface) and insert them back. They must lie above the frozen and (with `n_thermostat_layers`) thermostatted layers. Default 0.
 
 **Returns**
 
@@ -1942,14 +1943,14 @@ layers above (subsurface sites included).
 
 **Raises**
 
-- *ValueError*: If the cell is not in the restricted (a1 along x, a2 in xy) form, the planes do not divide into layers of `planes_per_layer`, or `n_frozen_layers` or `n_thermostat_layers` is out of range.
+- *ValueError*: If the cell is not in the restricted (a1 along x, a2 in xy) form, the planes do not divide into layers of `planes_per_layer`, or `n_frozen_layers`, `n_thermostat_layers` or `n_exchangeable_layers` is out of range.
 
 ---
 
 ### `SlabGeometry`
 
 ```python
-SlabGeometry(cell_xy: np.ndarray, Lz: float, top_z: float, frozen_positions: np.ndarray, frozen_species: np.ndarray, substrate_positions: np.ndarray, substrate_species: np.ndarray, layer_z: np.ndarray, n_surface: int = 0, thermostat_mask: Optional[np.ndarray] = None, layers: Optional[Tuple[int, int, int]] = None, planes_per_layer: int = 1) -> None
+SlabGeometry(cell_xy: np.ndarray, Lz: float, top_z: float, frozen_positions: np.ndarray, frozen_species: np.ndarray, substrate_positions: np.ndarray, substrate_species: np.ndarray, layer_z: np.ndarray, n_surface: int = 0, thermostat_mask: Optional[np.ndarray] = None, layers: Optional[Tuple[int, int, int]] = None, planes_per_layer: int = 1, mobile_positions: Optional[np.ndarray] = None, mobile_species: Optional[np.ndarray] = None) -> None
 ```
 
 A slab laid out for `SlabSystem`: frozen block at z <= 0, substrate above.
@@ -1966,6 +1967,7 @@ A slab laid out for `SlabSystem`: frozen block at z <= 0, substrate above.
 - `thermostat_mask` (*numpy.ndarray or None*): Which displaceable atoms the MD thermostat acts on (bool, one per substrate atom), for the fixed / thermostat / free layout; the rest (and the exchanged species) are integrated NVE. None (default): every moving atom is thermostatted.
 - `layers` (*tuple of int or None*): `(fixed, thermostat, free)` layer counts when `thermostat_mask` comes from layers (`slab_geometry_from_atoms`), else None.
 - `planes_per_layer` (*int*): Atomic z-planes per layer (1 for flat surfaces; more for open and stepped ones such as fcc(211) or hcp(10-10), where one `ase.build` layer spans several planes).
+- `mobile_positions, mobile_species` (*numpy.ndarray or None*): Slab atoms that start as exchangeable (mobile) particles: the top `n_exchangeable_layers` of `slab_geometry_from_atoms`. GC moves can delete them (into their reservoir, e.g. bulk metal) and insert more. None: the slab is all frozen + substrate.
 
 #### `SlabGeometry.orthogonal` (property)
 
@@ -4110,6 +4112,111 @@ Relax a gas molecule with a potential and take its vibrations from the Hessian.
 **Raises**
 
 - *ValueError*: If the symmetry number is unknown and not given, the relaxed geometry is not a minimum (imaginary vibrational modes), or `masses_amu` does not fit the template.
+
+---
+
+### `BulkSolidReservoir`
+
+```python
+BulkSolidReservoir(mass_amu: float, e_bulk_eV: float, mean_wavenumber_cm: float, info: dict = <factory>) -> None
+```
+
+The bulk crystal of the exchanged element as its reservoir (e.g. bulk Pd).
+
+Removing a surface metal atom puts it back into the bulk, as when a
+surface oxide forms that holds fewer metal atoms than the bare surface
+(Pd(100)-(sqrt5 x sqrt5)R27-O has one Pd fewer per cell; Rogal, Reuter,
+Scheffler, PRB 75, 205433 (2007)). The chemical potential is the free
+energy per atom of the classical harmonic crystal, independent of the
+gas pressure:
+
+    mu(T) = e_bulk + 3 k_B T ln(hbar omega_g / k_B T),
+
+omega_g the geometric mean of its phonon frequencies. Classical, like
+the sampled atoms (whose momenta give the Lambda^3 of the GC weight), so
+the classical momentum and vibrational terms of reservoir and surface
+are counted the same way; pV of the solid is neglected.
+
+**Parameters**
+
+- `mass_amu` (*float*): Atomic mass, in amu.
+- `e_bulk_eV` (*float*): Potential energy per atom of the relaxed crystal, in eV (same potential and energy zero as the simulation).
+- `mean_wavenumber_cm` (*float*): Geometric-mean phonon wavenumber, in cm^-1 (`from_calculator` computes it from the potential's Hessian).
+- `info` (*dict, optional*): Diagnostics (crystal, lattice constant, supercell). Default empty.
+
+#### `BulkSolidReservoir.mass_exchanged_amu` (property)
+
+float: The atom's mass.
+
+#### `BulkSolidReservoir.mu_eV`
+
+```python
+BulkSolidReservoir.mu_eV(T_kelvin: float, p_pascal: float = 0.0) -> float
+```
+
+Chemical potential of an atom in the bulk crystal at T.
+
+**Parameters**
+
+- `T_kelvin` (*float*): Temperature, in Kelvin.
+- `p_pascal` (*float, optional*): Ignored (a solid reservoir has no gas pressure). Default 0.
+
+**Returns**
+
+- *float*: mu, in eV.
+
+#### `BulkSolidReservoir.pressure_pascal`
+
+```python
+BulkSolidReservoir.pressure_pascal(T_kelvin: float, mu_eV: float) -> float
+```
+
+Not defined: a solid reservoir has no pressure.
+
+**Parameters**
+
+- `T_kelvin` (*float*): Temperature, in Kelvin.
+- `mu_eV` (*float*): Chemical potential, in eV.
+
+**Returns**
+
+- *float*: Never returns.
+
+**Raises**
+
+- *ValueError*: Always.
+
+#### `BulkSolidReservoir.from_calculator` (classmethod)
+
+```python
+BulkSolidReservoir.from_calculator(ase_calculator, symbol: str, crystal: str = 'fcc', a: Optional[float] = None, supercell: int = 2, delta: float = 0.01, mass_amu: Optional[float] = None) -> BulkSolidReservoir
+```
+
+Energy per atom and mean phonon frequency of the bulk crystal, from a potential.
+
+Builds the cubic cell of `crystal` repeated `supercell` times, takes
+its energy per atom, and the Gamma-point phonons of that supercell
+from a finite-difference Hessian (3 translations dropped). A 2x2x2
+cubic fcc cell (32 atoms) gives the geometric-mean frequency to a
+few per cent, i.e. mu to about 3 kT x 0.03.
+
+**Parameters**
+
+- `ase_calculator` (*ase.calculators.calculator.Calculator*): The potential.
+- `symbol` (*str*): The element.
+- `crystal` (*str, optional*): `ase.build.bulk` crystal structure. Default `'fcc'`.
+- `a` (*float, optional*): Lattice constant (A); default None: ASE's tabulated one. Pass the slab's own (the potential's equilibrium) lattice constant.
+- `supercell` (*int, optional*): Repetitions of the cubic cell. Default 2.
+- `delta` (*float, optional*): Finite-difference displacement, A. Default 0.01.
+- `mass_amu` (*float, optional*): Atomic mass; default None: ASE's.
+
+**Returns**
+
+- *BulkSolidReservoir*: The reservoir.
+
+**Raises**
+
+- *ValueError*: If the crystal has imaginary modes at this lattice constant.
 
 ---
 

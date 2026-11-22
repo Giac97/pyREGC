@@ -2668,6 +2668,7 @@ nanoparticle).
 | `cluster` | – | A mapping for an `ase.cluster` function (below). |
 | `geometry` | `cluster` with a `cluster` block, else `slab` | `slab` or `cluster`. Needed only to read a cluster from `file`. |
 | `n_frozen_layers` | all layers | Slab only: bottom layers kept rigid; the rest are displaceable. |
+| `exchangeable_top_layers` | 0 | Slab only: these top layers start as exchangeable atoms (their element must be in `gas.species`, usually with `reservoir.<el>.type: bulk`), so GC moves can remove and re-insert them (§14.4). |
 | `layers` | – | Slab only, instead of `n_frozen_layers`: `{fixed: 2, thermostat: 2, free: 2}`. Rigid bottom, thermostatted middle, NVE top (§2.1.1). With `build`, give `size: [nx, ny]` and the layers set the depth. On open or stepped surfaces a layer is several atomic planes (§2.1); the plane count must divide by the sum. A warning is printed unless `diffusion: md`. |
 | `layer_tol` | 0.001 | Slab only: z tolerance (Å) for grouping atoms into layers. |
 | `frozen` | `center` | Cluster only: `center` (the central atom), `core` (fully coordinated atoms), `none`, or a number of central atoms (§2.6). |
@@ -2770,7 +2771,7 @@ species, key the section by species: `reservoir: {O: {...}, Cl: {...}}`.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `type` | `diatomic` | `diatomic` (atoms from X2 gas) or `monatomic`. |
+| `type` | `diatomic` | `diatomic` (atoms from X2 gas), `monatomic`, or `bulk` (the element's own bulk crystal, for exchanged slab atoms; see below). |
 | `d0` | `self` | Diatomic: `self` (the potential's molecule), `experimental` (H2 only, 4.478 eV) or a number in eV. |
 | `D0_eV` | – | Same as giving `d0` a number. Required for `LJ` and `PairLJ`, which have no ASE counterpart to evaluate the molecule. |
 | `e_atom_eV` | from the calculator | Isolated-atom energy, the zero of μ. |
@@ -2779,9 +2780,36 @@ species, key the section by species: `reservoir: {O: {...}, Cl: {...}}`.
 | `electronic_degeneracy` | 3 for O, else 1 | Degeneracy of the molecule's electronic ground state. |
 | `mass_molecule_amu` | 2 × atomic mass | Molecular mass. |
 | `mass_amu` | gas mass | Monatomic: the atom's mass. |
+| `crystal`, `lattice_constant_angstrom`, `supercell` | `fcc`, the slab's, 2 | Bulk: the crystal whose energy and Γ-point phonons (of the cubic cell × `supercell`) the potential gives. |
+| `e_bulk_eV`, `mean_wavenumber_cm` | from the potential | Bulk: give both instead, e.g. from a converged phonon calculation. |
 
 The reservoir is built when the ladder uses `pressures`, or when there
 is a `phase_diagram` or `reservoir` section.
+
+**Bulk reservoir (`type: bulk`).** Some surface phases hold fewer metal
+atoms than the bare surface. The Pd(100)-(√5×√5)R27°-O oxide has one Pd
+fewer per cell (Rogal, Reuter, Scheffler, PRB 75, 205433 (2007)). To
+sample such phases, exchange the metal with its bulk crystal:
+
+- **The exchanged atoms:** list the element in `gas.species`. Set
+  `structure.exchangeable_top_layers` so that its top layer(s) start as
+  exchangeable atoms instead of substrate.
+- **μ of the reservoir:** μ(T) = e_bulk + 3kT ln(ħω̄/kT). This is the
+  classical harmonic crystal, consistent with the classically sampled
+  atoms; ω̄ is the geometric-mean phonon frequency. μ does not depend on
+  the gas pressure, so it needs no `gas.composition` entry.
+- **Insertion:** metal atoms are inserted uniformly in the box, so
+  refilling a surface vacancy is rare. MD diffusion carries adatoms back
+  into vacancies.
+
+```yaml
+structure: {build: {surface: fcc100, symbol: Pd, size: [5, 5, 4]}, n_frozen_layers: 2,
+            exchangeable_top_layers: 1}
+gas: {species: [O, Pd]}
+reservoir:
+  O: {type: diatomic, d0: self, bond_length_angstrom: 1.2075, vibrational_wavenumber_cm: 1580.2}
+  Pd: {type: bulk}
+```
 
 ### 14.4c `subsurface`
 

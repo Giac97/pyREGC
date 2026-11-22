@@ -107,6 +107,7 @@ def _available_cpus() -> int:
 
 _SECTIONS = {
     "structure": {"file", "build", "cluster", "geometry", "n_frozen_layers", "layers",
+                  "exchangeable_top_layers",
                   "headroom_angstrom",
                   "layer_tol", "frozen", "full_coordination", "alloy", "alloy_seed", "alloy_per_layer"},
     "sgc": {"species", "dmu_eV", "attempts_per_step", "bulk_composition", "ensemble"},
@@ -118,7 +119,8 @@ _SECTIONS = {
             "insertion_shell_around_cluster", "composition", "atomic_exchange"},
     "reservoir": {"type", "d0", "D0_eV", "e_atom_eV", "bond_length_angstrom",
                   "vibrational_wavenumber_cm", "symmetry_number", "electronic_degeneracy",
-                  "mass_molecule_amu", "mass_amu"},
+                  "mass_molecule_amu", "mass_amu", "crystal", "lattice_constant_angstrom",
+                  "supercell", "e_bulk_eV", "mean_wavenumber_cm"},
     "trajectory": {"save", "directory", "every"},
     "configurations": {"save", "directory", "every"},
     "records": {"save", "file", "every", "potential", "positions"},
@@ -1175,6 +1177,8 @@ def _build_reservoir(sp: str, cfg: Dict[str, Any], mass_amu: float, calc_spec: _
                             H2_VIBRATIONAL_WAVENUMBER_CM, DiatomicReservoir,
                             MonatomicIdealGasReservoir, default_electronic_degeneracy)
     rtype = str(cfg.get("type", "diatomic")).lower()
+    if rtype == "bulk":
+        return _build_bulk_reservoir(sp, cfg, mass_amu, calc_spec, ase_calc_getter)
     e_atom = cfg.get("e_atom_eV")
     e_atom = None if e_atom is None else _as_float(e_atom, f"reservoir.{sp}.e_atom_eV")
     if rtype == "monatomic":
@@ -1182,7 +1186,7 @@ def _build_reservoir(sp: str, cfg: Dict[str, Any], mass_amu: float, calc_spec: _
         return MonatomicIdealGasReservoir(m, e_atom if e_atom is not None
                                           else calc_spec.isolated_atom_energy(sp))
     if rtype != "diatomic":
-        raise ValueError(f"reservoir.type must be 'diatomic' or 'monatomic', got {rtype!r}")
+        raise ValueError(f"reservoir.type must be 'diatomic', 'monatomic' or 'bulk', got {rtype!r}")
 
     d0 = cfg.get("D0_eV", cfg.get("d0", "self"))
     if d0 is None:
@@ -1225,6 +1229,58 @@ def _build_reservoir(sp: str, cfg: Dict[str, Any], mass_amu: float, calc_spec: _
     return DiatomicReservoir(float(d0), e_atom, m_mol, bond, vib, sym, g_el)
 
 
+def _build_bulk_reservoir(sp: str, cfg: Dict[str, Any], mass_amu: float,
+                          calc_spec: _CalculatorSpec, ase_calc_getter: Callable[[], Any]):
+    """
+    A bulk-crystal reservoir (``reservoir.<sp>.type: bulk``) for exchanged slab atoms.
+
+    ``e_bulk_eV`` and ``mean_wavenumber_cm`` may be given; otherwise both
+    come from the potential (`BulkSolidReservoir.from_calculator`) at
+    ``lattice_constant_angstrom`` (default: the slab's, set by the runner).
+
+    Parameters
+    ----------
+    sp : str
+        The element.
+    cfg : dict
+        Its reservoir section.
+    mass_amu : float
+        Its atomic mass.
+    calc_spec : _CalculatorSpec
+        The calculator.
+    ase_calc_getter : callable
+        Returns the potential as an ASE calculator (or None).
+
+    Returns
+    -------
+    BulkSolidReservoir
+        The reservoir.
+
+    Raises
+    ------
+    ValueError
+        If only one of the two numbers is given, or the potential is needed
+        but has no ASE counterpart.
+    """
+    from .reservoir import BulkSolidReservoir
+    e_bulk, wn = cfg.get("e_bulk_eV"), cfg.get("mean_wavenumber_cm")
+    if (e_bulk is None) != (wn is None):
+        raise ValueError(f"reservoir.{sp}: give both e_bulk_eV and mean_wavenumber_cm, or "
+                         f"neither (then both come from the potential)")
+    if e_bulk is not None:
+        return BulkSolidReservoir(float(mass_amu), _as_float(e_bulk, f"reservoir.{sp}.e_bulk_eV"),
+                                  _as_float(wn, f"reservoir.{sp}.mean_wavenumber_cm"))
+    ase_calc = ase_calc_getter()
+    if ase_calc is None:
+        raise ValueError(f"reservoir.{sp} (bulk): the calculator has no ASE counterpart; give "
+                         f"e_bulk_eV and mean_wavenumber_cm")
+    a = cfg.get("lattice_constant_angstrom")
+    return BulkSolidReservoir.from_calculator(
+        ase_calc, sp, crystal=str(cfg.get("crystal", "fcc")),
+        a=None if a is None else _as_float(a, f"reservoir.{sp}.lattice_constant_angstrom"),
+        supercell=int(cfg.get("supercell", 2)), mass_amu=float(mass_amu))
+
+
 def _reservoir_to_dict(res) -> Dict[str, Any]:
     """
     A reservoir as a JSON-able dict (for ``run_metadata.json``).
@@ -1239,10 +1295,11 @@ def _reservoir_to_dict(res) -> Dict[str, Any]:
     dict
         Its type and parameters (diagnostics dropped).
     """
-    from .reservoir import DiatomicReservoir
+    from .reservoir import BulkSolidReservoir, DiatomicReservoir
     d = {f.name: getattr(res, f.name) for f in dataclasses.fields(res)
          if f.name != "calculator_info"}
-    d["type"] = "diatomic" if isinstance(res, DiatomicReservoir) else "monatomic"
+    d["type"] = ("diatomic" if isinstance(res, DiatomicReservoir) else
+                 "bulk" if isinstance(res, BulkSolidReservoir) else "monatomic")
     return d
 
 
@@ -1260,9 +1317,10 @@ def _reservoir_from_dict(d: Dict[str, Any]):
     Reservoir
         The reservoir.
     """
-    from .reservoir import DiatomicReservoir, MonatomicIdealGasReservoir
+    from .reservoir import BulkSolidReservoir, DiatomicReservoir, MonatomicIdealGasReservoir
     d = dict(d)
-    cls = DiatomicReservoir if d.pop("type") == "diatomic" else MonatomicIdealGasReservoir
+    cls = {"diatomic": DiatomicReservoir, "bulk": BulkSolidReservoir}.get(
+        d.pop("type"), MonatomicIdealGasReservoir)
     return cls(**d)
 
 
@@ -1362,7 +1420,8 @@ class GasFeed:
         return lams[0] if len(lams) == 1 else SpeciesLambdaCubed(lams)
 
 
-def _feed_fractions(gas_cfg: Dict[str, Any], species: Sequence[str]) -> List[float]:
+def _feed_fractions(gas_cfg: Dict[str, Any], species: Sequence[str],
+                    solid: Sequence[str] = ()) -> List[float]:
     """
     Feed mole fractions from ``gas.composition``.
 
@@ -1372,12 +1431,16 @@ def _feed_fractions(gas_cfg: Dict[str, Any], species: Sequence[str]) -> List[flo
         The ``gas`` section.
     species : sequence of str
         The exchanged species.
+    solid : sequence of str, optional
+        Species with a bulk-solid reservoir: no gas fraction (their mu does
+        not depend on the pressure); they get 1.0, the gases are
+        normalised among themselves. Default none.
 
     Returns
     -------
     list of float
-        One fraction per species (1.0 for a single species), normalised to
-        sum to 1.
+        One fraction per species (1.0 for a single gas species), the gas
+        fractions normalised to sum to 1.
 
     Raises
     ------
@@ -1386,17 +1449,21 @@ def _feed_fractions(gas_cfg: Dict[str, Any], species: Sequence[str]) -> List[flo
         each of them.
     """
     comp = gas_cfg.get("composition")
+    gases = [s for s in species if s not in solid]
+    if comp is None and len(gases) <= 1:
+        return [1.0] * len(species)
     if comp is None:
         if len(species) > 1:
             raise ValueError("several exchanged species with a pressure ladder or a (T, p) "
                              "phase diagram need gas.composition (feed mole fractions, "
                              "e.g. {O: 0.999, Cl: 0.001})")
         return [1.0]
-    missing = [s for s in species if s not in comp]
+    missing = [s for s in gases if s not in comp]
     if missing:
         raise ValueError(f"gas.composition lacks {missing}")
-    x = np.array([_as_float(comp[s], f"gas.composition.{s}") for s in species])
-    return list(x / x.sum())
+    x = {s: _as_float(comp[s], f"gas.composition.{s}") for s in gases}
+    total = sum(x.values())
+    return [x[s] / total if s in x else 1.0 for s in species]
 
 
 def _build_molecular_feed(config: Dict[str, Any], species: Sequence[str],
@@ -1769,7 +1836,14 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
             atoms, n_frozen_layers=None if nfl is None else int(nfl),
             headroom=_as_float(struct_cfg.get("headroom_angstrom", 5.0),
                                "structure.headroom_angstrom"),
-            layer_tol=layer_tol, n_thermostat_layers=n_th, planes_per_layer=ppl)
+            layer_tol=layer_tol, n_thermostat_layers=n_th, planes_per_layer=ppl,
+            n_exchangeable_layers=int(struct_cfg.get("exchangeable_top_layers", 0)))
+        if geometry.mobile_species is not None:
+            foreign = sorted(set(geometry.mobile_species) - set(species))
+            if foreign:
+                raise ValueError(f"structure.exchangeable_top_layers: the top layers hold "
+                                 f"{foreign}, which are not exchanged species {list(species)} "
+                                 f"(add them to gas.species with a reservoir, e.g. type: bulk)")
         cell, pbc = np.zeros((3, 3)), (True, True, False)
         cell[:2, :2], cell[2, 2] = geometry.cell_xy, geometry.Lz
         region = {"insertion_z_range": None}
@@ -1816,9 +1890,12 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
             config, species, masses, calc_spec, ase_calc)
     elif needs_reservoir:
         res_cfgs = _per_species_reservoir_cfg(config, species)
+        solid = [s for s in species if str(res_cfgs[s].get("type", "")).lower() == "bulk"]
+        for s in solid:     # the bulk crystal at the slab's lattice constant
+            res_cfgs[s].setdefault("lattice_constant_angstrom", a)
         reservoirs = [_build_reservoir(s, res_cfgs[s], masses[s], calc_spec, ase_calc)
                       for s in species]
-        feed = GasFeed(species, reservoirs, _feed_fractions(gas_cfg, species))
+        feed = GasFeed(species, reservoirs, _feed_fractions(gas_cfg, species, solid))
     if pressures is not None:
         mu_grid = feed.mu_grid(temperatures_K, pressures, unit=pressure_unit)
     else:
@@ -1903,7 +1980,14 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
                 if hasattr(r, "D0_eV"):
                     src = (r.calculator_info or {}).get("d0_source", "given")
                     d0 = f"D0 = {r.D0_eV:.4f} eV ({src}), "
-                print(f"{s} reservoir ({type(r).__name__}): {d0}e_atom = {r.e_atom_eV:.4f} eV")
+                if hasattr(r, "e_bulk_eV"):
+                    print(f"{s} reservoir ({type(r).__name__}): e_bulk = {r.e_bulk_eV:.4f} eV/atom, "
+                          f"mean phonon {r.mean_wavenumber_cm:.1f} cm^-1; mu = "
+                          + ", ".join(f"{r.mu_eV(T):.4f}" for T in (temperatures_K[0],
+                                                                    temperatures_K[-1]))
+                          + f" eV at {temperatures_K[0]:g}, {temperatures_K[-1]:g} K")
+                else:
+                    print(f"{s} reservoir ({type(r).__name__}): {d0}e_atom = {r.e_atom_eV:.4f} eV")
         if sgc and sgc["canonical"]:
             print(f"canonical substrate alloy {sgc['species']}: {sgc['n_swappable']} "
                   f"swappable atoms {dict(zip(sgc['species'], sgc['counts']))} (fixed), "
@@ -2291,7 +2375,7 @@ def run_from_config(config: Dict[str, Any], verbose: bool = True, resume: bool =
         D0 = e_atom = None
     else:
         D0 = {s: getattr(r, "D0_eV", None) for s, r in zip(feed.species, feed.reservoirs)}
-        e_atom = {s: r.e_atom_eV for s, r in zip(feed.species, feed.reservoirs)}
+        e_atom = {s: getattr(r, "e_atom_eV", None) for s, r in zip(feed.species, feed.reservoirs)}
         if len(feed.species) == 1:
             D0, e_atom = D0[feed.species[0]], e_atom[feed.species[0]]
     result = {"sim": sim, "setup": setup, "status": status, "finished": finished,

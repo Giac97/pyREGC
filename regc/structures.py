@@ -155,6 +155,11 @@ class SlabGeometry:
         Atomic z-planes per layer (1 for flat surfaces; more for open and
         stepped ones such as fcc(211) or hcp(10-10), where one ``ase.build``
         layer spans several planes).
+    mobile_positions, mobile_species : numpy.ndarray or None
+        Slab atoms that start as exchangeable (mobile) particles: the top
+        `n_exchangeable_layers` of `slab_geometry_from_atoms`. GC moves can
+        delete them (into their reservoir, e.g. bulk metal) and insert more.
+        None: the slab is all frozen + substrate.
     """
 
     cell_xy: np.ndarray
@@ -169,6 +174,8 @@ class SlabGeometry:
     thermostat_mask: Optional[np.ndarray] = field(default=None, repr=False)
     layers: Optional[Tuple[int, int, int]] = None
     planes_per_layer: int = 1
+    mobile_positions: Optional[np.ndarray] = field(default=None, repr=False)
+    mobile_species: Optional[np.ndarray] = field(default=None, repr=False)
 
     @property
     def orthogonal(self) -> bool:
@@ -209,6 +216,8 @@ class SlabGeometry:
                   substrate_positions=self.substrate_positions,
                   substrate_species=self.substrate_species, mass_of_species=mass_of_species,
                   insertion_z_range=insertion_z_range)
+        if self.mobile_positions is not None and len(self.mobile_positions):
+            kw.update(positions=self.mobile_positions.copy(), species=self.mobile_species.copy())
         if self.orthogonal:
             system = SlabSystem(self.cell_xy[0, 0], self.cell_xy[1, 1], self.Lz, calculator, **kw)
         else:
@@ -239,6 +248,8 @@ class SlabGeometry:
         else:
             atoms = (f"{len(self.frozen_positions)} frozen + {len(self.substrate_positions)} "
                      f"displaceable")
+        if self.mobile_positions is not None and len(self.mobile_positions):
+            atoms += f" + {len(self.mobile_positions)} exchangeable"
         return (f"{atoms} slab atoms, {self.n_surface} per surface layer, cell |a1| = {a1:.3f} A, "
                 f"|a2| = {a2:.3f} A ({'rectangular' if self.orthogonal else 'oblique'}), "
                 f"mobile species in z in (0, {self.Lz:.2f}] A")
@@ -247,7 +258,8 @@ class SlabGeometry:
 def slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headroom: float = 5.0,
                              layer_tol: float = 1e-3,
                              n_thermostat_layers: Optional[int] = None,
-                             planes_per_layer: int = 1) -> SlabGeometry:
+                             planes_per_layer: int = 1,
+                             n_exchangeable_layers: int = 0) -> SlabGeometry:
     """
     Lay out an ASE slab for `SlabSystem`.
 
@@ -282,6 +294,13 @@ def slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headr
         Atomic z-planes per layer, counted from the bottom; the number of
         planes must be a multiple of it. Default 1 (a layer is a plane).
         `layer_planes` gives the value for an ``ase.build`` slab.
+    n_exchangeable_layers : int, optional
+        The top layers start as exchangeable particles (`SlabGeometry.mobile_positions`)
+        instead of substrate: grand-canonical moves can then remove slab
+        atoms into their reservoir (e.g. bulk metal, for surface oxides that
+        need fewer metal atoms than the bare surface) and insert them back.
+        They must lie above the frozen and (with `n_thermostat_layers`)
+        thermostatted layers. Default 0.
 
     Returns
     -------
@@ -293,7 +312,8 @@ def slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headr
     ValueError
         If the cell is not in the restricted (a1 along x, a2 in xy) form,
         the planes do not divide into layers of `planes_per_layer`, or
-        `n_frozen_layers` or `n_thermostat_layers` is out of range.
+        `n_frozen_layers`, `n_thermostat_layers` or `n_exchangeable_layers`
+        is out of range.
     """
     cell = np.array(atoms.cell[:], dtype=float)
     if abs(cell[0, 1]) > 1e-8 or abs(cell[0, 2]) > 1e-8 or abs(cell[1, 2]) > 1e-8:
@@ -325,13 +345,23 @@ def slab_geometry_from_atoms(atoms, n_frozen_layers: Optional[int] = None, headr
             raise ValueError(f"n_thermostat_layers must leave at least one free layer above it: "
                              f"1..{n_layers - n_frozen_layers - 1} for {n_layers} layers with "
                              f"{n_frozen_layers} frozen, got {n_thermostat_layers}")
-        mask = layer_of[~frozen] < n_frozen_layers + n_th
         regions = (int(n_frozen_layers), n_th, int(n_free))
+    n_ex = int(n_exchangeable_layers)
+    below = n_frozen_layers + (0 if n_thermostat_layers is None else int(n_thermostat_layers))
+    if n_ex < 0 or n_ex > n_layers - below:
+        raise ValueError(f"n_exchangeable_layers must be in 0..{n_layers - below} (above the "
+                         f"frozen and thermostatted layers), got {n_exchangeable_layers}")
+    mobile = layer_of >= n_layers - n_ex
+    sub = ~frozen & ~mobile
+    if n_thermostat_layers is not None:
+        mask = layer_of[sub] < n_frozen_layers + n_th
     return SlabGeometry(cell_xy=cell[:2, :2].copy(), Lz=top_z + headroom, top_z=top_z,
                         frozen_positions=pos[frozen], frozen_species=species[frozen],
-                        substrate_positions=pos[~frozen], substrate_species=species[~frozen],
+                        substrate_positions=pos[sub], substrate_species=species[sub],
                         layer_z=layers - shift, n_surface=int(np.sum(layer_of == n_layers - 1)),
-                        thermostat_mask=mask, layers=regions, planes_per_layer=ppl)
+                        thermostat_mask=mask, layers=regions, planes_per_layer=ppl,
+                        mobile_positions=pos[mobile] if n_ex else None,
+                        mobile_species=species[mobile] if n_ex else None)
 
 
 def layer_planes(atoms, n_layers: int, layer_tol: float = 1e-3) -> int:
