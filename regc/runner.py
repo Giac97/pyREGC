@@ -129,7 +129,7 @@ _SECTIONS = {
                       "p_min_atm", "p_max_atm", "observable", "coverage_per", "most_probable",
                       "discard", "min_ess", "heat_capacity", "rdf_states",
                       "export_configurations", "bootstrap", "merge", "suggest_ladder",
-                      "potentials"},
+                      "potentials", "extra_observables"},
     "output": {"directory", "plot_filename", "save_raw_data"},
 }
 _TOP_LEVEL = set(_SECTIONS) | {"calculator", "replica_exchange", "diatomic_reservoir",
@@ -1940,6 +1940,10 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
         "structure": struct_cfg, "calculator": calc_cfg, "lattice_constant_angstrom": a,
         "geometry": kind, "n_surface": geometry.n_surface, "area_angstrom2": geometry.area,
         "n_atoms": len(geometry.frozen_positions) + len(geometry.substrate_positions),
+        "initial_mobile_counts": (
+            {} if getattr(geometry, "mobile_species", None) is None else
+            {str(sp): int(np.sum(geometry.mobile_species == sp))
+             for sp in dict.fromkeys(geometry.mobile_species)}),
         "insertion_z_range": insertion_z_range, "insertion_shell": insertion_shell,
         "sampling": sampling,
     }
@@ -2880,7 +2884,11 @@ def analyze_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[st
         ``'analysis'`` (`MBARSurfaceAnalysis`), ``'theta_grid'`` (shape
         (n_T, n_p)), ``'T_grid_K'``, ``'p_grid'`` (in ``'pressure_unit'``),
         ``'p_grid_atm'``, ``'coverage_per'``, ``'observable'`` and, with
-        ``most_probable: true``, ``'most_probable_N'``.
+        ``most_probable: true``, ``'most_probable_N'``. Each of
+        ``phase_diagram.extra_observables`` (e.g. ``[N_Pd]``) adds
+        ``'theta_<name>'``, and for an exchangeable slab species
+        (``structure.exchangeable_top_layers``) ``'removed_<species>'``: the
+        atoms gone to the reservoir, (N_start - <N>) per normalisation unit.
 
     Raises
     ------
@@ -2964,6 +2972,25 @@ def analyze_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[st
     raw = dict(T_K=T_grid_K, p=p_grid, pressure_unit=unit, p_atm=result["p_grid_atm"],
                theta=theta, observable=observable, coverage_per=per, effective_samples=ess,
                min_ess=min_ess)
+    extra = pd_cfg.get("extra_observables") or []
+    extra = [extra] if isinstance(extra, str) else [str(x) for x in extra]
+    start = meta.get("initial_mobile_counts") or {}
+    for obs in extra:
+        th = analysis.phase_diagram_Tp(T_grid_eV, p_grid, area=norm, observable=obs)
+        result[f"theta_{obs}"] = raw[f"theta_{obs}"] = th
+        plot_map(T_grid_K, p_grid, th, os.path.join(out_dir, f"{root}_{obs}{ext}"), valid=valid,
+                 colorbar_label=f"<{obs}>: {_COVERAGE_LABEL[per]}", xlabel=xlabel,
+                 ylabel=ylabel, title=f"Reweighted <{obs}> (MBAR)", invalid_label=invalid)
+        sp = obs[2:] if obs.startswith("N_") else None
+        if sp in start:      # an exchangeable slab species: how much went to its reservoir
+            removed = start[sp] / norm - th
+            result[f"removed_{sp}"] = raw[f"removed_{sp}"] = removed
+            plot_map(T_grid_K, p_grid, removed, os.path.join(out_dir, f"{root}_{sp}_removed{ext}"),
+                     valid=valid, cmap="viridis",
+                     colorbar_label=f"{sp} removed to the reservoir: {_COVERAGE_LABEL[per]}",
+                     xlabel=xlabel, ylabel=ylabel,
+                     title=f"{sp} removed from the surface (start: {start[sp]} atoms)",
+                     invalid_label=invalid)
     raw.update(diag)
     if boot is not None:
         lo, hi = boot["theta"].interval(boot["level"])

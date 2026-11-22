@@ -6535,7 +6535,7 @@ other `phase_diagram` settings (`regc-run --analyze-only`).
 
 **Returns**
 
-- *dict*: `'analysis'` (`MBARSurfaceAnalysis`), `'theta_grid'` (shape (n_T, n_p)), `'T_grid_K'`, `'p_grid'` (in `'pressure_unit'`), `'p_grid_atm'`, `'coverage_per'`, `'observable'` and, with `most_probable: true`, `'most_probable_N'`.
+- *dict*: `'analysis'` (`MBARSurfaceAnalysis`), `'theta_grid'` (shape (n_T, n_p)), `'T_grid_K'`, `'p_grid'` (in `'pressure_unit'`), `'p_grid_atm'`, `'coverage_per'`, `'observable'` and, with `most_probable: true`, `'most_probable_N'`. Each of `phase_diagram.extra_observables` (e.g. `[N_Pd]`) adds `'theta_<name>'`, and for an exchangeable slab species (`structure.exchangeable_top_layers`) `'removed_<species>'`: the atoms gone to the reservoir, (N_start - <N>) per normalisation unit.
 
 **Raises**
 

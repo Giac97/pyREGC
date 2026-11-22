@@ -3045,6 +3045,7 @@ Per-sample records for re-evaluation with other potentials ([§9.6](#96-other-po
 | `observable` | `N` | `N`, `N_ads` (needs `adsorbed_cutoff`) or `N_<species>`. |
 | `coverage_per` | `area` (slab), `surface_atom` (cluster) | `area` (per Å², slab only), `surface_atom` (per top-layer or cluster-surface atom), `atom` (per slab or cluster atom) or `none` (absolute count). |
 | `most_probable` | false | Also compute and plot the most probable N (`<plot>_most_probable.png`). |
+| `extra_observables` | – | More observables mapped like `observable`, e.g. `[N_Pd]`, each to `<plot>_<name>.png`. For a species with `structure.exchangeable_top_layers`, also `<plot>_<species>_removed.png`: the atoms gone to the reservoir per normalisation unit (start count minus ⟨N⟩). |
 | `discard` | 0.2 | Fraction of each replica's samples dropped as equilibration (0 keeps all; check that the result does not change when you raise it). |
 | `min_ess` | 0 | Cells with fewer effective samples (Kish, [§9](#9-analysis-with-mbar)) are drawn grey and skipped by the ridge search and the export. 20–50 is a sensible value. |
 | `heat_capacity` | false | Compute C_V/k_B ([§9.2](#92-heat-capacity)) and its ridges; writes `<plot>_heat_capacity.png`. |

@@ -102,9 +102,15 @@ def test_pd_exchange_run(tmp_path):
     cfg["reservoir"]["Pd"] = {"type": "bulk", "e_bulk_eV": -1.0, "mean_wavenumber_cm": 110.0}
     cfg["phase_diagram"] = {"T_min_K": 600, "T_max_K": 900, "n_T": 4, "p_min": 1e-6, "p_max": 1.0,
                             "n_p": 4, "pressure_unit": "bar", "observable": "N_O",
-                            "coverage_per": "surface_atom"}
-    run_from_config(cfg, verbose=False)                   # mu_Pd far below: Pd leaves
+                            "coverage_per": "surface_atom", "extra_observables": ["N_Pd"]}
+    res = run_from_config(cfg, verbose=False)             # mu_Pd far below: Pd leaves
     from regc.io import load_samples
     s = load_samples(str(tmp_path / "out" / "samples.npz"))
     n_s = np.asarray(next(iter(s.samples.values()))["N_s"]).reshape(-1, 2)
     assert n_s[-1, 1] < 4                                 # some Pd went to the bulk
+    th, removed = res["theta_N_Pd"], res["removed_Pd"]
+    assert np.allclose(th + removed, 1.0)                 # 4 of 4 surface sites start as Pd
+    assert np.nanmax(removed) > 0
+    assert (tmp_path / "out" / "phase_diagram_Pd_removed.png").exists()
+    import json
+    assert json.load(open(tmp_path / "out" / "run_metadata.json"))["initial_mobile_counts"] == {"Pd": 4}
