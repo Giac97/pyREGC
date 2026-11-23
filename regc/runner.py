@@ -45,6 +45,8 @@ surface phase diagram, all from one YAML or JSON file.
 5. **checkpoint** (regc only) -- run in chunks with `run_with_checkpoints`
    (``checkpoint.pkl``/``samples.npz``), resumable (``--resume``) and
    stopping cleanly before ``--time-limit`` (exit code 75, `EXIT_RESUBMIT`).
+   With ``replica_exchange.adapt_ladder`` the (T, p) ladder is moved after
+   the first chunks from the measured swap rates, then frozen (`regc.ladder`).
 6. **phase_diagram** -- MBAR-reweighted coverage (of ``N``, ``N_ads`` or one
    species ``N_<sp>``) on a (T, p) mesh, per area, per surface atom or per
    slab/cluster atom, and
@@ -166,11 +168,15 @@ _RE_SCHEME = {
              "convergence_min_neff", "convergence_median_tol", "convergence_discard",
              "convergence_consecutive", "convergence_min_round_trips", "swap_types",
              "displace_substrate",
-             "md"},
+             "md", "adapt_ladder"},
     "sweep": {"n_cycles", "sweeps_per_cycle", "exchange_every", "burn_in_cycles",
               "diagonal_swaps", "p_displace", "p_insert", "p_delete", "p_displace_substrate"},
 }
 _HMC_KEYS = {"enabled", "leapfrog_steps", "timestep_fs", "dt"}
+#: Keys of ``replica_exchange.adapt_ladder`` and their defaults (`regc.ladder.LadderAdapter`).
+_ADAPT_LADDER_DEFAULTS = {"chunks": 3, "trust": 1.5, "per_row": True, "min_gap_ratio": 0.25,
+                          "max_gap_ratio": 4.0, "min_attempts": 20, "max_evals": 20000,
+                          "max_time_s": None, "min_samples": 5}
 _MD_KEYS = {"timestep_fs", "thermostat", "taut_fs", "friction_per_fs"}
 
 
@@ -483,6 +489,8 @@ def validate_config(config: Dict[str, Any]) -> None:
                          "potentials) or 'pressures' (gas-pressure ladder via the reservoir)")
     if "checkpoint" in config and scheme != "regc":
         raise ValueError("the checkpoint section needs replica_exchange.scheme: regc")
+    if scheme == "regc":
+        _adapt_ladder_settings(config)
     if "sgc" in config:
         sgc = config["sgc"] or {}
         if scheme != "regc":
@@ -534,6 +542,72 @@ def validate_config(config: Dict[str, Any]) -> None:
             and config["phase_diagram"].get("coverage_per") == "area"):
         raise ValueError("phase_diagram.coverage_per: area needs a slab; for a cluster use "
                          "surface_atom, atom or none")
+
+
+def _adapt_ladder_settings(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    The ``replica_exchange.adapt_ladder`` settings, checked and with defaults.
+
+    Parameters
+    ----------
+    config : dict
+        The parsed config.
+
+    Returns
+    -------
+    dict or None
+        The settings (`_ADAPT_LADDER_DEFAULTS` keys), or None when the key is
+        absent or false.
+
+    Raises
+    ------
+    ValueError
+        On an unknown key or a bad value, or outside a checkpointed regc run
+        with a pressure ladder of at least 3 temperatures or 3 pressures.
+    """
+    re_cfg = config["replica_exchange"]
+    cfg = re_cfg.get("adapt_ladder")
+    if cfg is None or cfg is False:
+        return None
+    cfg = {} if cfg is True else cfg
+    _check_keys(cfg, set(_ADAPT_LADDER_DEFAULTS), "replica_exchange.adapt_ladder")
+    out = dict(_ADAPT_LADDER_DEFAULTS, **cfg)
+    where = "replica_exchange.adapt_ladder"
+    for key in ("chunks", "min_attempts", "max_evals", "min_samples"):
+        v = _as_float(out[key], f"{where}.{key}")
+        if v != int(v) or v < (2 if key == "min_samples" else 1):
+            raise ValueError(f"{where}.{key} must be an integer >= "
+                             f"{2 if key == 'min_samples' else 1}, got {out[key]!r}")
+        out[key] = int(v)
+    for key in ("trust", "min_gap_ratio", "max_gap_ratio"):
+        out[key] = _as_float(out[key], f"{where}.{key}")
+    if out["max_time_s"] is not None:
+        out["max_time_s"] = _as_float(out["max_time_s"], f"{where}.max_time_s")
+        if out["max_time_s"] <= 0:
+            raise ValueError(f"{where}.max_time_s must be positive")
+    if not isinstance(out["per_row"], bool):
+        raise ValueError(f"{where}.per_row must be true or false, got {out['per_row']!r}")
+    if not out["trust"] > 1.0:
+        raise ValueError(f"{where}.trust must be > 1, got {out['trust']}")
+    if not 0.0 < out["min_gap_ratio"] <= 1.0 <= out["max_gap_ratio"]:
+        raise ValueError(f"{where}: need 0 < min_gap_ratio <= 1 <= max_gap_ratio, got "
+                         f"{out['min_gap_ratio']}, {out['max_gap_ratio']}")
+    if "pressures" not in re_cfg:
+        raise ValueError(f"{where} needs a pressure ladder (replica_exchange.pressures with a "
+                         f"gas reservoir): the ladder is moved in (T, log10 p)")
+    if "checkpoint" not in config:
+        raise ValueError(f"{where} needs a checkpoint section: the ladder is adapted between "
+                         f"checkpoint chunks")
+    n_steps = re_cfg.get("n_steps")
+    chunk = (config["checkpoint"] or {}).get("chunk", n_steps)
+    if n_steps is not None and chunk is not None and int(chunk) >= int(n_steps):
+        raise ValueError(f"{where} needs checkpoint.chunk ({chunk}) < n_steps ({n_steps}): the "
+                         f"ladder is adapted after a chunk, before the next one")
+    n_T, n_p = len(re_cfg.get("temperatures_K") or []), len(re_cfg.get("pressures") or [])
+    if n_T < 3 and n_p < 3:
+        raise ValueError(f"{where} needs at least 3 temperatures or 3 pressures: the corners "
+                         f"of the ladder stay fixed")
+    return out
 
 
 def _validate_site_exchange(config: Dict[str, Any]) -> None:
@@ -2120,6 +2194,9 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
     if scheme == "regc":
         sampling.update({k: re_cfg.get(k) for k in ("x0", "diffusion", "diffusion_steps",
                                                      "displace_substrate", "md", "hmc")})
+        adapt = _adapt_ladder_settings(config)
+        if adapt is not None:   # only then: older runs' metadata stay unchanged
+            sampling["adapt_ladder"] = adapt
     metadata = {
         "species": species, "masses_amu": masses,
         "temperatures_K": temperatures_K, "mu_grid_eV": np.asarray(mu_grid).tolist(),
@@ -2217,6 +2294,14 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
         n_mu = np.shape(mu_grid)[-1 if len(species) == 1 else -2]
         print(f"replica grid: {len(temperatures_K)} T x {n_mu} "
               f"{'p' if pressures is not None else 'mu'} = {len(temperatures_K) * n_mu} replicas")
+        adapt = sampling.get("adapt_ladder")
+        if adapt:
+            print(f"adaptive ladder: after each of the first {adapt['chunks']} chunks (with >= "
+                  f"{adapt['min_attempts']} swap attempts per pair), "
+                  f"{'one p ladder per T' if adapt['per_row'] else 'one shared p ladder'}, gaps "
+                  f"x{adapt['trust']:g} at most per step and within [{adapt['min_gap_ratio']:g}, "
+                  f"{adapt['max_gap_ratio']:g}] x the initial ones; samples discarded at each "
+                  f"change, then frozen")
 
     return {"geometry": geometry, "lattice_constant": a, "calc_spec": calc_spec,
             "species": species, "masses": masses, "feed": feed,
@@ -2549,7 +2634,7 @@ def run_from_config(config: Dict[str, Any], verbose: bool = True, resume: bool =
                     sim, out_dir, chunk=chunk, time_limit=None if limit is None else float(limit),
                     resume=resume, overwrite=overwrite, metadata=setup["metadata"],
                     progress=(lambda line: print(line, flush=True)) if verbose else None,
-                    **common, **kwargs)
+                    adapt_ladder=_ladder_adapter(setup, sim), **common, **kwargs)
                 finished = status.finished
             else:
                 sim.run_regc(**common, burn_in_steps=burn_in, verbose=verbose,
@@ -2593,6 +2678,37 @@ def run_from_config(config: Dict[str, Any], verbose: bool = True, resume: bool =
     elif verbose:
         print(f"Done (no phase_diagram section: sampling only). Outputs in {out_dir}/")
     return result
+
+
+def _ladder_adapter(setup: Dict[str, Any], sim) -> Any:
+    """
+    The `LadderAdapter` of a run with ``replica_exchange.adapt_ladder``.
+
+    Parameters
+    ----------
+    setup : dict
+        From `setup_from_config`.
+    sim : ReplicaExchangeGCMC
+        The simulation (its Lambda^3(T)).
+
+    Returns
+    -------
+    regc.ladder.LadderAdapter or None
+        None without ``adapt_ladder``.
+    """
+    from .ladder import LadderAdapter
+    from .units import kelvin_to_eV
+    settings = setup["metadata"]["sampling"].get("adapt_ladder")
+    if not settings:
+        return None
+    feed, unit = setup["feed"], setup["pressure_unit"]
+
+    def mu_of(T, y):
+        return feed.mu_at_T_eV(T, 10.0 ** y, unit=unit)
+    return LadderAdapter(mu_of, sim.lambda_cubed_of_T,
+                         [kelvin_to_eV(T) for T in setup["temperatures_K"]],
+                         np.log10(np.asarray(setup["pressures"], dtype=float)),
+                         kelvin_per_unit=1.0 / kelvin_to_eV(1.0), pressure_unit=unit, **settings)
 
 
 def _records_path(config: Dict[str, Any], out_dir: Optional[str] = None) -> str:
@@ -3219,6 +3335,10 @@ def analyze_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[st
     if pd_cfg.get("heat_capacity"):
         cv = analysis.heat_capacity(T_grid_eV, p_grid, pressure=True)
         ladder_p = meta.get("pressures")
+        if meta.get("pressure_grid") is not None:   # an adapted ladder
+            pg = np.asarray(meta["pressure_grid"], dtype=float)
+            # per-row pressures: no single sampled pressure list to flag ridges against
+            ladder_p = pg[0].tolist() if np.allclose(pg, pg[:1], rtol=1e-12) else None
         ladder_p = (np.asarray(ladder_p, dtype=float) * pascal_per(meta.get("pressure_unit") or unit)
                     / pascal_per(unit)) if ladder_p else None
         ridges = heat_capacity_ridges(T_grid_K, p_grid, cv, valid=valid, ladder=ladder_p)

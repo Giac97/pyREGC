@@ -261,7 +261,10 @@ def save_samples(sim, path: str) -> None:
     """
     Write a simulation's (or `SampleSet`'s) samples to an ``.npz`` file.
 
-    The write is atomic (temporary file + rename). The Lambda^3 convention
+    The write is atomic (temporary file + rename). The ladder is the
+    current one (``temperatures``, ``mu_grid``; ``ladder_version`` counts
+    the `ReplicaExchangeGCMC.set_ladder` changes, ``first_index`` the
+    samples discarded with them). The Lambda^3 convention
     is stored as the particle mass for a `ThermalWavelengthCubed` (the
     per-species masses for a `SpeciesLambdaCubed` of them), as "unit" for
     Lambda^3 = 1; any other callable is stored by its values on the ladder
@@ -311,6 +314,7 @@ def save_samples(sim, path: str) -> None:
     if n_substrate is not None:
         extra['n_substrate'] = np.array(int(n_substrate))
     extra['first_index'] = np.array(int(getattr(sim, 'first_index', 0)))
+    extra['ladder_version'] = np.array(int(getattr(sim, 'ladder_version', 0)))
     tmp = path + ".tmp.npz"
     with open(tmp, "wb") as f:
         np.savez(f, **extra, U=np.array([sim.samples[k]['U'] for k in keys], dtype=float),

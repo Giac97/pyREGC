@@ -363,7 +363,10 @@ def ladder_pairs(analysis, pressure: bool = False, decimals: int = 6) -> Dict[st
 
     Works for one rectangular grid and for merged runs alike: states with
     the same T (to `decimals`) form a row, ordered by y; states with the
-    same y form a column, ordered by T; neighbours are consecutive.
+    same y form a column, ordered by T; neighbours are consecutive. A
+    single grid (keys ``(it, imu)``) is grouped by its indices instead, so
+    a grid whose pressures differ from row to row (an adapted ladder,
+    `regc.ladder`) still pairs every column.
 
     Parameters
     ----------
@@ -381,10 +384,11 @@ def ladder_pairs(analysis, pressure: bool = False, decimals: int = 6) -> Dict[st
         ``{'y': [(key_a, key_b), ...], 'T': [...]}``.
     """
     coords = _state_coordinates(analysis, pressure)
+    grid = all(len(k) == 2 for k in coords)
     rows, cols = {}, {}
     for key, (T, y) in coords.items():
-        rows.setdefault(round(T, decimals), []).append(key)
-        cols.setdefault(round(y, decimals), []).append(key)
+        rows.setdefault(key[0] if grid else round(T, decimals), []).append(key)
+        cols.setdefault(key[1] if grid else round(y, decimals), []).append(key)
     pairs = {"y": [], "T": []}
     for axis, groups, coord in (("y", rows, 1), ("T", cols, 0)):
         for keys in groups.values():

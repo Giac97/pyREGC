@@ -1104,6 +1104,114 @@ page holds, so other pages open in the same browser cannot send them.
 Requests naming another host (DNS rebinding), and changes coming from
 another origin, are refused; so are foreign host names on `regc-monitor`.
 
+### 7.3 Adapting the ladder during a run
+
+A ladder chosen before the run rarely has even swap traffic: near a phase
+boundary neighbouring replicas barely overlap and walkers stall there,
+while elsewhere replicas are packed closer than needed. With
+`adapt_ladder` the driver moves the states after each of the first few
+checkpoint chunks, from the swap rates it has just measured, then freezes
+the ladder for the rest of the run.
+
+```python
+from regc import LadderAdapter, run_with_checkpoints
+
+adapter = LadderAdapter(lambda T, y: feed.mu_at_T_eV(T, 10 ** y, unit="bar"),
+                        sim.lambda_cubed_of_T, temperatures_eV, np.log10(pressures_bar),
+                        chunks=3, trust=1.5, per_row=True, min_gap_ratio=0.25,
+                        max_gap_ratio=4.0, min_attempts=20, kelvin_per_unit=1 / 8.617333262e-5,
+                        pressure_unit="bar")
+run_with_checkpoints(sim, "run_dir", n_steps=40000, chunk=4000, adapt_ladder=adapter, ...)
+```
+
+In a config file this is `replica_exchange.adapt_ladder` ([§14.5](#145-replica_exchange)).
+
+**What moves.** The temperatures T_l (one per row) and, per state, y =
+log10 p; every species' μ follows from the gas feed at (T, p), Λ³ from T.
+The corners stay: T_0 and T_last, and the first and last pressure of every
+row. So the left and right columns slide in T with the T ladder, and the
+bottom and top rows slide in p. With `per_row: true` each temperature gets
+its own pressure ladder; with `false` one ladder is shared (a product grid
+as before). Gaps are fractions of the fixed span, so the order never changes.
+
+**The model.** For a neighbouring pair (i, j) the swap acceptance is
+predicted as a = 2 Φ(−s/2) with s² = κ_ij Δθᵀ (C_i + C_j) Δθ, where
+θ = (β, βμ_s − ln Λ_s³, ...), Δθ = θ_i − θ_j, and C is the covariance of
+(U, −N_s, ...) at a state. This is the exact result for Gaussian
+fluctuations (κ = 1). κ_ij is chosen so that the model reproduces the
+acceptance measured for that pair at the current ladder, from the
+per-chunk pair counts in `mixing.json` (`pair_acceptance_by_chunk`, summed
+over the chunks since the last change; a rate of 0 or 1 is clipped to
+[0.5/attempts, 1 − 10⁻⁶]). C comes from the samples recorded since the last
+change; a moved state takes C interpolated from the sampled ones (linear in
+ln T between rows, linear in y along each row, held at the edges).
+
+**The objective.** The swap graph has one node per state and one edge per
+attempted pair, with conductance = predicted acceptance × the pair's share
+of the attempts. The optimiser (Powell, up to `max_evals` evaluations,
+about 1.5 ms each on an 8 × 8 grid) minimises ln R_T + ln R_μ, the
+effective resistances between the coldest and the hottest row and between
+the first and the last pressure column. On a finished 8 × 8 Pd(100)–O run
+one step with `trust: 1.5` predicts R_T × 0.73 and R_μ × 0.85 per row
+(about 5 % with one shared pressure ladder).
+
+**Constraints.** Each gap changes by at most a factor `trust` per
+adaptation, and stays within [`min_gap_ratio`, `max_gap_ratio`] × its
+initial size, cumulatively over the adaptations. Both are enforced exactly
+(the gaps are projected onto them). The coverage bound matters: without it
+the model games itself. It sees that a replica pinned on its neighbour
+swaps perfectly, and in a test run it collapsed the whole 300 K row onto
+the low-pressure corner, a ladder that no longer samples the map.
+
+**Why measured rates.** Predicting the acceptances by reweighting the
+samples (MBAR) to a candidate ladder was tried and fails where it matters:
+near phase transitions the effective sample size of a moved state drops to
+about one. The measured rates plus the covariance model need no such
+reweighting.
+
+**What a change does.** `ReplicaExchangeGCMC.set_ladder(temperatures,
+mu_grid)` gives every slot its new `ThermoState` (T, μ, Λ³(T), and the SGC
+field `sgc_dmu + T·sgc_log_ratio`); every move reads the state when it runs,
+so MD thermostats, HMC, NCMC and molecule moves follow. Configurations,
+energies, walkers, round trips and pair counts are kept. The samples so far
+belong to the old states and are discarded (the driver keeps them in
+`samples_ladder<version>.npz`); sample numbering continues (`first_index`),
+so stored configurations and records keep their indices. The convergence
+history is reset, and no convergence check runs until the ladder is
+frozen, so the stop rule only ever sees samples of the final ladder.
+Changing the states between chunks is exact for everything sampled
+afterwards, because nothing sampled before is kept.
+
+**Outputs.** `ladder.json` lists the settings, the initial ladder and every
+adaptation: step, temperatures (also in K), the log10 p and pressure grids,
+the μ grid, each pair's attempts, accepts, measured and predicted
+acceptance, κ, and the model's (R_T, R_μ) before and after. One line per
+adaptation goes to the log. `samples.npz` and `run_metadata.json` describe
+the current ladder: `temperatures_K`, `mu_grid_eV`, and `pressure_grid`
+(n_T × n_p) next to the configured `pressures`. A proposal that does not
+lower the loss keeps the ladder (no samples are lost) and still counts as
+one of the `chunks` adaptations. If some pair has fewer than `min_attempts`
+attempts (or a state fewer than `min_samples` samples) the step waits for
+the next chunk, which adds to the same window.
+
+**Resume.** The checkpoint stores the current ladder and the history. The
+setup check compares against the ladder the run was configured with, so an
+adapted run resumes, and continues bit-identically. A different
+configuration is still refused. `run_metadata.json` keeps the replaced
+entries under `ladder_adaptation` for that comparison. `max_time_s` makes a
+proposal depend on timing, which breaks this; `max_evals` does not.
+
+**Analysis.** MBAR does not need a product grid of sampled states, so
+`--analyze-only`, the overlap and correlation diagnostics, the bootstrap,
+the monitor (columns are labelled with their pressure range over T) and the
+analysis targets (taken from `phase_diagram`, not from the ladder) work
+unchanged. Two things behave differently with per-row pressures. The
+heat-capacity "on the ladder" flag needs one list of sampled pressures, so
+it is off. And `suggest_ladder` pairs grid neighbours by index, but its
+fill runs are still product grids. The records file keeps the ladder it
+was opened with in its attributes; its samples map to `samples.npz`
+through `first_index`.
+
 ## 8. Saving and loading samples
 
 ```python
@@ -3034,6 +3142,7 @@ The ladder: give `temperatures_K` and **exactly one** of `pressures` or
 | `swap_types` | all four | Subset of `[T, mu, cross_left, cross_right]`. |
 | `displace_substrate` | false | With `mc`: move displaceable substrate atoms too. |
 | `md` | – | `{timestep_fs: 1.0, thermostat: bussi, taut_fs: 20.0, friction_per_fs: 0.01}` for `diffusion: md`. |
+| `adapt_ladder` | off | Move the (T, p) ladder after the first chunks from the measured swap rates, then freeze it ([§7.3](#73-adapting-the-ladder-during-a-run)). `true` or `{chunks: 3, trust: 1.5, per_row: true, min_gap_ratio: 0.25, max_gap_ratio: 4.0, min_attempts: 20, min_samples: 5, max_evals: 20000, max_time_s: null}`. Needs `pressures`, a `checkpoint` section with `chunk` < `n_steps`, at least 3 temperatures or 3 pressures, and scipy. Every change discards the samples so far. |
 
 `scheme: sweep` keys: `n_cycles`, `sweeps_per_cycle` (100),
 `exchange_every` (1), `burn_in_cycles` (0), `diagonal_swaps` (true),
@@ -3230,7 +3339,8 @@ Everything goes to `output.directory`:
 | `status.json` | Always: the live heartbeat read by `regc-monitor` (progress, per-replica counts and averages, recent N and U traces, swap statistics, convergence checks), replaced every 5 s. |
 | `records.h5` | With `records.save`: per-sample records and energies under re-evaluated potentials ([§9.6](#96-other-potentials-records-re-evaluation-and-reweighting)). |
 | `phase_diagram_<name>.png`, `_<name>_difference.png`, `_<name>_ess.png` | With `phase_diagram.potentials`. |
-| `mixing.json` | Swap acceptance per pattern and per neighbouring pair (with the worst pair), round trips per walker along T and μ, and `chunks` (per-chunk pair attempts and accepts, aligned with `pairs`); rewritten after every chunk. |
+| `mixing.json` | Swap acceptance per pattern and per neighbouring pair (with the worst pair), round trips per walker along T and μ, and `chunks` (per-chunk pair attempts and accepts, aligned with `pairs`, and the `ladder_version` they were sampled on); rewritten after every chunk. |
+| `ladder.json`, `samples_ladder<v>.npz` | With `adapt_ladder`: every adaptation (ladder, measured and predicted acceptances, resistances), and the samples of each replaced ladder ([§7.3](#73-adapting-the-ladder-during-a-run)). `samples.npz` and `run_metadata.json` then hold the current ladder (`pressure_grid`: the pressure of every state). |
 | `phase_diagram_uncertainty.png` | With `bootstrap`: half-width of the coverage interval. |
 | reliability keys of `phase_diagram_data.npz` | Always: `statistical_inefficiency`, `n_independent`, `overlap_min` (replica grid), `round_trips_T` (with `mixing.json`); C_V: `heat_capacity_ridges_kept` (and `heat_capacity_ridges_on_ladder` with a pressure ladder). With `bootstrap`: `theta_ci_low`/`theta_ci_high`, `most_probable_agreement`, `heat_capacity_ci_low`/`heat_capacity_ci_high`, `heat_capacity_ridges_support`, `bootstrap_level`, `bootstrap_n`. |
 

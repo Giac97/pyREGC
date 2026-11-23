@@ -1858,8 +1858,15 @@ QTabBar::tab {{ padding: 7px 16px; }}
             lab = st.get("labels") or {}
             T = lab.get("temperatures_K") or meta.get("temperatures_K")
             P = lab.get("pressures") or meta.get("pressures")
+            PG = lab.get("pressure_grid") or meta.get("pressure_grid")
             unit = lab.get("pressure_unit") or meta.get("pressure_unit") or ""
-            rows = [f"{t:g} K" for t in T] if T else [str(i) for i in range(shape[0])]
+            rows = [f"{t:.4g} K" for t in T] if T else [str(i) for i in range(shape[0])]
+            if PG and len(PG) == shape[0]:   # an adapted ladder: pressures differ per row
+                cols = []
+                for j in range(shape[1]):
+                    lo, hi = min(r[j] for r in PG), max(r[j] for r in PG)
+                    cols.append(f"{lo:.0e}" + (f"–{hi:.0e}" if hi > lo * (1 + 1e-9) else ""))
+                return rows, cols, f"pressure ({unit}), range over T"
             cols = [f"{p:.0e}" for p in P] if P else [str(j) for j in range(shape[1])]
             return rows, cols, (f"pressure ({unit})" if P else "μ column")
 

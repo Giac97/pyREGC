@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -33,6 +34,9 @@ CHECKPOINT_FILE = "checkpoint.pkl"
 SAMPLES_FILE = "samples.npz"
 METADATA_FILE = "run_metadata.json"
 MIXING_FILE = "mixing.json"
+LADDER_FILE = "ladder.json"
+#: Metadata entry recording what an adapted ladder replaced (see `update_metadata`).
+LADDER_META_KEY = "ladder_adaptation"
 
 
 def write_mixing(sim, path: str, step: Optional[int] = None) -> dict:
@@ -55,7 +59,8 @@ def write_mixing(sim, path: str, step: Optional[int] = None) -> dict:
         What was written: acceptance per pattern, per pair (with the worst
         pair), the round trips of every walker along T and mu, and
         ``chunks``: per interval between snapshots, ``step_start``,
-        ``step_end`` and ``attempts`` / ``accepted`` aligned with ``pairs``.
+        ``step_end``, ``ladder_version`` and ``attempts`` / ``accepted``
+        aligned with ``pairs``.
     """
     if step is not None and hasattr(sim, "snapshot_pair_stats"):
         sim.snapshot_pair_stats(step)
@@ -74,6 +79,7 @@ def write_mixing(sim, path: str, step: Optional[int] = None) -> dict:
     order = sorted(pairs)
     chunks = sim.pair_acceptance_by_chunk() if hasattr(sim, "pair_acceptance_by_chunk") else []
     data["chunks"] = [{"step_start": c["step_start"], "step_end": c["step_end"],
+                       "ladder_version": c.get("ladder_version", 0),
                        "attempts": [c["pairs"].get(k, (0, 0))[0] for k in order],
                        "accepted": [c["pairs"].get(k, (0, 0))[1] for k in order]}
                       for c in chunks]
@@ -111,9 +117,58 @@ class RunStatus:
     resumed_from: int = 0
 
 
+def _write_json_atomic(path: str, data: dict) -> None:
+    """
+    Replace a JSON file atomically.
+
+    Parameters
+    ----------
+    path : str
+        The file.
+    data : dict
+        JSON-able data (numpy scalars allowed).
+    """
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1, default=float)
+    os.replace(tmp, path)
+
+
+def update_metadata(path: str, update: dict) -> None:
+    """
+    Record a moved ladder in the saved run metadata.
+
+    The entries of `update` replace the saved ones; what they replaced (and
+    which keys they added) is kept under ``ladder_adaptation``, so a resumed
+    run is still compared with the metadata it started from.
+
+    Parameters
+    ----------
+    path : str
+        ``run_metadata.json``.
+    update : dict
+        The new entries (e.g. `regc.ladder.LadderAdapter.metadata_update`).
+    """
+    with open(path) as f:
+        saved = json.load(f)
+    record = saved.setdefault(LADDER_META_KEY, {"original": {}, "added": []})
+    for key in update:
+        if key in record["original"] or key in record["added"]:
+            continue
+        if key in saved:
+            record["original"][key] = saved[key]
+        else:
+            record["added"].append(key)
+    saved.update(json.loads(json.dumps(update, default=float)))
+    _write_json_atomic(path, saved)
+
+
 def _check_metadata(path: str, metadata: dict) -> None:
     """
     Refuse to resume a run whose metadata differ from the saved ones.
+
+    Entries changed by an adapted ladder (`update_metadata`) are compared
+    in their original form.
 
     Parameters
     ----------
@@ -130,6 +185,11 @@ def _check_metadata(path: str, metadata: dict) -> None:
     """
     with open(path) as f:
         saved = json.load(f)
+    adapted = saved.pop(LADDER_META_KEY, None)
+    if adapted:
+        for key in adapted.get("added", []):
+            saved.pop(key, None)
+        saved.update(adapted.get("original", {}))
     current = json.loads(json.dumps(metadata, default=float))
     only = sorted(set(saved) ^ set(current))
     if only:
@@ -153,7 +213,7 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
                          convergence_median_tol: float = 1.3, convergence_discard: float = 0.2,
                          convergence_consecutive: int = NOISE_CONSECUTIVE,
                          convergence_min_round_trips: int = NOISE_MIN_ROUND_TRIPS,
-                         **diffusion_kwargs) -> RunStatus:
+                         adapt_ladder=None, **diffusion_kwargs) -> RunStatus:
     """
     Run `sim.run_regc` in checkpointed chunks.
 
@@ -217,6 +277,13 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
         After every chunk each replica's running energy is compared with a
         full recomputation (`ReplicaExchangeGCMC.check_energies`); a drift
         above this, per atom, is resynced with a warning. Default 1e-6.
+    adapt_ladder : regc.ladder.LadderAdapter, optional
+        Adapt the ladder after every chunk until it is frozen (see
+        `regc.ladder`): each change discards the samples so far (kept in
+        ``samples_ladder<version>.npz``), restarts the convergence checks
+        (skipped until the ladder is frozen) and is logged in
+        ``ladder.json``; ``run_metadata.json`` is updated to the current
+        ladder. Never after the last chunk. Default None (fixed ladder).
     **diffusion_kwargs
         Passed to `run_regc` (e.g. ``timestep_fs``, ``taut_fs``).
 
@@ -257,6 +324,9 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
             sim.convergence_history = [float(c) for c in changes]
         if progress:
             progress(f"resumed from {ckpt} at step {done}")
+        if adapt_ladder is not None and getattr(sim, "ladder_history", None) \
+                and hasattr(sim, "status_extra"):
+            sim.status_extra.update(adapt_ladder.status_labels(sim))
     elif os.path.isfile(ckpt) and not overwrite:
         raise FileExistsError(f"{ckpt} exists: resume=True to continue it, or overwrite=True")
     else:
@@ -296,7 +366,10 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
                           f"drift means the calculator's incremental and full energies disagree",
                           stacklevel=2)
         detail = None
-        if (convergence_every is not None and mode == "noise"
+        adapting = adapt_ladder is not None and adapt_ladder.pending(sim)
+        if adapting:
+            pass   # the ladder will still move: no convergence checks yet
+        elif (convergence_every is not None and mode == "noise"
                 and (done % convergence_every == 0 or done >= n_steps)):
             detail = sim.rho_u_noise_check(convergence_bins, convergence_tol, convergence_min_neff,
                                            convergence_median_tol, convergence_discard,
@@ -321,6 +394,25 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
             sim._maybe_write_status(n, n, "regc", force=True, converged=bool(converged))
         save_samples(sim, os.path.join(out_dir, SAMPLES_FILE))
         write_mixing(sim, os.path.join(out_dir, MIXING_FILE), step=done)
+        if adapting and done < n_steps:
+            version = sim.ladder_version
+            rec, reason = adapt_ladder.adapt(sim, done)
+            if rec is None:
+                if progress:
+                    progress(f"ladder not adapted at step {done}: {reason}")
+            else:
+                if rec["changed"]:
+                    # the samples of the old ladder (still on disk) are kept aside
+                    shutil.copyfile(os.path.join(out_dir, SAMPLES_FILE),
+                                    os.path.join(out_dir, f"samples_ladder{version}.npz"))
+                    changes, n_at_last_check, n_at_check_before = [], None, None
+                    update_metadata(meta_path, adapt_ladder.metadata_update(sim))
+                    if hasattr(sim, "status_extra"):
+                        sim.status_extra.update(adapt_ladder.status_labels(sim))
+                        sim._maybe_write_status(n, n, "regc", force=True)
+                _write_json_atomic(os.path.join(out_dir, LADDER_FILE), adapt_ladder.to_json(sim))
+                if progress:
+                    progress(adapt_ladder.describe(rec))
         sim.save_checkpoint(ckpt, extra={"steps_done": done, "n_at_last_check": n_at_last_check,
                                          "n_at_check_before": n_at_check_before,
                                          "rho_u_changes": changes, "converged": converged})

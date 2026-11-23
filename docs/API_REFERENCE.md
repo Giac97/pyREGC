@@ -14,6 +14,7 @@ Everything below is importable as `from regc import <name>`, except the runner f
 - [Replicas (`regc.replica`)](#replicas-regcreplica): `Replica`
 - [The replica-exchange engine (`regc.engine`)](#the-replica-exchange-engine-regcengine): `ReplicaExchangeGCMC`, `SWAP_TYPES`
 - [Checkpointed runs (`regc.driver`)](#checkpointed-runs-regcdriver): `run_with_checkpoints`, `RunStatus`, `EXIT_RESUBMIT`
+- [Adaptive replica ladder (`regc.ladder`)](#adaptive-replica-ladder-regcladder): `LadderAdapter`, `LadderProposal`, `propose_ladder`
 - [Sample I/O (`regc.io`)](#sample-io-regcio): `save_samples`, `load_samples`, `SampleSet`
 - [Units (`regc.units`)](#units-regcunits): `kelvin_to_eV`, `eV_to_kelvin`, `pascal_per`, `PRESSURE_UNITS`, `ThermalWavelengthCubed`, `SpeciesLambdaCubed`, `thermal_wavelength_angstrom`, `thermal_wavelength_cubed_angstrom3`, `default_mass_amu`
 - [Reduced-unit pressure conventions (`regc.pressure`)](#reduced-unit-pressure-conventions-regcpressure): `p0_reduced_units`, `p0_ideal_gas_wavelength`, `mu_from_pressure`, `pressure_from_mu`, `mu_grid_from_pressures`, `invert_mu_of_Tp`
@@ -2731,6 +2732,9 @@ Differences of successive snapshots are the per-chunk acceptances
 drift has not reached stationarity, which the cumulative
 `pair_acceptance` hides. The history is kept in the checkpoint.
 
+Each snapshot also records the current `ladder_version`: the
+interval ending at it was sampled on that ladder (`set_ladder`).
+
 **Parameters**
 
 - `step` (*int or None*): Steps done when the snapshot is taken (None if unknown).
@@ -2749,7 +2753,45 @@ Swap attempts and accepts of every pair between successive snapshots.
 
 **Returns**
 
-- *list of dict*: One dict per interval: `step_start` (None for the first interval of a history starting at an unknown step, or 0 for a fresh run), `step_end` and `pairs` = `{(key_a, key_b): (attempts, accepts)}`.
+- *list of dict*: One dict per interval: `step_start` (None for the first interval of a history starting at an unknown step, or 0 for a fresh run), `step_end`, `ladder_version` (the ladder the interval was sampled on) and `pairs` = `{(key_a, key_b): (attempts, accepts)}`.
+
+#### `ReplicaExchangeGCMC.set_ladder`
+
+```python
+ReplicaExchangeGCMC.set_ladder(temperatures: Sequence[float], mu_grid, info: Optional[dict] = None, step: Optional[int] = None) -> None
+```
+
+Move every grid point to a new (T, mu) state, discarding the samples recorded so far.
+
+The configurations stay where they are (each slot keeps its current
+configuration and energy, which do not depend on the state), and so
+do the walkers, round trips and pair statistics. Each slot gets a
+new `ThermoState`: temperature, mu, Lambda^3(T) from
+`lambda_cubed_of_T` and, for a semi-grand-canonical substrate, the
+field `sgc_dmu + T * sgc_log_ratio`. Every move reads the state
+when it runs, so the next sweep samples the new states exactly.
+The recorded samples belong to the old states: they are dropped
+(sample numbering continues, `first_index`, so stored
+configurations and records keep their indices), and so is the
+convergence history, so stop rules see only the new ladder. The
+per-pair swap counts are snapshotted first (at `step`) and later
+snapshots carry the new `ladder_version`, so per-chunk rates of
+the new ladder can be told apart (`pair_acceptance_by_chunk`).
+
+**Parameters**
+
+- `temperatures` (*sequence of float*): New temperature ladder, length n_T (the grid shape is kept).
+- `mu_grid` (*array_like*): New chemical potentials, shape (n_T, n_mu), or (n_T, n_mu, n_species) with several species.
+- `info` (*dict, optional*): Appended to `ladder_history` (with the new `version`). Default None (an empty record).
+- `step` (*int, optional*): Steps done, for the pair-statistics snapshot. Default None.
+
+**Returns**
+
+- *None*
+
+**Raises**
+
+- *ValueError*: If the shapes do not match the grid or a temperature is not positive.
 
 #### `ReplicaExchangeGCMC.round_trip_counts`
 
@@ -2957,7 +2999,7 @@ What a checkpoint must agree with to be loaded into this simulation.
 
 **Returns**
 
-- *dict*: The temperature ladder, the mu grid and Lambda^3 on the ladder.
+- *dict*: The temperature ladder, the mu grid and Lambda^3 on the ladder, as constructed: a ladder moved by `set_ladder` is stored in the checkpoint separately, so an adapted run still matches its setup.
 
 #### `ReplicaExchangeGCMC.save_checkpoint`
 
@@ -2987,7 +3029,9 @@ ReplicaExchangeGCMC.load_checkpoint(path: str) -> dict
 Restore a state saved by `save_checkpoint` into this simulation.
 
 The simulation must have been constructed with the same temperature
-ladder, mu grid, Lambda^3(T) and `adsorbed_cutoff`. The
+ladder, mu grid, Lambda^3(T) and `adsorbed_cutoff` (the ladder it
+was constructed with: a ladder moved by `set_ladder` is restored
+from the checkpoint). The
 checkpoint supplies the configurations, energies, random streams
 and samples; the calculators and the move settings (`max_disp`,
 HMC) are this simulation's, built from the current setup. So a
@@ -3132,7 +3176,7 @@ SWAP_TYPES = ('T', 'mu', 'cross_left', 'cross_right')
 ### `run_with_checkpoints`
 
 ```python
-run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000, x0: float = 0.99, diffusion: str = 'mc', diffusion_steps: int = 10, record_every: int = 100, convergence_every: Optional[int] = None, convergence_tol: Optional[float] = None, time_limit: Optional[float] = None, resume: bool = True, overwrite: bool = False, metadata: Optional[dict] = None, progress: Optional[Callable[[str], None]] = <built-in function print>, energy_tol: float = 1e-06, convergence_mode: str = 'blocks', convergence_bins: Optional[int] = None, convergence_min_neff: float = 50.0, convergence_median_tol: float = 1.3, convergence_discard: float = 0.2, convergence_consecutive: int = 2, convergence_min_round_trips: int = 1, **diffusion_kwargs) -> RunStatus
+run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000, x0: float = 0.99, diffusion: str = 'mc', diffusion_steps: int = 10, record_every: int = 100, convergence_every: Optional[int] = None, convergence_tol: Optional[float] = None, time_limit: Optional[float] = None, resume: bool = True, overwrite: bool = False, metadata: Optional[dict] = None, progress: Optional[Callable[[str], None]] = <built-in function print>, energy_tol: float = 1e-06, convergence_mode: str = 'blocks', convergence_bins: Optional[int] = None, convergence_min_neff: float = 50.0, convergence_median_tol: float = 1.3, convergence_discard: float = 0.2, convergence_consecutive: int = 2, convergence_min_round_trips: int = 1, adapt_ladder=None, **diffusion_kwargs) -> RunStatus
 ```
 
 Run `sim.run_regc` in checkpointed chunks.
@@ -3159,6 +3203,7 @@ Run `sim.run_regc` in checkpointed chunks.
 - `metadata` (*dict, optional*): JSON-serialisable description of the run (potential, lattice constant, protocol, ...). Saved on a fresh start; on resume every key must match the saved value.
 - `progress` (*callable, optional*): Called with a one-line status after every chunk. Default `print`; None for silence.
 - `energy_tol` (*float, optional*): After every chunk each replica's running energy is compared with a full recomputation (`ReplicaExchangeGCMC.check_energies`); a drift above this, per atom, is resynced with a warning. Default 1e-6.
+- `adapt_ladder` (*regc.ladder.LadderAdapter, optional*): Adapt the ladder after every chunk until it is frozen (see `regc.ladder`): each change discards the samples so far (kept in `samples_ladder<version>.npz`), restarts the convergence checks (skipped until the ladder is frozen) and is logged in `ladder.json`; `run_metadata.json` is updated to the current ladder. Never after the last chunk. Default None (fixed ladder).
 - `**diffusion_kwargs`: Passed to `run_regc` (e.g. `timestep_fs`, `taut_fs`).
 
 **Returns**
@@ -3196,6 +3241,332 @@ Outcome of `run_with_checkpoints`.
 EXIT_RESUBMIT = 75
 ```
 
+## Adaptive replica ladder (`regc.ladder`)
+
+### `LadderAdapter`
+
+```python
+LadderAdapter(mu_of: Callable, lambda_cubed_of_T: Callable, temperatures, log10p, chunks: int = 3, trust: float = 1.5, per_row: bool = True, min_gap_ratio: float = 0.25, max_gap_ratio: float = 4.0, min_attempts: int = 20, max_evals: int = 20000, max_time_s: Optional[float] = None, min_samples: int = 5, kelvin_per_unit: Optional[float] = None, pressure_unit: Optional[str] = None)
+```
+
+Adapt the ladder of a running `ReplicaExchangeGCMC` between chunks.
+
+At each call of `adapt` (the driver calls it after every chunk while
+`pending`): sum the per-chunk swap counts of the current ladder
+(`window_counts`); if every pair has `min_attempts`, estimate the
+covariances from the samples recorded since the last ladder change,
+run `propose_ladder` and apply the result with
+`ReplicaExchangeGCMC.set_ladder` (which discards the samples of the old
+states). After `chunks` adaptations the ladder is frozen.
+
+**Parameters**
+
+- `mu_of` (*callable*): `mu_of(T, y)`: chemical potential(s) at engine temperature T and pressure 10**y (e.g. a gas feed's `mu_at_T_eV`).
+- `lambda_cubed_of_T` (*callable*): Lambda^3(T) (the simulation's).
+- `temperatures` (*array_like*): The initial (configured) ladder, engine units.
+- `log10p` (*array_like*): Its log10 pressures, shape (n_mu,) or (n_T, n_mu).
+- `chunks` (*int, optional*): Adaptations before the ladder is frozen. Default 3.
+- `trust` (*float, optional*): Largest factor by which a gap changes per adaptation. Default 1.5.
+- `per_row` (*bool, optional*): One pressure ladder per temperature (True) or one shared. Default True.
+- `min_gap_ratio, max_gap_ratio` (*float, optional*): Bounds of every gap relative to its initial value. Default 0.25, 4.
+- `min_attempts` (*int, optional*): Swap attempts every pair needs in the window. Default 20.
+- `max_evals` (*int, optional*): Loss evaluations per optimisation. Default 20000.
+- `max_time_s` (*float, optional*): Wall-time budget per optimisation. Default None.
+- `min_samples` (*int, optional*): Samples every state needs in the window. Default 5.
+- `kelvin_per_unit` (*float, optional*): Engine temperature unit in kelvin (1 / k_B in eV/K for real runs), for the reports. Default None (engine units only).
+- `pressure_unit` (*str, optional*): Unit of 10**y, for the reports. Default None.
+
+**Raises**
+
+- *ValueError*: On invalid settings or a ladder with nothing to adapt.
+
+**Constructor**
+
+Store the settings and the initial ladder.
+
+**Parameters**
+
+- `mu_of` (*callable*): `mu_of(T, y)`.
+- `lambda_cubed_of_T` (*callable*): Lambda^3(T).
+- `temperatures` (*array_like*): Initial ladder.
+- `log10p` (*array_like*): Initial log10 pressures.
+- `chunks` (*int, optional*): Adaptations before freezing. Default 3.
+- `trust` (*float, optional*): Trust factor. Default 1.5.
+- `per_row` (*bool, optional*): Per-row pressure ladders. Default True.
+- `min_gap_ratio, max_gap_ratio` (*float, optional*): Coverage bounds. Default 0.25, 4.
+- `min_attempts` (*int, optional*): Attempts per pair. Default 20.
+- `max_evals` (*int, optional*): Evaluations per optimisation. Default 20000.
+- `max_time_s` (*float, optional*): Time per optimisation. Default None.
+- `min_samples` (*int, optional*): Samples per state. Default 5.
+- `kelvin_per_unit` (*float, optional*): Kelvin per engine temperature unit. Default None.
+- `pressure_unit` (*str, optional*): Pressure unit. Default None.
+
+**Raises**
+
+- *ValueError*: On invalid settings or a ladder with nothing to adapt.
+
+#### `LadderAdapter.settings`
+
+```python
+LadderAdapter.settings() -> dict
+```
+
+The adaptation settings.
+
+**Returns**
+
+- *dict*: JSON-able.
+
+#### `LadderAdapter.history` (staticmethod)
+
+```python
+LadderAdapter.history(sim) -> List[dict]
+```
+
+The adaptations made so far (kept by the simulation, so in its checkpoint).
+
+**Parameters**
+
+- `sim` (*ReplicaExchangeGCMC*): The simulation.
+
+**Returns**
+
+- *list of dict*: One record per adaptation.
+
+#### `LadderAdapter.pending`
+
+```python
+LadderAdapter.pending(sim) -> bool
+```
+
+Whether adaptations remain (the ladder is not frozen yet).
+
+**Parameters**
+
+- `sim` (*ReplicaExchangeGCMC*): The simulation.
+
+**Returns**
+
+- *bool*: True while fewer than `chunks` adaptations were made.
+
+#### `LadderAdapter.current_log10p`
+
+```python
+LadderAdapter.current_log10p(sim) -> np.ndarray
+```
+
+log10 p of every current state.
+
+**Parameters**
+
+- `sim` (*ReplicaExchangeGCMC*): The simulation.
+
+**Returns**
+
+- *numpy.ndarray*: Shape (n_T, n_mu).
+
+#### `LadderAdapter.propose`
+
+```python
+LadderAdapter.propose(sim) -> Tuple[Optional[LadderProposal], str]
+```
+
+A ladder proposal from the current window, if the window suffices.
+
+**Parameters**
+
+- `sim` (*ReplicaExchangeGCMC*): The simulation (its per-chunk pair counts and current samples).
+
+**Returns**
+
+- *tuple*: `(proposal, '')`, or `(None, reason)` when the window holds too few swap attempts or samples.
+
+**Raises**
+
+- *ValueError*: If the simulation's grid does not match the ladder.
+
+#### `LadderAdapter.apply`
+
+```python
+LadderAdapter.apply(sim, proposal: LadderProposal, step: Optional[int] = None) -> dict
+```
+
+Apply a proposal to the simulation and record it.
+
+An improving proposal goes through `ReplicaExchangeGCMC.set_ladder`
+(new states, samples discarded); otherwise the ladder is kept and
+only the record is added.
+
+**Parameters**
+
+- `sim` (*ReplicaExchangeGCMC*): The simulation.
+- `proposal` (*LadderProposal*): From `propose`.
+- `step` (*int, optional*): Steps done (recorded). Default None.
+
+**Returns**
+
+- *dict*: The record (also appended to `sim.ladder_history`).
+
+#### `LadderAdapter.adapt`
+
+```python
+LadderAdapter.adapt(sim, step: Optional[int] = None) -> Tuple[Optional[dict], str]
+```
+
+Propose and apply a new ladder if the window suffices.
+
+**Parameters**
+
+- `sim` (*ReplicaExchangeGCMC*): The simulation.
+- `step` (*int, optional*): Steps done. Default None.
+
+**Returns**
+
+- *tuple*: `(record, '')` or `(None, reason)`.
+
+#### `LadderAdapter.describe`
+
+```python
+LadderAdapter.describe(rec: dict) -> str
+```
+
+One line summarising an adaptation.
+
+**Parameters**
+
+- `rec` (*dict*): A record from `apply`.
+
+**Returns**
+
+- *str*: The line.
+
+#### `LadderAdapter.to_json`
+
+```python
+LadderAdapter.to_json(sim) -> dict
+```
+
+Everything `ladder.json` holds: settings, initial ladder, adaptations.
+
+**Parameters**
+
+- `sim` (*ReplicaExchangeGCMC*): The simulation.
+
+**Returns**
+
+- *dict*: JSON-able.
+
+#### `LadderAdapter.metadata_update`
+
+```python
+LadderAdapter.metadata_update(sim) -> dict
+```
+
+The run-metadata entries describing the current ladder.
+
+**Parameters**
+
+- `sim` (*ReplicaExchangeGCMC*): The simulation.
+
+**Returns**
+
+- *dict*: `temperatures_K` (or `temperatures` without `kelvin_per_unit`), `mu_grid_eV`, `pressure_grid` (n_T, n_mu) and `ladder_version`.
+
+#### `LadderAdapter.status_labels`
+
+```python
+LadderAdapter.status_labels(sim) -> dict
+```
+
+The monitor labels of the current ladder (`status.json`).
+
+**Parameters**
+
+- `sim` (*ReplicaExchangeGCMC*): The simulation.
+
+**Returns**
+
+- *dict*: `temperatures_K` (if known) and `pressure_grid`.
+
+---
+
+### `LadderProposal`
+
+```python
+LadderProposal(temperatures: np.ndarray, log10p: np.ndarray, mu_grid: np.ndarray, resistance_before: Tuple[float, float], resistance_after: Tuple[float, float], pairs: List[Pair], attempts: np.ndarray, accepted: np.ndarray, predicted_before: np.ndarray, predicted_after: np.ndarray, kappa: np.ndarray, n_evals: int, seconds: float, improved: bool, message: str) -> None
+```
+
+A proposed ladder and what the model predicts for it.
+
+**Attributes**
+
+- `temperatures` (*numpy.ndarray*): New ladder, shape (n_T,).
+- `log10p` (*numpy.ndarray*): New log10 p of every state, shape (n_T, n_mu).
+- `mu_grid` (*numpy.ndarray*): Chemical potentials, shape (n_T, n_mu) or (n_T, n_mu, n_species).
+- `resistance_before, resistance_after` (*tuple of float*): `(R_T, R_mu)` of the current and the proposed ladder (model).
+- `pairs` (*list of tuple*): The calibrated pairs.
+- `attempts, accepted` (*numpy.ndarray*): Window counts per pair.
+- `predicted_before, predicted_after` (*numpy.ndarray*): Model acceptance per pair at the current (the clipped measured rate, by calibration) and at the proposed ladder.
+- `kappa` (*numpy.ndarray*): Calibration factor per pair.
+- `n_evals` (*int*): Loss evaluations of the optimiser.
+- `seconds` (*float*): Wall time of the optimisation.
+- `improved` (*bool*): Whether the proposal lowers the loss (if not, it is the current ladder).
+- `message` (*str*): Optimiser status.
+
+#### `LadderProposal.to_dict`
+
+```python
+LadderProposal.to_dict() -> dict
+```
+
+JSON-able summary (what `ladder.json` stores per adaptation).
+
+**Returns**
+
+- *dict*: The fields as lists and floats; `pairs` as `[[l, m], [l', m']]`.
+
+---
+
+### `propose_ladder`
+
+```python
+propose_ladder(temperatures, log10p, covariances: np.ndarray, pairs: Sequence[Pair], attempts, accepted, mu_of: Callable, lambda_cubed_of_T: Callable, initial_temperatures=None, initial_log10p=None, trust: float = 1.5, per_row: bool = True, min_gap_ratio: float = 0.25, max_gap_ratio: float = 4.0, max_evals: int = 20000, max_time_s: Optional[float] = None) -> LadderProposal
+```
+
+Optimise the ladder for the swap-graph resistances, within trust and coverage bounds.
+
+Parametrisation: the gaps of ln T, and of y = log10 p along every row
+(`per_row`) or along one row shared by all (product grid), as fractions
+of the fixed span; corners T_0, T_last and every row's first and last y
+are fixed, so order is kept. Each gap stays within [1/trust, trust] x
+its current value and [min_gap_ratio, max_gap_ratio] x its initial value
+(bounds enforced exactly by projection). Minimises ln R_T + ln R_mu of
+`AcceptanceModel` with Powell's method from the current ladder.
+
+**Parameters**
+
+- `temperatures` (*array_like*): Current ladder, shape (n_T,).
+- `log10p` (*array_like*): Current log10 p, shape (n_T, n_mu) (or (n_mu,), shared by every row).
+- `covariances` (*numpy.ndarray*): Covariance of (U, -N_s, ...) at every current state, shape (n_T, n_mu, d, d).
+- `pairs` (*sequence of tuple*): Attempted neighbouring pairs `((l, m), (l', m'))`.
+- `attempts, accepted` (*array_like*): Swap attempts and accepts of every pair in the calibration window.
+- `mu_of` (*callable*): `mu_of(T, y)`: chemical potential(s) at (T, 10**y).
+- `lambda_cubed_of_T` (*callable*): Lambda^3(T).
+- `initial_temperatures, initial_log10p` (*array_like, optional*): The ladder the run started from (coverage bounds). Default: the current one.
+- `trust` (*float, optional*): Largest factor by which one gap changes. Default 1.5.
+- `per_row` (*bool, optional*): One pressure ladder per row (True) or one shared by all rows. Default True.
+- `min_gap_ratio, max_gap_ratio` (*float, optional*): Bounds of every gap relative to its initial value. Default 0.25, 4.
+- `max_evals` (*int, optional*): Most loss evaluations. Default 20000 (Powell usually converges before: about 10000 on an 8 x 8 grid, per row).
+- `max_time_s` (*float, optional*): Wall-time budget of the optimisation (makes the result timing dependent). Default None (no limit).
+
+**Returns**
+
+- *LadderProposal*: The proposal (the current ladder if nothing better was found).
+
+**Raises**
+
+- *ValueError*: On inconsistent shapes, a non-monotonic ladder, a product mode with different rows, moved corners, or bad bounds.
+
 ## Sample I/O (`regc.io`)
 
 ### `save_samples`
@@ -3206,7 +3577,10 @@ save_samples(sim, path: str) -> None
 
 Write a simulation's (or `SampleSet`'s) samples to an `.npz` file.
 
-The write is atomic (temporary file + rename). The Lambda^3 convention
+The write is atomic (temporary file + rename). The ladder is the
+current one (`temperatures`, `mu_grid`; `ladder_version` counts
+the `ReplicaExchangeGCMC.set_ladder` changes, `first_index` the
+samples discarded with them). The Lambda^3 convention
 is stored as the particle mass for a `ThermalWavelengthCubed` (the
 per-species masses for a `SpeciesLambdaCubed` of them), as "unit" for
 Lambda^3 = 1; any other callable is stored by its values on the ladder

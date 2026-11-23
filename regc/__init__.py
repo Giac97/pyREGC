@@ -40,6 +40,8 @@ lammps_backend  LammpsCalculator (any LAMMPS pair style; native MD),
 Running and analysing
 ---------------------
 driver    run_with_checkpoints, RunStatus, EXIT_RESUBMIT -- long/batch runs
+ladder    LadderAdapter, propose_ladder -- adapt the (T, p) ladder from measured swap
+          rates between checkpoint chunks (needs scipy)
 io        save_samples, load_samples, SampleSet
 observables  CoordinationNumber, CoordinationHistogram, RadialDistribution,
              FunctionObservable -- structural observables recorded with every sample
@@ -120,6 +122,7 @@ from .structures import (
 )
 from .io import SampleSet, load_samples, save_samples
 from .driver import EXIT_RESUBMIT, RunStatus, run_with_checkpoints
+from .ladder import LadderAdapter, LadderProposal, propose_ladder
 
 __all__ = [
     # calculators and systems
@@ -148,6 +151,7 @@ __all__ = [
     "reference_lattice_constant", "surface_slab", "substrate_layers", "layer_planes",
     # running and analysis
     "run_with_checkpoints", "RunStatus", "EXIT_RESUBMIT",
+    "LadderAdapter", "LadderProposal", "propose_ladder",
     "save_samples", "load_samples", "SampleSet",
     "MBARSurfaceAnalysis", "plot_phase_diagram", "plot_map", "plot_radial_distribution",
     "heat_capacity_ridges", "export_phase_configurations",

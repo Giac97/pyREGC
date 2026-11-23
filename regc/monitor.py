@@ -846,10 +846,13 @@ $("run").onchange=()=>{cur=+$("run").value;sel=null;refresh()};fromHash()}
 function fromHash(){const m=location.hash.match(/run=(\d+)/);if(m&&runs.some(r=>r.id==+m[1])){cur=+m[1];$("run").value=cur;sel=null}}
 window.addEventListener("hashchange",async()=>{await loadRuns();refresh()});
 function axes(st,meta){const lab=st&&st.labels||{};const nT=st?st.shape[0]:0,nM=st?st.shape[1]:0;
-const TK=lab.temperatures_K||(meta&&meta.temperatures_K);let y=TK?TK.map(t=>t+" K"):st.temperatures.map(t=>"T="+fmtN(t,4));
+const TK=lab.temperatures_K||(meta&&meta.temperatures_K);let y=TK?TK.map(t=>(+Number(t).toPrecision(4))+" K"):st.temperatures.map(t=>"T="+fmtN(t,4));
 const P=lab.pressures||(meta&&meta.pressures),u=lab.pressure_unit||(meta&&meta.pressure_unit)||"";
-let x=[];for(let j=0;j<nM;j++){x.push(P?`${fmtP(P[j])} ${u}`:`μ=${fmtN(Array.isArray(st.mu_grid[0][j])?st.mu_grid[0][j][0]:st.mu_grid[0][j],4)}`)}
-return {x,y,xt:P?"pressure":"μ (column, eV at lowest T)",yt:"temperature"}}
+const PG=lab.pressure_grid||(meta&&meta.pressure_grid);
+let x=[];for(let j=0;j<nM;j++){if(PG&&PG.length==nT){const c=PG.map(r=>r[j]),lo=Math.min(...c),hi=Math.max(...c);
+x.push(`${j}: ${fmtP(lo)}${hi>lo*(1+1e-9)?"–"+fmtP(hi):""} ${u}`);continue}
+x.push(P?`${fmtP(P[j])} ${u}`:`μ=${fmtN(Array.isArray(st.mu_grid[0][j])?st.mu_grid[0][j][0]:st.mu_grid[0][j],4)}`)}
+return {x,y,xt:PG?"pressure (column: range over T, adapted ladder)":P?"pressure":"μ (column, eV at lowest T)",yt:"temperature"}}
 function draw(d){last=d;const st=d.status,meta=d.metadata;$("badge").className="badge "+d.state;$("badge").textContent=d.state;
 $("updated").textContent=d.last_update?`updated ${fmtT(d.now-d.last_update)} ago`+(d.state=="quiet"?" (no heartbeat: the log reports every 10 % of the run)":""):"no data yet";
 const frac=d.step&&d.n_steps?d.step/d.n_steps:0;$("pbar").style.width=(100*frac).toFixed(1)+"%";

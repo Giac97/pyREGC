@@ -33,6 +33,7 @@ MODULE_ORDER = [
     ("replica", "Replicas"),
     ("engine", "The replica-exchange engine"),
     ("driver", "Checkpointed runs"),
+    ("ladder", "Adaptive replica ladder"),
     ("io", "Sample I/O"),
     ("units", "Units"),
     ("pressure", "Reduced-unit pressure conventions"),

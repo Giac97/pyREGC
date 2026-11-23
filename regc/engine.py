@@ -405,7 +405,13 @@ class ReplicaExchangeGCMC:
         # noise-aware checks: one summary dict per check (see rho_u_noise_check)
         self.convergence_details: List[dict] = []
         self.convergence_settings: Optional[dict] = None
+        # adaptive ladder (`set_ladder`): the configured ladder is what checkpoints must match
+        self._initial_ladder = ([float(T) for T in self.temperatures], self.mu_grid.copy())
+        self.ladder_version = 0
+        self.ladder_history: List[dict] = []
+        self.first_index = 0   # run index of samples[key][0] (samples before are discarded)
         self._init_walkers()
+
     @staticmethod
     def _parse_mus(mus_arr: np.ndarray, n_T: int, n_species: int) -> np.ndarray:
         """
@@ -800,6 +806,9 @@ class ReplicaExchangeGCMC:
         drift has not reached stationarity, which the cumulative
         `pair_acceptance` hides. The history is kept in the checkpoint.
 
+        Each snapshot also records the current ``ladder_version``: the
+        interval ending at it was sampled on that ladder (`set_ladder`).
+
         Parameters
         ----------
         step : int or None
@@ -809,13 +818,14 @@ class ReplicaExchangeGCMC:
         -------
         None
         """
+        snap = {"step": None if step is None else int(step),
+                "pairs": {k: list(v) for k, v in self.pair_stats.items()},
+                "ladder_version": int(getattr(self, "ladder_version", 0))}
         if self.pair_stats_history and self.pair_stats_history[-1]["step"] == step \
                 and step is not None:
-            self.pair_stats_history[-1] = {"step": step, "pairs": {
-                k: list(v) for k, v in self.pair_stats.items()}}   # same step: replace
+            self.pair_stats_history[-1] = snap   # same step: replace
             return
-        self.pair_stats_history.append({"step": None if step is None else int(step),
-                                        "pairs": {k: list(v) for k, v in self.pair_stats.items()}})
+        self.pair_stats_history.append(snap)
 
     def pair_acceptance_by_chunk(self) -> List[dict]:
         """
@@ -826,7 +836,8 @@ class ReplicaExchangeGCMC:
         list of dict
             One dict per interval: ``step_start`` (None for the first
             interval of a history starting at an unknown step, or 0 for a
-            fresh run), ``step_end`` and ``pairs`` = ``{(key_a, key_b):
+            fresh run), ``step_end``, ``ladder_version`` (the ladder the
+            interval was sampled on) and ``pairs`` = ``{(key_a, key_b):
             (attempts, accepts)}``.
         """
         out, prev = [], {"step": 0, "pairs": {}}
@@ -838,9 +849,84 @@ class ReplicaExchangeGCMC:
             for k, (att, acc) in snap["pairs"].items():
                 a0, c0 = prev["pairs"].get(k, (0, 0))
                 pairs[k] = (int(att - a0), int(acc - c0))
-            out.append({"step_start": prev["step"], "step_end": snap["step"], "pairs": pairs})
+            out.append({"step_start": prev["step"], "step_end": snap["step"],
+                        "ladder_version": int(snap.get("ladder_version", 0)), "pairs": pairs})
             prev = snap
         return out
+
+    def set_ladder(self, temperatures: Sequence[float], mu_grid, info: Optional[dict] = None,
+                   step: Optional[int] = None) -> None:
+        """
+        Move every grid point to a new (T, mu) state, discarding the samples recorded so far.
+
+        The configurations stay where they are (each slot keeps its current
+        configuration and energy, which do not depend on the state), and so
+        do the walkers, round trips and pair statistics. Each slot gets a
+        new `ThermoState`: temperature, mu, Lambda^3(T) from
+        `lambda_cubed_of_T` and, for a semi-grand-canonical substrate, the
+        field ``sgc_dmu + T * sgc_log_ratio``. Every move reads the state
+        when it runs, so the next sweep samples the new states exactly.
+        The recorded samples belong to the old states: they are dropped
+        (sample numbering continues, ``first_index``, so stored
+        configurations and records keep their indices), and so is the
+        convergence history, so stop rules see only the new ladder. The
+        per-pair swap counts are snapshotted first (at `step`) and later
+        snapshots carry the new ``ladder_version``, so per-chunk rates of
+        the new ladder can be told apart (`pair_acceptance_by_chunk`).
+
+        Parameters
+        ----------
+        temperatures : sequence of float
+            New temperature ladder, length n_T (the grid shape is kept).
+        mu_grid : array_like
+            New chemical potentials, shape (n_T, n_mu), or (n_T, n_mu,
+            n_species) with several species.
+        info : dict, optional
+            Appended to ``ladder_history`` (with the new ``version``).
+            Default None (an empty record).
+        step : int, optional
+            Steps done, for the pair-statistics snapshot. Default None.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If the shapes do not match the grid or a temperature is not positive.
+        """
+        T_new = [float(T) for T in temperatures]
+        mus = np.asarray(mu_grid, dtype=float)
+        expected = self.mu_grid.shape
+        if len(T_new) != self.shape[0] or mus.shape != expected:
+            raise ValueError(f"set_ladder needs {self.shape[0]} temperatures and mu_grid of "
+                             f"shape {expected}; got {len(T_new)} and {mus.shape}")
+        if min(T_new) <= 0.0:
+            raise ValueError("temperatures must be positive")
+        last = self.pair_stats_history[-1]["pairs"] if self.pair_stats_history else {}
+        if {k: list(v) for k, v in self.pair_stats.items()} != last:
+            self.snapshot_pair_stats(step)   # close the interval sampled on the old ladder
+        for (it, imu), r in self.grid.items():
+            T = T_new[it]
+            if self.n_species == 1:
+                mu, lam3 = float(mus[it, imu]), self.lambda_cubed_of_T(T)
+            else:
+                mu = mus[it, imu].copy()
+                lam3 = np.broadcast_to(np.asarray(self.lambda_cubed_of_T(T), dtype=float),
+                                       (self.n_species,)).copy()
+            r.state = ThermoState(T, mu, label=(it, imu), lambda_cubed=lam3,
+                                  sgc_dmu=None if self.sgc_dmu is None
+                                  else self.sgc_dmu + T * self.sgc_log_ratio)
+        self.temperatures, self.mu_grid = T_new, mus.copy()
+        n_old = max((len(v["U"]) for v in self.samples.values()), default=0)
+        self.first_index += n_old
+        for v in self.samples.values():
+            for name in v:
+                v[name] = []
+        self.convergence_history, self.convergence_details = [], []
+        self.ladder_version += 1
+        self.ladder_history.append({**(info or {}), "version": self.ladder_version})
 
     def round_trip_counts(self) -> Dict[str, np.ndarray]:
         """
@@ -961,7 +1047,7 @@ class ReplicaExchangeGCMC:
                     for name, v in evaluate_observables(self.observables, r.system).items():
                         self.samples[key]['obs:' + name].append(v)
                     if self.configurations_dir is not None or self.records_path is not None:
-                        sample = len(self.samples[key]['U']) - 1
+                        sample = self.first_index + len(self.samples[key]['U']) - 1
                         config = snapshot(r.system)
                         if self.configurations_dir is not None:
                             self._store_configuration(key, sample, r.energy, config)
@@ -1177,7 +1263,7 @@ class ReplicaExchangeGCMC:
                         self.samples[key]['N_s'].append(N_s)
                     for name, v in obs.items():
                         self.samples[key]['obs:' + name].append(v)
-                    sample = len(self.samples[key]['U']) - 1
+                    sample = self.first_index + len(self.samples[key]['U']) - 1
                     if config is not None and self.configurations_dir is not None:
                         self._store_configuration(key, sample, U, config)
                     self._record(key, sample, U, N, N_s, config)
@@ -1439,12 +1525,16 @@ class ReplicaExchangeGCMC:
         Returns
         -------
         dict
-            The temperature ladder, the mu grid and Lambda^3 on the ladder.
+            The temperature ladder, the mu grid and Lambda^3 on the ladder,
+            as constructed: a ladder moved by `set_ladder` is stored in the
+            checkpoint separately, so an adapted run still matches its setup.
         """
-        return {"temperatures": [float(T) for T in self.temperatures],
-                "mu_grid": np.asarray(self.mu_grid, dtype=float).tolist(),
+        temperatures, mu_grid = getattr(self, "_initial_ladder",
+                                        (self.temperatures, self.mu_grid))
+        return {"temperatures": [float(T) for T in temperatures],
+                "mu_grid": np.asarray(mu_grid, dtype=float).tolist(),
                 "lambda_cubed": [np.asarray(self.lambda_cubed_of_T(T), dtype=float).tolist()
-                                 for T in self.temperatures]}
+                                 for T in temperatures]}
 
     def save_checkpoint(self, path: str, extra: Optional[dict] = None) -> None:
         """
@@ -1476,6 +1566,11 @@ class ReplicaExchangeGCMC:
                        "convergence_history": self.convergence_history,
                        "convergence_details": self.convergence_details,
                        "convergence_settings": self.convergence_settings,
+                       "ladder": {"temperatures": list(self.temperatures),
+                                  "mu_grid": np.asarray(self.mu_grid, dtype=float),
+                                  "version": self.ladder_version,
+                                  "history": self.ladder_history,
+                                  "first_index": self.first_index},
                        "rng_state": self.rng.bit_generator.state, "extra": extra or {}}, path)
 
     def load_checkpoint(self, path: str) -> dict:
@@ -1483,7 +1578,9 @@ class ReplicaExchangeGCMC:
         Restore a state saved by `save_checkpoint` into this simulation.
 
         The simulation must have been constructed with the same temperature
-        ladder, mu grid, Lambda^3(T) and ``adsorbed_cutoff``. The
+        ladder, mu grid, Lambda^3(T) and ``adsorbed_cutoff`` (the ladder it
+        was constructed with: a ladder moved by `set_ladder` is restored
+        from the checkpoint). The
         checkpoint supplies the configurations, energies, random streams
         and samples; the calculators and the move settings (``max_disp``,
         HMC) are this simulation's, built from the current setup. So a
@@ -1562,6 +1659,13 @@ class ReplicaExchangeGCMC:
         self.swap_stats, self.convergence_history = st["swap_stats"], st["convergence_history"]
         self.convergence_details = st.get("convergence_details", [])
         self.convergence_settings = st.get("convergence_settings")
+        ladder = st.get("ladder")
+        if ladder is not None:   # the ladder may have been moved by set_ladder
+            self.temperatures = [float(T) for T in ladder["temperatures"]]
+            self.mu_grid = np.asarray(ladder["mu_grid"], dtype=float)
+            self.ladder_version = int(ladder["version"])
+            self.ladder_history = list(ladder["history"])
+            self.first_index = int(ladder["first_index"])
         self.rng.bit_generator.state = st["rng_state"]
         # keep the RE-move draw of the run being continued (bit-identical continuation)
         self.skip_empty_swaps = bool(st.get("skip_empty_swaps", False))

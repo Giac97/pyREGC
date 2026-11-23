@@ -178,7 +178,8 @@ def test_mixing_chunks_add_up_and_survive_resume(tmp_path):
     sim2.pair_stats[((0, 0), (1, 0))] = [10, 5]
     sim2.snapshot_pair_stats(300)
     ch = sim2.pair_acceptance_by_chunk()
-    assert ch == [{"step_start": None, "step_end": 300, "pairs": {((0, 0), (1, 0)): (3, 2)}}]
+    assert ch == [{"step_start": None, "step_end": 300, "ladder_version": 0,
+                   "pairs": {((0, 0), (1, 0)): (3, 2)}}]
     sim2.close()
 
 
