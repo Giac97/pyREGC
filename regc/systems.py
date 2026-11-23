@@ -1590,46 +1590,66 @@ class SlabSystem(ParticleSystem):
 
     def set_subsurface(self, settings) -> None:
         """
-        Add subsurface NCMC channels and confine the instantaneous moves above z_c.
+        Add subsurface / site-exchange NCMC channels; partitioning ones confine the gas moves.
 
-        The exchange zone's lower bound is raised to ``settings.z_cut`` (if
-        it is lower), so the existing insertion and deletion moves (atomic
-        and molecular) act only in the gas region z >= z_c (a zone that
-        starts higher is kept: the gap is not exchanged); the subsurface
-        region below is
-        handled by the NCMC channels (`regc.subsurface`,
-        `Replica._move_insert_subsurface`). Calling it again with None
-        restores the original zone.
+        Each channel (`regc.subsurface.Subsurface`) inserts and removes its
+        species in its own region with NCMC (`Replica._move_insert_subsurface`).
+        For a partitioning channel (``partition_gas_zone=True``, the
+        subsurface default) the exchange zone's lower bound is raised to its
+        ``z_cut`` (if it is lower), so the instantaneous insertion and
+        deletion moves (atomic and molecular) act only above it (a zone that
+        starts higher is kept: the gap is not exchanged). An overlay channel
+        (``partition_gas_zone=False``) leaves the zone alone. Calling it
+        again with None restores the original zone.
+
+        ``self.subsurface`` is the first partitioning channel (None if there
+        is none): the region the subsurface counts and the run status
+        report, its moves counted under ``'insert_sub:<sp>'`` /
+        ``'delete_sub:<sp>'``; channel k of ``self.subsurface_channels``
+        otherwise under ``'insert_site<k>:<sp>'``.
 
         Parameters
         ----------
-        settings : regc.subsurface.Subsurface or None
-            The channels (None: off).
+        settings : regc.subsurface.Subsurface, sequence of them, or None
+            The channels (None or empty: off).
 
         Raises
         ------
         ValueError
-            If a subsurface species is not exchanged, z_cut is not below the
-            top of the original zone, or the region leaves the box.
+            If a channel's species is not exchanged, a partitioning
+            channel's z_cut is not below the top of the original zone, or a
+            region leaves the box.
         """
         full = getattr(self, "_full_insertion_z_range", self.insertion_z_range)
         self._full_insertion_z_range = full
         if settings is None:
-            self.subsurface = None
-            self.insertion_z_range = full
-            return
-        missing = sorted(set(settings.species) - set(self.exchange_species_list))
-        if missing:
-            raise ValueError(f"subsurface species {missing} are not exchanged species "
-                             f"{list(self.exchange_species_list)}")
+            channels = ()
+        elif hasattr(settings, "in_region"):
+            channels = (settings,)
+        else:
+            channels = tuple(settings)
         z_lo, z_hi = full
-        if not settings.z_cut < z_hi:
-            raise ValueError(f"subsurface z_cut {settings.z_cut:.3f} must lie below the top of the "
-                             f"exchange zone ({z_hi:.3f})")
-        if settings.z_min <= 0.0:
-            raise ValueError(f"subsurface z_min {settings.z_min:.3f} is outside the box (0, Lz]")
-        self.subsurface = settings
-        self.insertion_z_range = (max(z_lo, settings.z_cut), z_hi)
+        for c in channels:
+            missing = sorted(set(c.species) - set(self.exchange_species_list))
+            if missing:
+                raise ValueError(f"subsurface species {missing} are not exchanged species "
+                                 f"{list(self.exchange_species_list)}")
+            if c.partition_gas_zone and not c.z_cut < z_hi:
+                raise ValueError(f"subsurface z_cut {c.z_cut:.3f} must lie below the top of the "
+                                 f"exchange zone ({z_hi:.3f})")
+            if c.z_min <= 0.0:
+                raise ValueError(f"subsurface z_min {c.z_min:.3f} is outside the box (0, Lz]")
+            if c.z_cut > self.Lz + 1e-9:
+                raise ValueError(f"site-exchange z_cut {c.z_cut:.3f} is above the box (Lz = "
+                                 f"{self.Lz:.3f})")
+        parts = [c for c in channels if c.partition_gas_zone]
+        primary = next((k for k, c in enumerate(channels) if c.partition_gas_zone), None)
+        self.subsurface_channels = channels
+        self.subsurface = parts[0] if parts else None
+        self.subsurface_labels = tuple("sub" if k == primary else f"site{k}"
+                                       for k in range(len(channels)))
+        self.insertion_z_range = ((max(z_lo, max(c.z_cut for c in parts)), z_hi) if parts
+                                  else full)
 
     def in_exchange_zone(self, positions: np.ndarray) -> np.ndarray:
         """

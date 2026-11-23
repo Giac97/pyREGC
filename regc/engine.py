@@ -351,14 +351,21 @@ class ReplicaExchangeGCMC:
         if self.molecules:
             self.observables = check_observables(self.observables
                                                  + [MoleculeCounts(self.molecules)])
-        # subsurface NCMC channels: the same settings in every system
-        sub = getattr(built[0][2], "subsurface", None)
-        sub_sig = None if sub is None else sub.signature()
-        if any((None if getattr(sysm, "subsurface", None) is None
-                else sysm.subsurface.signature()) != sub_sig for _, _, sysm in built):
+        # subsurface / site-exchange NCMC channels: the same settings in every system
+        from .subsurface import system_channels
+
+        def channel_sig(sysm):
+            sub = getattr(sysm, "subsurface", None)
+            return (tuple(c.signature() for c in system_channels(sysm)),
+                    None if sub is None else sub.signature())
+        sub_sig = channel_sig(built[0][2])
+        if any(channel_sig(sysm) != sub_sig for _, _, sysm in built):
             raise ValueError("every system from system_factory must use the same subsurface "
                              "settings (SlabSystem.set_subsurface)")
+        # the first partitioning channel: the region the counts and the status report
+        sub = getattr(built[0][2], "subsurface", None)
         self.subsurface = sub
+        self.subsurface_channels = system_channels(built[0][2])
         if sub is not None:
             self.observables = check_observables(
                 self.observables + [SubsurfaceCounts(sub.species, sub.z_min, sub.z_cut)])

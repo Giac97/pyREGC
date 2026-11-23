@@ -1946,6 +1946,91 @@ def factory(rng):
   unfavourable, a low insertion rate is the right answer, and no
   protocol changes it.
 
+#### 10.2.1 Site-exchange channels (vacancies, adatoms, several channels)
+
+The subsurface channel is one case of a general *site-exchange*
+channel: a region z_min ≤ z < z_c, the species it exchanges, a rule
+that turns the configuration into sites, and the NCMC switch above.
+`Subsurface` takes these extra settings (the defaults reproduce the
+subsurface channel exactly):
+
+- **`site_method="trilateration"`** with `bond_length` R0. All atoms of
+  every species (frozen, substrate, mobile), with their periodic images
+  in x and y, are tessellated (3D Delaunay). For every triangle whose
+  edges are shorter than 2 R0, the two points at distance R0 from its
+  three vertices are candidate sites. Candidates in the primary cell and
+  the region, at least `site_min_distance` from every atom, are kept and
+  merged within `site_merge` (default 0.3 Å). With R0 the bulk
+  nearest-neighbour distance this finds, with no prior knowledge of the
+  phase, the surface vacancies (a removed lattice atom is R0 from its
+  neighbours) and the hollows that continue the lattice above the
+  surface (adatom sites). This is what metal exchange needs: a uniform
+  insertion pays a translational penalty of about e^-12 to land a Pd
+  atom at a lattice position.
+- **`defensive_fraction`** ε. The proposal is the mixture
+  q(y; x) = (1 − ε) n(y) / (K V_δ) + ε / V_region, n(y) the number of
+  site balls containing y, K the number of sites. With probability ε the
+  atom is placed uniformly in the region (always when there is no
+  site). q > 0 everywhere in the region, so an atom that is not near any
+  site of x' (e.g. one that diffused into a strained position) can still
+  be removed.
+- **`partition_gas_zone`**. `True` (the subsurface default): the region
+  belongs to the channel, and the gas moves act only above z_c. `False`:
+  an *overlay*. The exchange zone is unchanged, and atoms in the region
+  can be exchanged by both the channel and the uniform gas moves.
+
+Several channels can run at once: pass a list to `set_subsurface`, for
+example a partitioning O subsurface channel plus a Pd overlay channel on
+the top layer and the adatom layer. `system.subsurface` is the first
+partitioning channel. Its moves are counted as `insert_sub:<sp>` /
+`delete_sub:<sp>`, and it is the region of the automatic subsurface
+count and of the run status. Channel k of `system.subsurface_channels`
+is otherwise counted as `insert_site<k>:<sp>` / `delete_site<k>:<sp>`.
+
+```python
+from regc.subsurface import Subsurface
+
+top = geometry.top_z
+o_sub = Subsurface(top - 0.6, top - 4.0, ["O"], delta=0.5, kernel="langevin",
+                   ncmc_steps=160, freeze_switched=True)
+pd_sites = Subsurface(top + 3.0, top - 1.0, ["Pd"], site_method="trilateration",
+                      bond_length=3.89 / 2 ** 0.5, site_min_distance=1.7,
+                      defensive_fraction=0.05, partition_gas_zone=False, delta=0.5,
+                      kernel="langevin", ncmc_steps=160, dt=1.5 / 10.18,
+                      friction=0.01 * 10.18, freeze_switched=True)
+system.set_subsurface([o_sub, pd_sites])
+```
+
+**Why the moves stay exact.**
+
+- *Independent channels.* The channel and species of an attempt are
+  drawn with weights that do not depend on the configuration, and are
+  the same for insertions and removals. Each channel is a reversible
+  pair of moves on its own, with its own region and its own N (the atoms
+  of the species in that region). The stationary distribution of the
+  mixture is the grand-canonical one, whether the regions are disjoint,
+  overlapping, or overlap the gas zone.
+- *Mezei rule for the reverse density.* The insertion of y into x is
+  accepted with min(1, z e^{-βW} / (N' q(y; x))). The removal of y from
+  x ∪ {y} uses q(y; x'), where x' is the configuration at the end of the
+  switch-off with y deleted. That is the configuration the forward
+  insertion would start from. The sites are recomputed on x', so they
+  may depend on any atom, including the mobile ones and the atom's own
+  neighbours.
+- *A function of the configuration.* The sites must be a deterministic
+  function of the configuration. The atoms are wrapped and sorted by
+  position before the tessellation, and the candidates are sorted and
+  merged in a fixed order, so the sites do not depend on the order of
+  the atoms in the arrays.
+- *The held atom.* With `freeze_switched` the switched atom does not
+  move, so it ends inside its proposal ball and the region. Without it,
+  an insertion whose atom leaves the region is rejected, and a removal
+  of an atom outside every ball is rejected unless ε > 0.
+
+**Cost.** Each attempt computes the sites once (a Delaunay
+tessellation of a few hundred points, a few milliseconds), on top of the
+NCMC force evaluations.
+
 ## 11. Worked examples
 
 Each example below is a complete script. The examples in §11.1–11.5
@@ -2800,7 +2885,8 @@ sample such phases, exchange the metal with its bulk crystal:
   the gas pressure, so it needs no `gas.composition` entry.
 - **Insertion:** metal atoms are inserted uniformly in the box, so
   refilling a surface vacancy is rare. MD diffusion carries adatoms back
-  into vacancies.
+  into vacancies. A `site_exchange` channel (§14.4d) inserts them at
+  vacancies and hollows found from the configuration.
 
 ```yaml
 structure: {build: {surface: fcc100, symbol: Pd, size: [5, 5, 4]}, n_frozen_layers: 2,
@@ -2834,6 +2920,39 @@ other insertions and deletions to z ≥ z_c.
 
 ```yaml
 subsurface: {z_cut_below_surface: 0.0, depth_angstrom: 4.0, ncmc_steps: 10, weight: 0.5}
+```
+
+### 14.4d `site_exchange`
+
+Slab only. A list of site-exchange NCMC channels (§10.2.1), each a
+mapping. It can sit next to `subsurface`, which then is channel 0.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `species` | – (required) | Exchanged species of this channel. |
+| `z_range_above_surface` | – (required) | `[lo, hi]`: the region is top_z + lo ≤ z < top_z + hi, with top_z the topmost slab atom. |
+| `sites` | `trilateration` | `trilateration` or `voronoi` (§10.2). |
+| `bond_length_angstrom` | bulk nearest-neighbour distance | R0 of trilateration. The default comes from the slab's lattice constant (a/√2 for fcc, a√3/2 for bcc, a for hcp); for a slab read from a file, the shortest distance between slab atoms. |
+| `min_distance_angstrom` | 0.6 R0 (trilateration), 1.0 (voronoi) | Drop sites closer than this to any atom. |
+| `merge_angstrom` | 0.3 (trilateration), 0.25 (voronoi) | Merge sites closer than this. |
+| `delta_angstrom` | 0.3 | Radius of the insertion ball around a site. |
+| `defensive_fraction` | 0.05 | ε: fraction of proposals uniform in the region. |
+| `partition_gas_zone` | false | `true` raises the gas zone to the top of the region, as `subsurface` does. `false` is an overlay. |
+| `freeze_switched` | true | Hold the switched atom fixed during the protocol. |
+| `ncmc_steps`, `kernel`, `kernel_steps`, `leapfrog_steps`, `timestep_fs`, `friction_per_fs`, `max_disp`, `weight` | as `subsurface` | The NCMC protocol and the channel's frequency (§14.4c). |
+
+The setup prints one line per channel, with the number of sites in the
+initial configuration.
+
+```yaml
+site_exchange:
+  - species: [Pd]
+    z_range_above_surface: [-1.0, 3.0]    # the top layer (vacancies) and the adatom hollows
+    delta_angstrom: 0.5
+    kernel: langevin
+    ncmc_steps: 160
+    timestep_fs: 1.5
+    friction_per_fs: 0.01
 ```
 
 ### 14.4b `molecules`

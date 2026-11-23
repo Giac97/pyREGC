@@ -34,7 +34,10 @@ surface phase diagram, all from one YAML or JSON file.
    for species also exchanged atom by atom.
    A ``subsurface`` section (slab) adds NCMC insertion and removal in
    interstitial sites below the surface (`regc.subsurface`) and confines
-   the other moves to the gas region above it.
+   the other moves to the gas region above it. A ``site_exchange`` list adds
+   further NCMC channels, each with its own species, z-range and sites
+   (``trilateration``: vacancies and hollows of a metal surface, found from
+   the configuration), by default as an overlay of the gas moves.
 4. **replica_exchange** -- a (T x p) ladder (``pressures``, mu from the
    reservoir) or an explicit (T x mu) one (``mu_eV``); the [ZSG] REGC
    scheme (``scheme: regc``, MC/HMC/MD diffusion) or the sweep scheme;
@@ -133,7 +136,13 @@ _SECTIONS = {
     "output": {"directory", "plot_filename", "save_raw_data"},
 }
 _TOP_LEVEL = set(_SECTIONS) | {"calculator", "replica_exchange", "diatomic_reservoir",
-                                "observables", "molecules"}
+                                "observables", "molecules", "site_exchange"}
+#: Keys of one entry of the ``site_exchange`` list (one NCMC site-exchange channel).
+_SITE_EXCHANGE_KEYS = {"species", "z_range_above_surface", "sites", "bond_length_angstrom",
+                       "min_distance_angstrom", "merge_angstrom", "delta_angstrom",
+                       "defensive_fraction", "partition_gas_zone", "ncmc_steps", "kernel",
+                       "kernel_steps", "leapfrog_steps", "timestep_fs", "friction_per_fs",
+                       "max_disp", "weight", "freeze_switched"}
 #: Keys of one entry of the ``molecules`` section (a gas, and optionally an insertion move).
 _MOLECULE_KEYS = {"template", "fraction", "insert", "anchor", "shell_angstrom",
                   "bond_sigma_angstrom", "angle_sigma_deg", "weight", "symmetry_number",
@@ -427,6 +436,8 @@ def validate_config(config: Dict[str, Any]) -> None:
         _validate_molecules(config)
     if "subsurface" in config and _geometry_kind(config["structure"]) != "slab":
         raise ValueError("the subsurface section (NCMC insertion in subsurface sites) needs a slab")
+    if "site_exchange" in config:
+        _validate_site_exchange(config)
     for name in ("reservoir", "diatomic_reservoir"):
         if name in config:
             for sp, sec in _per_species_reservoir_cfg(config, _species_list(config)).items():
@@ -523,6 +534,55 @@ def validate_config(config: Dict[str, Any]) -> None:
             and config["phase_diagram"].get("coverage_per") == "area"):
         raise ValueError("phase_diagram.coverage_per: area needs a slab; for a cluster use "
                          "surface_atom, atom or none")
+
+
+def _validate_site_exchange(config: Dict[str, Any]) -> None:
+    """
+    Check the ``site_exchange`` list against the rest of the config.
+
+    Parameters
+    ----------
+    config : dict
+        The parsed config.
+
+    Raises
+    ------
+    ValueError
+        If the section is not a list of mappings, an entry has unknown or
+        missing keys, an unknown ``sites`` method or a bad z-range, a
+        species is not exchanged, or the structure is not a slab.
+    """
+    from .subsurface import SITE_METHODS
+    entries = config["site_exchange"]
+    if _geometry_kind(config["structure"]) != "slab":
+        raise ValueError("the site_exchange section (NCMC site channels) needs a slab")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("site_exchange must be a non-empty list of channels, e.g. "
+                         "[{species: [Pd], z_range_above_surface: [-1.0, 2.5]}]")
+    species = set(_species_list(config))
+    for k, sec in enumerate(entries):
+        where = f"site_exchange[{k}]"
+        _check_keys(sec, _SITE_EXCHANGE_KEYS, where)
+        for key in ("species", "z_range_above_surface"):
+            if key not in sec:
+                raise ValueError(f"{where} needs {key!r}")
+        sp = [sec["species"]] if isinstance(sec["species"], str) else [str(x) for x in sec["species"]]
+        if not sp:
+            raise ValueError(f"{where}.species is empty")
+        foreign = sorted(set(sp) - species)
+        if foreign:
+            raise ValueError(f"{where}.species {foreign} are not exchanged species {sorted(species)}")
+        zr = _floats(sec["z_range_above_surface"], f"{where}.z_range_above_surface")
+        if len(zr) != 2 or not zr[0] < zr[1]:
+            raise ValueError(f"{where}.z_range_above_surface must be [lo, hi] with lo < hi, "
+                             f"got {sec['z_range_above_surface']}")
+        method = str(sec.get("sites", "trilateration")).lower()
+        if method not in SITE_METHODS:
+            raise ValueError(f"{where}.sites must be one of {list(SITE_METHODS)}, got "
+                             f"{sec['sites']!r}")
+        for key in ("partition_gas_zone", "freeze_switched"):
+            if key in sec:
+                _subsurface_flag(sec[key], f"{where}.{key}")
 
 
 def _validate_molecules(config: Dict[str, Any]) -> None:
@@ -1655,6 +1715,129 @@ def _subsurface_settings(config: Dict[str, Any], geometry: Any, species: Sequenc
                                          "subsurface.freeze_switched"))
 
 
+def _site_exchange_settings(config: Dict[str, Any], geometry: Any, species: Sequence[str],
+                            feed: Any, bond_length: Optional[float]) -> list:
+    """
+    The ``site_exchange`` list as `regc.subsurface.Subsurface` channels.
+
+    Each entry's region is ``top_z + z_range_above_surface``; defaults
+    differ from ``subsurface`` where the channel is meant for metal atoms:
+    trilateration sites, ``defensive_fraction`` 0.05, an overlay
+    (``partition_gas_zone: false``) and ``freeze_switched: true``.
+
+    Parameters
+    ----------
+    config : dict
+        The parsed (validated) config.
+    geometry : SlabGeometry
+        The slab (``top_z``).
+    species : sequence of str
+        The exchanged species.
+    feed : GasFeed or MolecularGasFeed or None
+        The gas feed.
+    bond_length : float or None
+        Default trilateration R0 (A): the nearest-neighbour distance of the
+        slab's crystal.
+
+    Returns
+    -------
+    list of Subsurface
+        The channels (empty without the section).
+
+    Raises
+    ------
+    ValueError
+        If a channel's species' chemical potential is not fixed by the
+        gases, a trilateration channel has no bond length, or a setting is
+        invalid.
+    """
+    from .subsurface import Subsurface
+    out = []
+    for k, sec in enumerate(config.get("site_exchange") or []):
+        where = f"site_exchange[{k}]"
+        sp = [sec["species"]] if isinstance(sec["species"], str) else [str(x) for x in sec["species"]]
+        if feed is not None and hasattr(feed, "check_moves"):
+            feed.check_moves({f"site exchange {e}": {e: 1} for e in sp})
+        lo, hi = _floats(sec["z_range_above_surface"], f"{where}.z_range_above_surface")
+        method = str(sec.get("sites", "trilateration")).lower()
+        r0 = sec.get("bond_length_angstrom", bond_length if method == "trilateration" else None)
+        if method == "trilateration" and r0 is None:
+            raise ValueError(f"{where}: give bond_length_angstrom (the slab's crystal is not "
+                             f"known, so its nearest-neighbour distance can't be the default)")
+        r0 = None if r0 is None else _as_float(r0, f"{where}.bond_length_angstrom")
+        min_d = sec.get("min_distance_angstrom", 0.6 * r0 if method == "trilateration" else 1.0)
+        merge = sec.get("merge_angstrom")
+        out.append(Subsurface(
+            z_cut=geometry.top_z + hi, z_min=geometry.top_z + lo, species=tuple(sp),
+            delta=_as_float(sec.get("delta_angstrom", 0.3), f"{where}.delta_angstrom"),
+            ncmc_steps=int(sec.get("ncmc_steps", 10)), kernel=str(sec.get("kernel", "hmc")).lower(),
+            kernel_steps=int(sec.get("kernel_steps", 1)),
+            leapfrog_steps=int(sec.get("leapfrog_steps", 5)),
+            dt=_as_float(sec.get("timestep_fs", 1.0), f"{where}.timestep_fs") / FS_PER_INTERNAL_TIME,
+            friction=_as_float(sec.get("friction_per_fs", 0.05), f"{where}.friction_per_fs")
+            * FS_PER_INTERNAL_TIME,
+            max_disp=_as_float(sec.get("max_disp", 0.1), f"{where}.max_disp"),
+            weight=_as_float(sec.get("weight", 1.0), f"{where}.weight"),
+            site_min_distance=_as_float(min_d, f"{where}.min_distance_angstrom"),
+            freeze_switched=_subsurface_flag(sec.get("freeze_switched", True),
+                                             f"{where}.freeze_switched"),
+            site_method=method, bond_length=r0,
+            site_merge=None if merge is None else _as_float(merge, f"{where}.merge_angstrom"),
+            defensive_fraction=_as_float(sec.get("defensive_fraction", 0.05),
+                                         f"{where}.defensive_fraction"),
+            partition_gas_zone=_subsurface_flag(sec.get("partition_gas_zone", False),
+                                                f"{where}.partition_gas_zone")))
+    return out
+
+
+def _slab_bond_length(struct_cfg: Dict[str, Any], a: Optional[float],
+                      geometry: Any) -> Optional[float]:
+    """
+    Nearest-neighbour distance of the slab's bulk crystal (default trilateration R0).
+
+    From the lattice constant of a built slab (``structure.build``: fcc
+    a / sqrt 2, bcc a sqrt 3 / 2, hcp a, diamond a sqrt 3 / 4; the ASE
+    reference constant if ``a`` was not given); otherwise the shortest
+    distance between the slab's frozen and substrate atoms.
+
+    Parameters
+    ----------
+    struct_cfg : dict
+        The ``structure`` section.
+    a : float or None
+        The lattice constant the runner used (None if ASE's default or a file).
+    geometry : SlabGeometry
+        The slab.
+
+    Returns
+    -------
+    float or None
+        The distance (A), or None if it can't be told.
+    """
+    build = struct_cfg.get("build")
+    if isinstance(build, dict) and "surface" in build:
+        crystal, symbol = str(build["surface"])[:3], str(build.get("symbol", ""))
+        if crystal == "dia":
+            crystal = "diamond"
+        if a is None:
+            from .structures import reference_lattice_constant
+            a = reference_lattice_constant(symbol, crystal)
+        factor = {"fcc": 1.0 / np.sqrt(2.0), "bcc": np.sqrt(3.0) / 2.0, "hcp": 1.0,
+                  "diamond": np.sqrt(3.0) / 4.0}.get(crystal)
+        if a is not None and factor is not None:
+            return float(a) * float(factor)
+    metal = np.vstack([geometry.frozen_positions, geometry.substrate_positions]).reshape(-1, 3)
+    if len(metal) < 2:
+        return None
+    A = np.asarray(geometry.cell_xy, dtype=float)
+    shifts = np.array([[i * A[0, 0] + j * A[1, 0], i * A[0, 1] + j * A[1, 1], 0.0]
+                       for i in (-1, 0, 1) for j in (-1, 0, 1)])
+    d = np.linalg.norm(metal[:, None, None, :] + shifts[None, :, None, :] - metal[None, None],
+                       axis=-1)
+    d = d[d > 1e-6]
+    return float(d.min()) if d.size else None
+
+
 def _subsurface_flag(value: Any, where: str) -> bool:
     """
     A YAML boolean, strictly.
@@ -1775,8 +1958,9 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
         when the run needs no reservoir), ``temperatures_K``, ``mu_grid``,
         ``pressures``/``pressure_unit`` (None for an explicit mu ladder),
         ``lambda_cubed_of_T``, ``insertion_z_range`` (slab) or
-        ``insertion_shell`` (cluster), ``system_factory``
-        and ``metadata`` (JSON-able; what a resumed run must agree with,
+        ``insertion_shell`` (cluster), ``system_factory``, ``subsurface``
+        (`Subsurface` or None) and ``site_exchange`` (list of `Subsurface`
+        channels), and ``metadata`` (JSON-able; what a resumed run must agree with,
         and what `analyze_from_config` reads).
 
     Raises
@@ -1914,6 +2098,10 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
     sgc = _sgc_settings(config, geometry)
     subsurface = _subsurface_settings(config, geometry, species, feed, molecule_moves,
                                       atomic_exchange)
+    site_exchange = (_site_exchange_settings(config, geometry, species, feed,
+                                             _slab_bond_length(struct_cfg, a, geometry))
+                     if "site_exchange" in config else [])
+    channels = ([subsurface] if subsurface is not None else []) + site_exchange
 
     def system_factory(rng):
         system = geometry.make_system(calc_spec.make(cell, pbc), exchange, mass_of_species=masses,
@@ -1922,8 +2110,8 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
             system.set_sgc_species(sgc["species"], canonical=sgc["canonical"])
         if atomic_exchange is not None:
             system.set_molecules(molecule_moves, atomic_exchange=atomic_exchange)
-        if subsurface is not None:
-            system.set_subsurface(subsurface)
+        if channels:
+            system.set_subsurface(channels)
         return system
 
     scheme = _scheme(re_cfg)
@@ -1951,6 +2139,8 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
         metadata.update(_feed_to_meta(feed))
     if subsurface is not None:
         metadata["subsurface"] = subsurface.metadata()
+    if site_exchange:
+        metadata["site_exchange"] = [c.metadata() for c in site_exchange]
     if atomic_exchange is not None:
         metadata["molecules"] = [m.metadata() for m in molecule_moves]
         metadata["atomic_exchange"] = list(atomic_exchange)
@@ -2014,6 +2204,16 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
                   f"{subsurface.z_cut:.2f} A ({n_sites} interstitial sites), gas moves above; "
                   f"{subsurface.ncmc_steps} lambda steps, {subsurface.kernel} kernel, "
                   f"weight {subsurface.weight:g}")
+        for k, c in enumerate(site_exchange):
+            probe = geometry.make_system(calc_spec.make(cell, pbc), exchange,
+                                         mass_of_species=masses, **region)
+            r0 = "" if c.bond_length is None else f", R0 = {c.bond_length:.3f} A"
+            print(f"site exchange {k}: {list(c.species)} in {c.z_min:.2f} <= z < {c.z_cut:.2f} A, "
+                  f"{len(c.sites(probe))} {c.site_method} sites now{r0}, delta {c.delta:g} A, "
+                  f"eps {c.defensive_fraction:g}, "
+                  f"{'partitions the gas zone' if c.partition_gas_zone else 'overlay'}; "
+                  f"{c.ncmc_steps} lambda steps, {c.kernel} kernel"
+                  f"{', switched atom held' if c.freeze_switched else ''}, weight {c.weight:g}")
         n_mu = np.shape(mu_grid)[-1 if len(species) == 1 else -2]
         print(f"replica grid: {len(temperatures_K)} T x {n_mu} "
               f"{'p' if pressures is not None else 'mu'} = {len(temperatures_K) * n_mu} replicas")
@@ -2025,7 +2225,7 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
             "insertion_z_range": insertion_z_range, "insertion_shell": insertion_shell,
             "system_factory": system_factory, "sgc": sgc,
             "molecules": molecule_moves, "atomic_exchange": atomic_exchange,
-            "subsurface": subsurface,
+            "subsurface": subsurface, "site_exchange": site_exchange,
             "metadata": metadata}
 
 

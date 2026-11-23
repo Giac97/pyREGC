@@ -26,7 +26,8 @@ reservoir       MonatomicIdealGasReservoir, DiatomicReservoir (e.g. H2), Molecul
                 (CO, CH4, ...), MolecularGasFeed (elemental mu of a gas mixture), and the
                 low-level diatomic functions
 molecules       MoleculeMove -- molecular insertion/deletion on top of atomic exchange
-subsurface      Subsurface -- site-biased NCMC insertion/removal in subsurface sites
+subsurface      Subsurface -- site-biased NCMC insertion/removal in subsurface sites, and
+                site-exchange channels (trilateration sites: vacancies, adatom hollows)
 structures      cubic_lattice_constant, slab_geometry_from_atoms, SlabGeometry,
                 surface_slab (fixed / thermostat / free substrate template),
                 substrate_layers, layer_planes,

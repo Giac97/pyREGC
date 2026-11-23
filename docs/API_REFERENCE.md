@@ -1514,24 +1514,31 @@ they diffuse back in.
 SlabSystem.set_subsurface(settings) -> None
 ```
 
-Add subsurface NCMC channels and confine the instantaneous moves above z_c.
+Add subsurface / site-exchange NCMC channels; partitioning ones confine the gas moves.
 
-The exchange zone's lower bound is raised to `settings.z_cut` (if
-it is lower), so the existing insertion and deletion moves (atomic
-and molecular) act only in the gas region z >= z_c (a zone that
-starts higher is kept: the gap is not exchanged); the subsurface
-region below is
-handled by the NCMC channels (`regc.subsurface`,
-`Replica._move_insert_subsurface`). Calling it again with None
-restores the original zone.
+Each channel (`regc.subsurface.Subsurface`) inserts and removes its
+species in its own region with NCMC (`Replica._move_insert_subsurface`).
+For a partitioning channel (`partition_gas_zone=True`, the
+subsurface default) the exchange zone's lower bound is raised to its
+`z_cut` (if it is lower), so the instantaneous insertion and
+deletion moves (atomic and molecular) act only above it (a zone that
+starts higher is kept: the gap is not exchanged). An overlay channel
+(`partition_gas_zone=False`) leaves the zone alone. Calling it
+again with None restores the original zone.
+
+`self.subsurface` is the first partitioning channel (None if there
+is none): the region the subsurface counts and the run status
+report, its moves counted under `'insert_sub:<sp>'` /
+`'delete_sub:<sp>'`; channel k of `self.subsurface_channels`
+otherwise under `'insert_site<k>:<sp>'`.
 
 **Parameters**
 
-- `settings` (*regc.subsurface.Subsurface or None*): The channels (None: off).
+- `settings` (*regc.subsurface.Subsurface, sequence of them, or None*): The channels (None or empty: off).
 
 **Raises**
 
-- *ValueError*: If a subsurface species is not exchanged, z_cut is not below the top of the original zone, or the region leaves the box.
+- *ValueError*: If a channel's species is not exchanged, a partitioning channel's z_cut is not below the top of the original zone, or a region leaves the box.
 
 #### `SlabSystem.in_exchange_zone`
 
@@ -6288,7 +6295,7 @@ JSON-able description.
 ### `Subsurface`
 
 ```python
-Subsurface(z_cut: float, z_min: float, species: Tuple[str, ...], delta: float = 0.3, ncmc_steps: int = 10, kernel: str = 'hmc', kernel_steps: int = 1, leapfrog_steps: int = 5, dt: float = 0.0982, friction: float = 0.509, max_disp: float = 0.1, weight: float = 1.0, site_min_distance: float = 1.0, freeze_switched: bool = False) -> None
+Subsurface(z_cut: float, z_min: float, species: Tuple[str, ...], delta: float = 0.3, ncmc_steps: int = 10, kernel: str = 'hmc', kernel_steps: int = 1, leapfrog_steps: int = 5, dt: float = 0.0982, friction: float = 0.509, max_disp: float = 0.1, weight: float = 1.0, site_min_distance: float = 1.0, freeze_switched: bool = False, site_method: str = 'voronoi', bond_length: Optional[float] = None, site_merge: Optional[float] = None, defensive_fraction: float = 0.0, partition_gas_zone: bool = True) -> None
 ```
 
 Settings of the subsurface NCMC channels of a slab.
@@ -6309,6 +6316,11 @@ Settings of the subsurface NCMC channels of a slab.
 - `weight` (*float, optional*): Relative frequency of each subsurface channel among the GC channels (an atomic gas channel has weight 1). Default 1.
 - `site_min_distance` (*float, optional*): Sites closer than this to a metal atom are dropped (A). Default 1.0.
 - `freeze_switched` (*bool, optional*): Hold the switched atom fixed during the protocol: the kernels move only the other atoms, so the lattice relaxes around it (still exact: each kernel preserves the lambda-distribution of the atoms it moves). Far less work is dissipated than when the half-coupled atom drifts and pushes into the lattice, and it ends where it was inserted, inside the proposal ball, so the reverse move stays possible. Default False.
+- `site_method` (*str, optional*): `'voronoi'` (vertices of the Voronoi tessellation of the frozen and substrate atoms; the interstitial holes of a metal) or `'trilateration'` (the two points at distance `bond_length` from the vertices of every triangle of the Delaunay tessellation of all atoms, mobile ones included, with edges shorter than 2 `bond_length`; lattice vacancies and hollow sites of any surface). Default `'voronoi'`.
+- `bond_length` (*float, optional*): R0 of trilateration (A), e.g. the nearest-neighbour distance of the bulk metal. Required for `'trilateration'`.
+- `site_merge` (*float, optional*): Sites closer than this (A, minimum image) are merged. Default `SITE_MERGE_TOL` (Voronoi) or `TRILATERATION_MERGE_TOL`.
+- `defensive_fraction` (*float, optional*): eps in [0, 1): the proposal is a mixture, a point uniform in the region with probability eps (always when there is no site), a site ball otherwise. Keeps q > 0 everywhere in the region, so an atom away from every site can still be removed. Default 0 (sites only).
+- `partition_gas_zone` (*bool, optional*): True: the region belongs to this channel only, the gas moves act above z_cut (`SlabSystem.set_subsurface` raises the exchange zone). False: an overlay that leaves the exchange zone alone, so atoms in the region can also be exchanged by the uniform gas moves (each channel is its own reversible pair). Default True.
 
 **Raises**
 
@@ -6317,6 +6329,26 @@ Settings of the subsurface NCMC channels of a slab.
 #### `Subsurface.v_delta` (property)
 
 float: Volume of the insertion ball, 4/3 pi delta^3.
+
+#### `Subsurface.merge_tol` (property)
+
+float: Merge distance of the sites (A): `site_merge`, or the method's default.
+
+#### `Subsurface.region_volume`
+
+```python
+Subsurface.region_volume(system) -> float
+```
+
+Volume of the region, area x (z_cut - z_min).
+
+**Parameters**
+
+- `system` (*SlabSystem*): For the cell area.
+
+**Returns**
+
+- *float*: The volume (A^3).
 
 #### `Subsurface.signature`
 
@@ -6364,14 +6396,11 @@ Whether positions lie in the subsurface region, z_min <= z < z_cut.
 Subsurface.sites(system) -> np.ndarray
 ```
 
-Interstitial sites of the metal: Voronoi vertices of its atoms in the region.
+The sites of the configuration, by `site_method`.
 
-The substrate and frozen atoms, with their periodic images in x and
-y, are tessellated; the vertices in the region and at least
-`site_min_distance` from every metal atom are kept, wrapped into
-the primary cell, and vertices closer than `SITE_MERGE_TOL`
-(minimum image) merged in a deterministic order. A deterministic function of the metal atoms,
-as the proposal density requires.
+A deterministic function of the configuration, as the proposal
+density requires (for a removal it is evaluated on the configuration
+without the removed atom).
 
 **Parameters**
 
@@ -6379,7 +6408,7 @@ as the proposal density requires.
 
 **Returns**
 
-- *numpy.ndarray*: Site positions, shape (K, 3) (K may be 0).
+- *numpy.ndarray*: Site positions, shape (K, 3) (K may be 0), in the primary cell.
 
 #### `Subsurface.log_q`
 
@@ -6389,32 +6418,46 @@ Subsurface.log_q(y: np.ndarray, sites: np.ndarray, system) -> float
 
 Log density of proposing position y from these sites.
 
+q(y; x) = w n(y) / (K V_delta) + (1 - w) / V_region for y in the
+region (0 outside), n(y) the number of site balls containing y, K
+the number of sites, w = 1 - `defensive_fraction` (w = 0 without
+sites). Without the defensive mixture (eps = 0), w = 1 always.
+
 **Parameters**
 
 - `y` (*numpy.ndarray*): The (3,) position.
 - `sites` (*numpy.ndarray*): The sites, shape (K, 3).
-- `system` (*SlabSystem*): For the minimum image.
+- `system` (*SlabSystem*): For the minimum image and the cell area.
 
 **Returns**
 
-- *float*: log[(1/K) sum_{k: |y - s_k| < delta} 1/V_delta]; -inf if no site is within delta or y is outside the region.
+- *float*: log q(y; x); -inf if q = 0 (y outside the region, or no site within delta and eps = 0).
 
 #### `Subsurface.propose`
 
 ```python
-Subsurface.propose(sites: np.ndarray, rng: np.random.Generator) -> np.ndarray
+Subsurface.propose(sites: np.ndarray, rng: np.random.Generator, system=None) -> np.ndarray
 ```
 
 Draw an insertion point: a uniform site, then uniform in its delta-ball.
 
+With a defensive fraction eps > 0, the point is instead uniform in
+the region (xy uniform in the cell, z uniform in [z_min, z_cut))
+with probability eps, and always when there is no site.
+
 **Parameters**
 
-- `sites` (*numpy.ndarray*): The sites, shape (K >= 1, 3).
+- `sites` (*numpy.ndarray*): The sites, shape (K, 3); K >= 1 unless eps > 0.
 - `rng` (*numpy.random.Generator*): Random number generator.
+- `system` (*SlabSystem, optional*): The cell, for the uniform part (needed when eps > 0).
 
 **Returns**
 
 - *numpy.ndarray*: The (3,) point (not wrapped).
+
+**Raises**
+
+- *ValueError*: If eps > 0 and no system is given, or there is no site and eps = 0.
 
 ## Config runner (`regc.runner`)
 
@@ -6473,7 +6516,7 @@ Everything a run needs, built from a config but nothing sampled yet.
 
 **Returns**
 
-- *dict*: `geometry` (`SlabGeometry` or `ClusterGeometry`), `lattice_constant` (A, or None), `calc_spec`, `species`, `masses`, `feed` (`GasFeed`, or None when the run needs no reservoir), `temperatures_K`, `mu_grid`, `pressures`/`pressure_unit` (None for an explicit mu ladder), `lambda_cubed_of_T`, `insertion_z_range` (slab) or `insertion_shell` (cluster), `system_factory` and `metadata` (JSON-able; what a resumed run must agree with, and what `analyze_from_config` reads).
+- *dict*: `geometry` (`SlabGeometry` or `ClusterGeometry`), `lattice_constant` (A, or None), `calc_spec`, `species`, `masses`, `feed` (`GasFeed`, or None when the run needs no reservoir), `temperatures_K`, `mu_grid`, `pressures`/`pressure_unit` (None for an explicit mu ladder), `lambda_cubed_of_T`, `insertion_z_range` (slab) or `insertion_shell` (cluster), `system_factory`, `subsurface` (`Subsurface` or None) and `site_exchange` (list of `Subsurface` channels), and `metadata` (JSON-able; what a resumed run must agree with, and what `analyze_from_config` reads).
 
 **Raises**
 

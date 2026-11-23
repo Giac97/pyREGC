@@ -32,6 +32,16 @@ docs/REGC_algorithm.md Sec. 11, a slab is split at a fixed height z_c:
 
 Uniform site choice (instead of weighting sites by their Voronoi volume)
 keeps q exactly computable; the site weights only affect efficiency.
+
+The same machinery gives general **site-exchange channels** (several per
+system, `SlabSystem.set_subsurface` with a list): sites can also come from
+trilateration (``site_method='trilateration'``: points at a bond length R0
+from three mutually close atoms of any species, e.g. lattice vacancies and
+adatom hollows of a metal surface), the proposal can mix in a uniform density
+over the region (``defensive_fraction``), and a channel can overlay the
+ordinary gas moves instead of partitioning the box
+(``partition_gas_zone=False``). Every channel and species is its own
+reversible pair of moves, chosen with configuration-independent weights.
 """
 
 from __future__ import annotations
@@ -44,6 +54,10 @@ import numpy as np
 
 #: Sites closer than this (A) are merged (degenerate Voronoi vertices of a lattice).
 SITE_MERGE_TOL = 0.25
+#: Default merge distance (A) of trilateration sites.
+TRILATERATION_MERGE_TOL = 0.3
+#: Site construction methods.
+SITE_METHODS = ("voronoi", "trilateration")
 
 
 @dataclass
@@ -97,6 +111,32 @@ class Subsurface:
         drifts and pushes into the lattice, and it ends where it was
         inserted, inside the proposal ball, so the reverse move stays
         possible. Default False.
+    site_method : str, optional
+        ``'voronoi'`` (vertices of the Voronoi tessellation of the frozen
+        and substrate atoms; the interstitial holes of a metal) or
+        ``'trilateration'`` (the two points at distance `bond_length` from
+        the vertices of every triangle of the Delaunay tessellation of all
+        atoms, mobile ones included, with edges shorter than
+        2 `bond_length`; lattice vacancies and hollow sites of any
+        surface). Default ``'voronoi'``.
+    bond_length : float, optional
+        R0 of trilateration (A), e.g. the nearest-neighbour distance of the
+        bulk metal. Required for ``'trilateration'``.
+    site_merge : float, optional
+        Sites closer than this (A, minimum image) are merged. Default
+        `SITE_MERGE_TOL` (Voronoi) or `TRILATERATION_MERGE_TOL`.
+    defensive_fraction : float, optional
+        eps in [0, 1): the proposal is a mixture, a point uniform in the
+        region with probability eps (always when there is no site), a
+        site ball otherwise. Keeps q > 0 everywhere in the region, so an
+        atom away from every site can still be removed. Default 0 (sites
+        only).
+    partition_gas_zone : bool, optional
+        True: the region belongs to this channel only, the gas moves act
+        above z_cut (`SlabSystem.set_subsurface` raises the exchange zone).
+        False: an overlay that leaves the exchange zone alone, so atoms in
+        the region can also be exchanged by the uniform gas moves (each
+        channel is its own reversible pair). Default True.
 
     Raises
     ------
@@ -118,6 +158,11 @@ class Subsurface:
     weight: float = 1.0
     site_min_distance: float = 1.0
     freeze_switched: bool = False
+    site_method: str = "voronoi"
+    bond_length: Optional[float] = None
+    site_merge: Optional[float] = None
+    defensive_fraction: float = 0.0
+    partition_gas_zone: bool = True
 
     def __post_init__(self):
         """
@@ -144,11 +189,51 @@ class Subsurface:
                 or self.leapfrog_steps < 1 or self.dt <= 0 or self.max_disp <= 0):
             raise ValueError("subsurface: delta, dt, max_disp, weight must be positive and "
                              "ncmc_steps, leapfrog_steps >= 1, kernel_steps >= 0")
+        self.site_method = str(self.site_method).lower()
+        if self.site_method not in SITE_METHODS:
+            raise ValueError(f"site_method must be one of {list(SITE_METHODS)}, "
+                             f"got {self.site_method!r}")
+        if self.site_method == "trilateration":
+            if self.bond_length is None or not float(self.bond_length) > 0:
+                raise ValueError("trilateration sites need a positive bond_length (A)")
+        if self.bond_length is not None:
+            self.bond_length = float(self.bond_length)
+        if self.site_merge is not None:
+            self.site_merge = float(self.site_merge)
+            if self.site_merge < 0:
+                raise ValueError("site_merge must be >= 0")
+        self.defensive_fraction = float(self.defensive_fraction)
+        if not 0.0 <= self.defensive_fraction < 1.0:
+            raise ValueError(f"defensive_fraction must be in [0, 1), got {self.defensive_fraction}")
+        self.partition_gas_zone = bool(self.partition_gas_zone)
 
     @property
     def v_delta(self) -> float:
         """float: Volume of the insertion ball, 4/3 pi delta^3."""
         return 4.0 / 3.0 * math.pi * self.delta ** 3
+
+    @property
+    def merge_tol(self) -> float:
+        """float: Merge distance of the sites (A): `site_merge`, or the method's default."""
+        if self.site_merge is not None:
+            return self.site_merge
+        return SITE_MERGE_TOL if self.site_method == "voronoi" else TRILATERATION_MERGE_TOL
+
+    def region_volume(self, system) -> float:
+        """
+        Volume of the region, area x (z_cut - z_min).
+
+        Parameters
+        ----------
+        system : SlabSystem
+            For the cell area.
+
+        Returns
+        -------
+        float
+            The volume (A^3).
+        """
+        return float(system.area) * (self.z_cut - self.z_min)
 
     def signature(self) -> tuple:
         """
@@ -162,7 +247,8 @@ class Subsurface:
         return (round(self.z_cut, 9), round(self.z_min, 9), self.species, self.delta,
                 self.ncmc_steps, self.kernel, self.kernel_steps, self.leapfrog_steps, self.dt,
                 self.friction, self.max_disp, self.weight, self.site_min_distance,
-                self.freeze_switched)
+                self.freeze_switched, self.site_method, self.bond_length, self.merge_tol,
+                self.defensive_fraction, self.partition_gas_zone)
 
     def metadata(self) -> dict:
         """
@@ -178,7 +264,10 @@ class Subsurface:
                 "kernel_steps": self.kernel_steps, "leapfrog_steps": self.leapfrog_steps,
                 "dt": self.dt, "friction": self.friction, "max_disp": self.max_disp, "weight": self.weight,
                 "site_min_distance": self.site_min_distance,
-                "freeze_switched": self.freeze_switched}
+                "freeze_switched": self.freeze_switched, "site_method": self.site_method,
+                "bond_length": self.bond_length, "site_merge": self.merge_tol,
+                "defensive_fraction": self.defensive_fraction,
+                "partition_gas_zone": self.partition_gas_zone}
 
     # -- region and sites --------------------------------------------------------------------
     def in_region(self, positions: np.ndarray) -> np.ndarray:
@@ -200,14 +289,35 @@ class Subsurface:
 
     def sites(self, system) -> np.ndarray:
         """
+        The sites of the configuration, by `site_method`.
+
+        A deterministic function of the configuration, as the proposal
+        density requires (for a removal it is evaluated on the configuration
+        without the removed atom).
+
+        Parameters
+        ----------
+        system : SlabSystem
+            The configuration.
+
+        Returns
+        -------
+        numpy.ndarray
+            Site positions, shape (K, 3) (K may be 0), in the primary cell.
+        """
+        if self.site_method == "trilateration":
+            return self._trilateration_sites(system)
+        return self._voronoi_sites(system)
+
+    def _voronoi_sites(self, system) -> np.ndarray:
+        """
         Interstitial sites of the metal: Voronoi vertices of its atoms in the region.
 
         The substrate and frozen atoms, with their periodic images in x and
         y, are tessellated; the vertices in the region and at least
         `site_min_distance` from every metal atom are kept, wrapped into
-        the primary cell, and vertices closer than `SITE_MERGE_TOL`
-        (minimum image) merged in a deterministic order. A deterministic function of the metal atoms,
-        as the proposal density requires.
+        the primary cell, and vertices closer than `merge_tol` (minimum
+        image) merged in a deterministic order.
 
         Parameters
         ----------
@@ -235,19 +345,146 @@ class Subsurface:
         if len(vert) == 0:
             return np.zeros((0, 3))
         vert = np.column_stack([(frac - np.floor(frac)) @ A, vert[:, 2]])
-        d = np.linalg.norm(system._min_image(vert[:, None, :] - metal[None, :, :]), axis=-1)
-        vert = vert[d.min(axis=1) >= self.site_min_distance]
-        vert = vert[np.lexsort((vert[:, 0], vert[:, 1], vert[:, 2]))]
+        return self._filter_and_merge(vert, metal, system)
+
+    def _trilateration_sites(self, system) -> np.ndarray:
+        """
+        Sites at distance R0 from three mutually close atoms (any species).
+
+        All atoms (frozen, substrate, mobile), wrapped into the cell and
+        sorted by position (so the result does not depend on their order),
+        with enough periodic images in x and y, are tessellated (Delaunay);
+        for every triangle of the tessellation with all edges shorter than
+        2 R0 and circumradius below R0, the two points at distance R0 from
+        its vertices are candidates. Those in the primary cell, in the
+        region, at least `site_min_distance` from every atom are kept, and
+        candidates closer than `merge_tol` (minimum image) merged in a
+        deterministic order. On a metal with R0 its nearest-neighbour
+        distance this finds lattice vacancies and the hollow sites that
+        continue the lattice above the surface, whatever the phase.
+
+        Parameters
+        ----------
+        system : SlabSystem
+            The configuration.
+
+        Returns
+        -------
+        numpy.ndarray
+            Site positions, shape (K, 3) (K may be 0).
+        """
+        from scipy.spatial import Delaunay
+        r0 = self.bond_length
+        atoms = np.vstack([system.frozen_positions, system.substrate_positions,
+                           system.positions]).reshape(-1, 3)
+        # atoms within 2 R0 of the region can contribute (a site is R0 from its triangle)
+        z = atoms[:, 2]
+        atoms = atoms[(z >= self.z_min - 2.0 * r0) & (z < self.z_cut + 2.0 * r0)]
+        if len(atoms) < 3:
+            return np.zeros((0, 3))
+        A = np.asarray(system._A, dtype=float)
+        Ainv = np.linalg.inv(A)
+        frac = atoms[:, :2] @ Ainv
+        atoms = np.column_stack([(frac - np.floor(frac)) @ A, atoms[:, 2]])
+        atoms = atoms[np.lexsort((atoms[:, 2], atoms[:, 1], atoms[:, 0]))]
+        # images: enough cells that every point within 2 R0 of the primary cell is present
+        widths = np.abs(np.linalg.det(A)) / np.linalg.norm(A[::-1], axis=1)
+        m = np.maximum(1, np.ceil(2.0 * r0 / widths)).astype(int)
+        shifts = [i * A[0] + j * A[1] for i in range(-m[0], m[0] + 1)
+                  for j in range(-m[1], m[1] + 1)]
+        pts = np.vstack([atoms + np.array([s[0], s[1], 0.0]) for s in shifts])
+        margin = 2.0 * r0 / widths
+        f = pts[:, :2] @ Ainv
+        pts = pts[np.all((f >= -margin) & (f < 1.0 + margin), axis=1)]
+        try:
+            simplices = Delaunay(pts).simplices
+        except Exception:              # coplanar/degenerate input (e.g. a lone layer)
+            return np.zeros((0, 3))
+        tri = np.sort(np.vstack([simplices[:, [0, 1, 2]], simplices[:, [0, 1, 3]],
+                                 simplices[:, [0, 2, 3]], simplices[:, [1, 2, 3]]]), axis=1)
+        n_pts = np.int64(len(pts))
+        key = np.unique((tri[:, 0] * n_pts + tri[:, 1]) * n_pts + tri[:, 2])
+        tri = np.column_stack([key // (n_pts * n_pts), (key // n_pts) % n_pts, key % n_pts])
+        a, b, c = pts[tri[:, 0]], pts[tri[:, 1]], pts[tri[:, 2]]
+        ab, ac = b - a, c - a
+        keep = ((np.linalg.norm(ab, axis=1) < 2 * r0) & (np.linalg.norm(ac, axis=1) < 2 * r0)
+                & (np.linalg.norm(c - b, axis=1) < 2 * r0))
+        a, ab, ac = a[keep], ab[keep], ac[keep]
+        n = np.cross(ab, ac)
+        nn = np.einsum("ij,ij->i", n, n)
+        ok = nn > 1e-8
+        a, ab, ac, n, nn = a[ok], ab[ok], ac[ok], n[ok], nn[ok]
+        # circumcentre (relative to a), then the two points R0 from the vertices
+        cc = (np.cross(n, ab) * np.einsum("ij,ij->i", ac, ac)[:, None]
+              + np.cross(ac, n) * np.einsum("ij,ij->i", ab, ab)[:, None]) / (2 * nn[:, None])
+        r2 = np.einsum("ij,ij->i", cc, cc)
+        ok = r2 < r0 ** 2
+        h = np.sqrt(r0 ** 2 - r2[ok])[:, None]
+        nh = n[ok] / np.sqrt(nn[ok])[:, None]
+        centre = a[ok] + cc[ok]
+        cand = np.vstack([centre + h * nh, centre - h * nh])
+        fr = cand[:, :2] @ Ainv
+        cand = cand[np.all((fr >= -1e-9) & (fr < 1.0 - 1e-9), axis=1) & self.in_region(cand)]
+        if len(cand) == 0:
+            return np.zeros((0, 3))
+        return self._filter_and_merge(cand, atoms, system)
+
+    def _filter_and_merge(self, cand: np.ndarray, atoms: np.ndarray, system) -> np.ndarray:
+        """
+        Drop candidates near atoms, then merge close ones in a deterministic order.
+
+        Candidates closer than `site_min_distance` to an atom (minimum
+        image) are dropped; the rest, sorted by z, then y, then x, are kept
+        greedily: a candidate is kept unless a kept one lies within
+        `merge_tol` (minimum image).
+
+        Parameters
+        ----------
+        cand : numpy.ndarray
+            Candidate sites, shape (M, 3), in the primary cell.
+        atoms : numpy.ndarray
+            Atoms the sites must keep `site_min_distance` from, shape (n, 3).
+        system : SlabSystem
+            For the cell.
+
+        Returns
+        -------
+        numpy.ndarray
+            The sites, shape (K, 3), sorted by z, then y, then x.
+        """
+        from scipy.spatial import cKDTree
+        A = np.asarray(system._A, dtype=float)
+        Ainv = np.linalg.inv(A)
+        shifts = np.array([[*(i * A[0] + j * A[1]), 0.0] for i in (-1, 0, 1) for j in (-1, 0, 1)])
+
+        def images(p):         # wrapped into the cell, with the 8 neighbouring copies
+            f = p[:, :2] @ Ainv
+            p = np.column_stack([(f - np.floor(f)) @ A, p[:, 2]])
+            return (p[None, :, :] + shifts[:, None, :]).reshape(-1, 3)
+        if len(atoms) and len(cand):
+            d, _ = cKDTree(images(atoms)).query(cand, k=1)
+            cand = cand[d >= self.site_min_distance]
+        cand = cand[np.lexsort((cand[:, 0], cand[:, 1], cand[:, 2]))]
+        if len(cand) < 2:
+            return cand.reshape(-1, 3)
+        owner = np.tile(np.arange(len(cand)), len(shifts))
+        near = cKDTree(images(cand)).query_ball_point(cand, r=self.merge_tol)
+        suppressed = np.zeros(len(cand), dtype=bool)
         kept = []
-        for v in vert:
-            if not kept or np.min(np.linalg.norm(system._min_image(np.array(kept) - v),
-                                                 axis=-1)) > SITE_MERGE_TOL:
-                kept.append(v)
-        return np.array(kept).reshape(-1, 3)
+        for i in range(len(cand)):
+            if not suppressed[i]:
+                kept.append(i)
+                suppressed[owner[near[i]]] = True
+        return cand[kept]
 
     def log_q(self, y: np.ndarray, sites: np.ndarray, system) -> float:
         """
         Log density of proposing position y from these sites.
+
+        q(y; x) = w n(y) / (K V_delta) + (1 - w) / V_region for y in the
+        region (0 outside), n(y) the number of site balls containing y, K
+        the number of sites, w = 1 - `defensive_fraction` (w = 0 without
+        sites). Without the defensive mixture (eps = 0), w = 1 always.
 
         Parameters
         ----------
@@ -256,40 +493,114 @@ class Subsurface:
         sites : numpy.ndarray
             The sites, shape (K, 3).
         system : SlabSystem
-            For the minimum image.
+            For the minimum image and the cell area.
 
         Returns
         -------
         float
-            log[(1/K) sum_{k: |y - s_k| < delta} 1/V_delta]; -inf if no
-            site is within delta or y is outside the region.
+            log q(y; x); -inf if q = 0 (y outside the region, or no site
+            within delta and eps = 0).
         """
-        if len(sites) == 0 or not self.in_region(y[None, :])[0]:
+        eps = self.defensive_fraction
+        if not self.in_region(np.asarray(y, dtype=float)[None, :])[0]:
             return -math.inf
+        if len(sites) == 0:
+            return -math.inf if eps == 0.0 else -math.log(self.region_volume(system))
         n = int(np.count_nonzero(np.linalg.norm(system._min_image(sites - y), axis=-1)
                                  < self.delta))
-        return -math.inf if n == 0 else math.log(n / (len(sites) * self.v_delta))
+        if eps == 0.0:
+            return -math.inf if n == 0 else math.log(n / (len(sites) * self.v_delta))
+        return math.log((1.0 - eps) * n / (len(sites) * self.v_delta)
+                        + eps / self.region_volume(system))
 
-    def propose(self, sites: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    def propose(self, sites: np.ndarray, rng: np.random.Generator, system=None) -> np.ndarray:
         """
         Draw an insertion point: a uniform site, then uniform in its delta-ball.
+
+        With a defensive fraction eps > 0, the point is instead uniform in
+        the region (xy uniform in the cell, z uniform in [z_min, z_cut))
+        with probability eps, and always when there is no site.
 
         Parameters
         ----------
         sites : numpy.ndarray
-            The sites, shape (K >= 1, 3).
+            The sites, shape (K, 3); K >= 1 unless eps > 0.
         rng : numpy.random.Generator
             Random number generator.
+        system : SlabSystem, optional
+            The cell, for the uniform part (needed when eps > 0).
 
         Returns
         -------
         numpy.ndarray
             The (3,) point (not wrapped).
+
+        Raises
+        ------
+        ValueError
+            If eps > 0 and no system is given, or there is no site and
+            eps = 0.
         """
+        eps = self.defensive_fraction
+        if eps > 0.0:
+            if system is None:
+                raise ValueError("propose needs the system for the defensive (uniform) part")
+            if len(sites) == 0 or rng.random() < eps:
+                xy = rng.random(2) @ np.asarray(system._A, dtype=float)
+                return np.array([xy[0], xy[1],
+                                 self.z_min + rng.random() * (self.z_cut - self.z_min)])
+        if len(sites) == 0:
+            raise ValueError("no site to propose from")
         s = sites[int(rng.integers(len(sites)))]
         u = rng.standard_normal(3)
         r = self.delta * rng.random() ** (1.0 / 3.0)
         return s + r * u / np.linalg.norm(u)
+
+
+def system_channels(system) -> Tuple["Subsurface", ...]:
+    """
+    The site-exchange (subsurface) channels of a system, in order.
+
+    Parameters
+    ----------
+    system : ParticleSystem
+        The system (`SlabSystem.set_subsurface`); systems pickled before
+        several channels existed have only ``subsurface``.
+
+    Returns
+    -------
+    tuple of Subsurface
+        The channels (empty without any).
+    """
+    channels = getattr(system, "subsurface_channels", None)
+    if channels is None:
+        sub = getattr(system, "subsurface", None)
+        channels = () if sub is None else (sub,)
+    return tuple(channels)
+
+
+def channel_label(system, k: int) -> str:
+    """
+    Counter label of channel `k`: ``'sub'`` for the primary channel, else ``'site<k>'``.
+
+    The primary channel is `system.subsurface` (the first partitioning
+    one), whose moves keep the historical keys ``'insert_sub:<sp>'`` /
+    ``'delete_sub:<sp>'``.
+
+    Parameters
+    ----------
+    system : ParticleSystem
+        The system.
+    k : int
+        Index into `system_channels`.
+
+    Returns
+    -------
+    str
+        The label.
+    """
+    labels = getattr(system, "subsurface_labels", None)
+    return "sub" if labels is None else labels[k]
 
 
 # =============================================================================
