@@ -35,7 +35,7 @@ METADATA_FILE = "run_metadata.json"
 MIXING_FILE = "mixing.json"
 
 
-def write_mixing(sim, path: str) -> dict:
+def write_mixing(sim, path: str, step: Optional[int] = None) -> dict:
     """
     Write the replica-exchange mixing statistics of a simulation as JSON.
 
@@ -45,13 +45,20 @@ def write_mixing(sim, path: str) -> dict:
         The simulation.
     path : str
         Output file.
+    step : int, optional
+        Steps done. If given, the cumulative pair counts are first
+        recorded (`snapshot_pair_stats`), so ``chunks`` gains an entry.
 
     Returns
     -------
     dict
         What was written: acceptance per pattern, per pair (with the worst
-        pair), and the round trips of every walker along T and mu.
+        pair), the round trips of every walker along T and mu, and
+        ``chunks``: per interval between snapshots, ``step_start``,
+        ``step_end`` and ``attempts`` / ``accepted`` aligned with ``pairs``.
     """
+    if step is not None and hasattr(sim, "snapshot_pair_stats"):
+        sim.snapshot_pair_stats(step)
     pairs = sim.pair_acceptance()
     worst = min(pairs.items(), key=lambda kv: kv[1][1]) if pairs else None
     trips = sim.round_trip_counts()
@@ -64,6 +71,12 @@ def write_mixing(sim, path: str) -> dict:
                                                   "acceptance": worst[1][1]},
         "round_trips_T": trips["T"].tolist(), "round_trips_mu": trips["mu"].tolist(),
     }
+    order = sorted(pairs)
+    chunks = sim.pair_acceptance_by_chunk() if hasattr(sim, "pair_acceptance_by_chunk") else []
+    data["chunks"] = [{"step_start": c["step_start"], "step_end": c["step_end"],
+                       "attempts": [c["pairs"].get(k, (0, 0))[0] for k in order],
+                       "accepted": [c["pairs"].get(k, (0, 0))[1] for k in order]}
+                      for c in chunks]
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f, indent=1)
@@ -307,7 +320,7 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
             sim.convergence_details.append(detail)
             sim._maybe_write_status(n, n, "regc", force=True, converged=bool(converged))
         save_samples(sim, os.path.join(out_dir, SAMPLES_FILE))
-        write_mixing(sim, os.path.join(out_dir, MIXING_FILE))
+        write_mixing(sim, os.path.join(out_dir, MIXING_FILE), step=done)
         sim.save_checkpoint(ckpt, extra={"steps_done": done, "n_at_last_check": n_at_last_check,
                                          "n_at_check_before": n_at_check_before,
                                          "rho_u_changes": changes, "converged": converged})

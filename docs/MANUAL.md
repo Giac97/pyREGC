@@ -963,8 +963,8 @@ so the run stays bit-identical. Then it writes:
 - `checkpoint.pkl`, the complete simulation state, including every
   random number generator;
 - `run_metadata.json`, your `metadata`;
-- `mixing.json`, swap acceptance per pattern and per pair, and round
-  trips per walker.
+- `mixing.json`, swap acceptance per pattern and per pair, round
+  trips per walker, and `chunks`: the pair counts of every chunk.
 
 How restarts behave:
 
@@ -1355,7 +1355,13 @@ support = ridge_support(ridges, b.replicates)    # fraction of resamples keeping
   with the overlap and ladder checks.
 - **Mixing:** `sim.pair_acceptance()` (per neighbouring pair) and
   `sim.round_trip_counts()` (per walker, along T and μ); the driver writes
-  both to `mixing.json` after every chunk.
+  both to `mixing.json` after every chunk. It also records the cumulative
+  pair counts at the end of each chunk (`sim.snapshot_pair_stats`, kept in
+  the checkpoint): `sim.pair_acceptance_by_chunk()`, and `mixing.json`
+  `chunks` (`step_start`, `step_end`, `attempts`, `accepted`, aligned with
+  `pairs`), give the acceptance of every pair chunk by chunk. Cumulative
+  acceptances hide drift; per-chunk ones show whether the swap rates are
+  stationary, and are what a ladder adapted between chunks should use.
 
 #### 9.4.1 What one bootstrap resample does
 
@@ -3224,7 +3230,7 @@ Everything goes to `output.directory`:
 | `status.json` | Always: the live heartbeat read by `regc-monitor` (progress, per-replica counts and averages, recent N and U traces, swap statistics, convergence checks), replaced every 5 s. |
 | `records.h5` | With `records.save`: per-sample records and energies under re-evaluated potentials ([§9.6](#96-other-potentials-records-re-evaluation-and-reweighting)). |
 | `phase_diagram_<name>.png`, `_<name>_difference.png`, `_<name>_ess.png` | With `phase_diagram.potentials`. |
-| `mixing.json` | Swap acceptance per pattern and per neighbouring pair (with the worst pair), and round trips per walker along T and μ; rewritten after every chunk. |
+| `mixing.json` | Swap acceptance per pattern and per neighbouring pair (with the worst pair), round trips per walker along T and μ, and `chunks` (per-chunk pair attempts and accepts, aligned with `pairs`); rewritten after every chunk. |
 | `phase_diagram_uncertainty.png` | With `bootstrap`: half-width of the coverage interval. |
 | reliability keys of `phase_diagram_data.npz` | Always: `statistical_inefficiency`, `n_independent`, `overlap_min` (replica grid), `round_trips_T` (with `mixing.json`); C_V: `heat_capacity_ridges_kept` (and `heat_capacity_ridges_on_ladder` with a pressure ladder). With `bootstrap`: `theta_ci_low`/`theta_ci_high`, `most_probable_agreement`, `heat_capacity_ci_low`/`heat_capacity_ci_high`, `heat_capacity_ridges_support`, `bootstrap_level`, `bootstrap_n`. |
 

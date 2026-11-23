@@ -149,6 +149,39 @@ def test_driver_writes_mixing_and_resume_keeps_it(tmp_path):
         assert sim.pair_acceptance()[((0, 0), (1, 0))][0] > first[((0, 0), (1, 0))][0]
 
 
+def test_mixing_chunks_add_up_and_survive_resume(tmp_path):
+    """Per-chunk pair counts: differences of cumulative snapshots that sum to the
+    totals, kept across a resume (and a history-less checkpoint gets a baseline)."""
+    def make():
+        return ReplicaExchangeGCMC([1.0, 1.3], [[-1.0], [-0.8]], _ideal, seed=11)
+    kw = dict(chunk=50, x0=0.3, diffusion="mc_moves", diffusion_steps=1, record_every=5,
+              progress=None)
+    with make() as sim:
+        run_with_checkpoints(sim, str(tmp_path), n_steps=100, **kw)
+    with make() as sim:
+        run_with_checkpoints(sim, str(tmp_path), n_steps=200, **kw)
+        totals = sim.pair_acceptance()
+    with open(os.path.join(tmp_path, "mixing.json")) as f:
+        mix = json.load(f)
+    assert [(c["step_start"], c["step_end"]) for c in mix["chunks"]] == [
+        (0, 50), (50, 100), (100, 150), (150, 200)]
+    att = np.sum([c["attempts"] for c in mix["chunks"]], axis=0)
+    acc = np.sum([c["accepted"] for c in mix["chunks"]], axis=0)
+    assert list(att) == [p["attempts"] for p in mix["pairs"]]
+    assert np.allclose(acc / att, [p["acceptance"] for p in mix["pairs"]])
+    assert sum(n for n, _ in totals.values()) == att.sum()
+    # an old checkpoint without the history: its counts become a baseline
+    sim2 = make()
+    sim2.pair_stats_history = []
+    sim2.pair_stats = {((0, 0), (1, 0)): [7, 3]}
+    sim2.pair_stats_history = [{"step": None, "pairs": {((0, 0), (1, 0)): [7, 3]}}]
+    sim2.pair_stats[((0, 0), (1, 0))] = [10, 5]
+    sim2.snapshot_pair_stats(300)
+    ch = sim2.pair_acceptance_by_chunk()
+    assert ch == [{"step_start": None, "step_end": 300, "pairs": {((0, 0), (1, 0)): (3, 2)}}]
+    sim2.close()
+
+
 # -- heat-capacity peaks ----------------------------------------------------------------
 def test_ridge_support_separates_real_from_noise_peaks():
     from regc import heat_capacity_ridges

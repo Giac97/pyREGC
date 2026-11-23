@@ -724,6 +724,7 @@ class ReplicaExchangeGCMC:
         across the grid (`ParticleSystem` objects travel with accepted swaps).
         """
         self.pair_stats: Dict[Tuple[Tuple[int, int], Tuple[int, int]], List[int]] = {}
+        self.pair_stats_history: List[dict] = []
         for k, key in enumerate(sorted(self.grid)):
             self.grid[key].system.walker_id = k
         n = len(self.grid)
@@ -789,6 +790,57 @@ class ReplicaExchangeGCMC:
             ``{(key_a, key_b): (attempts, acceptance)}``.
         """
         return {pair: (att, acc / max(1, att)) for pair, (att, acc) in self.pair_stats.items()}
+
+    def snapshot_pair_stats(self, step: Optional[int]) -> None:
+        """
+        Record the cumulative per-pair swap counts at a step (end of a chunk).
+
+        Differences of successive snapshots are the per-chunk acceptances
+        (see `pair_acceptance_by_chunk`): a run whose acceptances still
+        drift has not reached stationarity, which the cumulative
+        `pair_acceptance` hides. The history is kept in the checkpoint.
+
+        Parameters
+        ----------
+        step : int or None
+            Steps done when the snapshot is taken (None if unknown).
+
+        Returns
+        -------
+        None
+        """
+        if self.pair_stats_history and self.pair_stats_history[-1]["step"] == step \
+                and step is not None:
+            self.pair_stats_history[-1] = {"step": step, "pairs": {
+                k: list(v) for k, v in self.pair_stats.items()}}   # same step: replace
+            return
+        self.pair_stats_history.append({"step": None if step is None else int(step),
+                                        "pairs": {k: list(v) for k, v in self.pair_stats.items()}})
+
+    def pair_acceptance_by_chunk(self) -> List[dict]:
+        """
+        Swap attempts and accepts of every pair between successive snapshots.
+
+        Returns
+        -------
+        list of dict
+            One dict per interval: ``step_start`` (None for the first
+            interval of a history starting at an unknown step, or 0 for a
+            fresh run), ``step_end`` and ``pairs`` = ``{(key_a, key_b):
+            (attempts, accepts)}``.
+        """
+        out, prev = [], {"step": 0, "pairs": {}}
+        for snap in self.pair_stats_history:
+            if snap["step"] is None and not out and not prev["pairs"]:
+                prev = snap   # baseline of an older checkpoint
+                continue
+            pairs = {}
+            for k, (att, acc) in snap["pairs"].items():
+                a0, c0 = prev["pairs"].get(k, (0, 0))
+                pairs[k] = (int(att - a0), int(acc - c0))
+            out.append({"step_start": prev["step"], "step_end": snap["step"], "pairs": pairs})
+            prev = snap
+        return out
 
     def round_trip_counts(self) -> Dict[str, np.ndarray]:
         """
@@ -1418,6 +1470,7 @@ class ReplicaExchangeGCMC:
                        "observables_meta": self.observables_meta,
                        "samples": self.samples, "swap_stats": self.swap_stats,
                        "pair_stats": self.pair_stats, "round_trips": self.round_trips,
+                       "pair_stats_history": self.pair_stats_history,
                        "walker_last_end": self.walker_last_end,
                        "skip_empty_swaps": self.skip_empty_swaps,
                        "convergence_history": self.convergence_history,
@@ -1515,6 +1568,11 @@ class ReplicaExchangeGCMC:
         if "round_trips" in st and all(hasattr(r.system, "walker_id") for r in self.grid.values()):
             self.pair_stats = st["pair_stats"]
             self.round_trips, self.walker_last_end = st["round_trips"], st["walker_last_end"]
+            # checkpoints from before the history: a baseline of unknown step, so the
+            # chunks recorded from now on are differences against it
+            self.pair_stats_history = st.get("pair_stats_history") or (
+                [{"step": None, "pairs": {k: list(v) for k, v in self.pair_stats.items()}}]
+                if self.pair_stats else [])
         else:  # a checkpoint from before walker tracking: start counting now
             self._init_walkers()
         return st["extra"]

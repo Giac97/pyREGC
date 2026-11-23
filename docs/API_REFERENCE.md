@@ -2718,6 +2718,39 @@ cuts the ladder in two; this lists them one by one.
 
 - *dict*: `{(key_a, key_b): (attempts, acceptance)}`.
 
+#### `ReplicaExchangeGCMC.snapshot_pair_stats`
+
+```python
+ReplicaExchangeGCMC.snapshot_pair_stats(step: Optional[int]) -> None
+```
+
+Record the cumulative per-pair swap counts at a step (end of a chunk).
+
+Differences of successive snapshots are the per-chunk acceptances
+(see `pair_acceptance_by_chunk`): a run whose acceptances still
+drift has not reached stationarity, which the cumulative
+`pair_acceptance` hides. The history is kept in the checkpoint.
+
+**Parameters**
+
+- `step` (*int or None*): Steps done when the snapshot is taken (None if unknown).
+
+**Returns**
+
+- *None*
+
+#### `ReplicaExchangeGCMC.pair_acceptance_by_chunk`
+
+```python
+ReplicaExchangeGCMC.pair_acceptance_by_chunk() -> List[dict]
+```
+
+Swap attempts and accepts of every pair between successive snapshots.
+
+**Returns**
+
+- *list of dict*: One dict per interval: `step_start` (None for the first interval of a history starting at an unknown step, or 0 for a fresh run), `step_end` and `pairs` = `{(key_a, key_b): (attempts, accepts)}`.
+
 #### `ReplicaExchangeGCMC.round_trip_counts`
 
 ```python
