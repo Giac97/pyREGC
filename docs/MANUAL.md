@@ -1351,6 +1351,132 @@ large grids and cheap adaptation. Use the ES (with a warm-up, enough
 attempts per pair and the `resistance` fitness) when the model's
 predictions disagree with what the next chunk measures.
 
+### 7.5 Bias columns: replicas at a shifted chemical potential
+
+**Why.** Some changes of the surface need several substrate atoms to
+leave together. Pd(100) + O with exchangeable Pd (a bulk reservoir for Pd,
+`structure.exchangeable_top_layers`, site-exchange NCMC channels) is the
+example: the PdO(101)/√5 surface oxide needs ΔN_Pd = −1 per √5 cell,
+several Pd atoms removed collectively. In a 3000-step D3 run not one of
+about 39 000 Pd moves was accepted. The measured dissipation-free log-odds
+of removing one Pd atom are about −6 at 900 K (O-rich) and −18 to −22 at
+300–560 K. The barrier is thermodynamic: the first removal is very
+unlikely even though the end state (the oxide) may be stable. A better
+move cannot fix that, but a different ensemble can.
+
+**What.** Bias columns are extra replicas after the highest-pressure
+column. Column n_p + j (j = 1..k) has the temperature of its row and the
+chemical potential of every species of the last physical column, except
+the biased species. Its μ is lowered by shift_j k_B T:
+
+    μ_Pd(T, n_p + j) = μ_Pd(T, p_max) − shift_j · k_B T
+
+In these replicas Pd removal, and with it oxide formation, is favoured.
+Ordinary replica exchange links them to the physical states: μ swaps
+along the row, diagonal swaps, and T swaps within a column. A
+configuration made with fewer Pd atoms then moves into the physical
+columns, where it is accepted or rejected with the exact rule. The engine
+needs nothing new: every state already has its own μ vector, and the
+insert/delete moves, the site-exchange and subsurface NCMC acceptances,
+the molecule moves and the swap rule all read the μ of their own state
+(the semi-grand-canonical field is the same everywhere and is not
+shifted). The four swap patterns run over the extended grid, so the
+physical column n_p − 1 swaps with the first bias column like any other
+neighbour.
+
+```yaml
+replica_exchange:
+  temperatures_K: [300, 450, 600, 750, 900]
+  pressures: [1.0e-12, 1.0e-8, 1.0e-4, 1.0]
+  scheme: regc
+  bias_columns: {species: Pd, shifts_kT: [2, 4, 6, 8, 10, 12]}
+  # or one list per species, all of the same length:
+  # bias_columns: {shifts_kT: {Pd: [2, 4, 6], Pt: [1, 2, 3]}}
+```
+
+**Why shifts in kT.** With a fixed shift in units of k_B T, the reduced
+field β Δμ is the same all the way down a column. Two consequences:
+
+- A μ swap between bias columns j and j + 1 is accepted with
+  min(1, exp(−(shift_{j+1} − shift_j) ΔN_Pd)), where ΔN_Pd is the
+  difference in Pd count between the two configurations. This is roughly
+  the same at every temperature, so one set of shifts suits the whole
+  ladder.
+- In a T swap within a bias column the shift cancels. The acceptance is
+  the same as in the last physical column.
+
+The setup summary prints, for each row, what the largest shift is in eV.
+
+**How many columns.** Two numbers set the ladder:
+
+- *Step.* Neighbouring columns overlap when the shift step is about
+  1/⟨|ΔN|⟩, where ⟨|ΔN|⟩ is the typical difference in N_Pd between their
+  configurations. When N_Pd hardly changes, steps of 2–3 kT are fine.
+  Near a collective change (a whole √5 cell, several atoms), use steps of
+  1 kT or less.
+- *Total.* The largest shift should be about the removal log-odds you
+  need to overcome. For the Pd(100) numbers above that is 6–10 kT at the
+  hot end. At 300–560 K it would be about 20 kT, which is more than the
+  cold rows need: there the configurations arrive by T swaps from the
+  hot bias replicas.
+
+`regc-run --analyze-only` writes `<plot>_states_N_Pd.png`, the plain
+average ⟨N_Pd⟩ of every sampled state with the bias columns right of a
+line, and `round_trips_bias` in `mixing.json`. Use them to check that
+the bias does what it should: Pd must leave in the bias columns, and
+walkers must travel from the physical columns to the bias columns and
+back. If Pd does not leave, extend the shifts. If no walker returns, the
+gap between the physical and the first bias column is too large.
+
+**What MBAR does with them.** Every state enters MBAR, bias columns
+included: each is just another (T, μ) with its own reduced potential.
+The phase diagram is evaluated only at the physical μ: the targets come
+from the configured T and p through the gas feed, as without bias
+columns, so the maps, C_V and exported structures are those of the real
+ensemble. The extra columns only add samples that MBAR weights by their
+overlap with the physical states. The ρ(u) convergence rule runs over all
+states, bias columns included. A bias column that has not converged
+therefore holds the run back, which is what we want: its samples enter
+every reweighted estimate.
+
+**Limitations.**
+
+- Reweighting to the physical μ_Pd needs overlap along the bias columns.
+  A Pd-depleted configuration that only exists in the most biased column
+  adds nothing at p_max unless the columns between pass it on. Look at
+  `overlap_min` and the pair acceptances in `mixing.json`.
+- The extra replicas cost as much as physical ones: k columns add
+  k × n_T replicas.
+- Bias columns need a gas feed with a `pressures` ladder and
+  `scheme: regc`.
+- They cannot be combined with `adapt_ladder` (the optimisers move
+  pressures, which the bias columns do not have),
+  `phase_diagram.merge` or `phase_diagram.suggest_ladder` (both place
+  states on the (T, p) plane of the gas feed). A run with bias columns
+  cannot be merged into another one.
+- `regc.diagnostics.suggest_ladder` and `ladder_pairs(pressure=True)`
+  convert each state's μ back to a pressure, so do not use them on such
+  runs from Python either.
+- The heat-capacity "on the ladder" flags use only the physical
+  pressures.
+
+In `run_metadata.json`:
+
+- `bias_columns`: `species`, `shifts_kT`, `n_physical_columns`,
+  `n_bias_columns`.
+- `mu_grid_eV`: the full grid.
+- `pressure_grid`: the pressure of every state; bias columns sit at
+  p_max.
+- `bias_shift_kT_grid`: the shift of every state and species.
+- `column_labels`: e.g. `1 bar, mu_Pd - 1.5 kT`. `regc-monitor` and
+  `regc gui` show these labels on the replica grid.
+
+`pressures` lists only the physical columns. From Python, build the grid
+with `regc.runner.bias_column_mu_grid` and pass
+`n_physical_mu=n_p` to `ReplicaExchangeGCMC`. The sampling does not
+depend on it; it only adds the bias round trips
+(`round_trip_counts()['bias']`).
+
 ## 8. Saving and loading samples
 
 ```python
@@ -3282,6 +3408,7 @@ The ladder: give `temperatures_K` and **exactly one** of `pressures` or
 | `displace_substrate` | false | With `mc`: move displaceable substrate atoms too. |
 | `md` | – | `{timestep_fs: 1.0, thermostat: bussi, taut_fs: 20.0, friction_per_fs: 0.01}` for `diffusion: md`. |
 | `adapt_ladder` | off | Move the (T, p) ladder after the first chunks from the measured swap rates, then freeze it ([§7.3](#73-adapting-the-ladder-during-a-run)). `true` or `{method: model, chunks: 3, trust: 1.5, per_row: true, min_gap_ratio: 0.25, max_gap_ratio: 4.0, min_attempts: 20, min_samples: 5, max_evals: 20000, max_time_s: null}`. Needs `pressures`, a `checkpoint` section with `chunk` < `n_steps`, at least 3 temperatures or 3 pressures, and scipy. Every change discards the samples so far. With `method: es` the ladder is optimised before the run by an evolution strategy on short trial runs ([§7.4](#74-optimising-the-ladder-by-an-evolution-strategy-model-free)); its keys are in the table below. |
+| `bias_columns` | off | Extra columns after the highest pressure, in which a species' μ is lowered by shift × k_B T ([§7.5](#75-bias-columns-replicas-at-a-shifted-chemical-potential)): `{species: Pd, shifts_kT: [1.5, 3.0, 4.5]}` (one list for one or several species) or `{shifts_kT: {Pd: [...], Pt: [...]}}` (one list per species, all the same length). Shifts positive and strictly increasing, at least one; the species must be exchanged. Needs `pressures`; not with `adapt_ladder`, `phase_diagram.merge` or `phase_diagram.suggest_ladder`. Adds n_T × len(shifts) replicas; the phase diagram stays at the physical μ. |
 
 `adapt_ladder` keys with `method: es` (other keys are refused):
 
@@ -3496,9 +3623,10 @@ Everything goes to `output.directory`:
 | `status.json` | Always: the live heartbeat read by `regc-monitor` (progress, per-replica counts and averages, recent N and U traces, swap statistics, convergence checks), replaced every 5 s. |
 | `records.h5` | With `records.save`: per-sample records and energies under re-evaluated potentials ([§9.6](#96-other-potentials-records-re-evaluation-and-reweighting)). |
 | `phase_diagram_<name>.png`, `_<name>_difference.png`, `_<name>_ess.png` | With `phase_diagram.potentials`. |
-| `mixing.json` | Swap acceptance per pattern and per neighbouring pair (with the worst pair), round trips per walker along T and μ, and `chunks` (per-chunk pair attempts and accepts, aligned with `pairs`, and the `ladder_version` they were sampled on); rewritten after every chunk. |
+| `mixing.json` | Swap acceptance per pattern and per neighbouring pair (with the worst pair), round trips per walker along T and μ (and with `bias_columns`, `round_trips_bias`: physical columns → bias columns → physical columns), and `chunks` (per-chunk pair attempts and accepts, aligned with `pairs`, and the `ladder_version` they were sampled on); rewritten after every chunk. |
 | `ladder.json`, `samples_ladder<v>.npz` | With `adapt_ladder`: every adaptation (ladder, measured and predicted acceptances, resistances), and the samples of each replaced ladder ([§7.3](#73-adapting-the-ladder-during-a-run)); with `method: es`, every generation (all evaluations with their pair counts, both fitnesses and their errors, the survivor; [§7.4](#74-optimising-the-ladder-by-an-evolution-strategy-model-free)). `samples.npz` and `run_metadata.json` then hold the current ladder (`pressure_grid`: the pressure of every state). |
 | `phase_diagram_uncertainty.png` | With `bootstrap`: half-width of the coverage interval. |
+| `phase_diagram_states_N_<species>.png` | With `bias_columns`: ⟨N⟩ of each biased species on every sampled state, bias columns included (plain averages, not reweighted); in `phase_diagram_data.npz` as `states_N_<species>` (n_T × columns) with `column_labels`, and `round_trips_bias` ([§7.5](#75-bias-columns-replicas-at-a-shifted-chemical-potential)). |
 | reliability keys of `phase_diagram_data.npz` | Always: `statistical_inefficiency`, `n_independent`, `overlap_min` (replica grid), `round_trips_T` (with `mixing.json`); C_V: `heat_capacity_ridges_kept` (and `heat_capacity_ridges_on_ladder` with a pressure ladder). With `bootstrap`: `theta_ci_low`/`theta_ci_high`, `most_probable_agreement`, `heat_capacity_ci_low`/`heat_capacity_ci_high`, `heat_capacity_ridges_support`, `bootstrap_level`, `bootstrap_n`. |
 
 To replot or post-process:

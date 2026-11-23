@@ -41,7 +41,10 @@ surface phase diagram, all from one YAML or JSON file.
 4. **replica_exchange** -- a (T x p) ladder (``pressures``, mu from the
    reservoir) or an explicit (T x mu) one (``mu_eV``); the [ZSG] REGC
    scheme (``scheme: regc``, MC/HMC/MD diffusion) or the sweep scheme;
-   optional ``adsorbed_cutoff`` to record the adsorbed count ``N_ads``.
+   optional ``adsorbed_cutoff`` to record the adsorbed count ``N_ads``;
+   ``bias_columns`` appends replicas at p_max with one species' mu lowered
+   by multiples of kT (`bias_column_mu_grid`), which reach the physical
+   states by replica exchange and enter MBAR.
 5. **checkpoint** (regc only) -- run in chunks with `run_with_checkpoints`
    (``checkpoint.pkl``/``samples.npz``), resumable (``--resume``) and
    stopping cleanly before ``--time-limit`` (exit code 75, `EXIT_RESUBMIT`).
@@ -168,7 +171,7 @@ _RE_SCHEME = {
              "convergence_min_neff", "convergence_median_tol", "convergence_discard",
              "convergence_consecutive", "convergence_min_round_trips", "swap_types",
              "displace_substrate",
-             "md", "adapt_ladder"},
+             "md", "adapt_ladder", "bias_columns"},
     "sweep": {"n_cycles", "sweeps_per_cycle", "exchange_every", "burn_in_cycles",
               "diagonal_swaps", "p_displace", "p_insert", "p_delete", "p_displace_substrate"},
 }
@@ -497,6 +500,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     if "checkpoint" in config and scheme != "regc":
         raise ValueError("the checkpoint section needs replica_exchange.scheme: regc")
     if scheme == "regc":
+        _bias_columns_settings(config)   # first: it names the adapt_ladder conflict
         _adapt_ladder_settings(config)
     if "sgc" in config:
         sgc = config["sgc"] or {}
@@ -698,6 +702,179 @@ def _adapt_ladder_es_settings(config: Dict[str, Any], cfg: Dict[str, Any]) -> Di
         raise ValueError(f"{where}.min_gap_fraction must be in [0, 1/{most_gaps}), got "
                          f"{out['min_gap_fraction']}")
     return out
+
+
+def _bias_columns_settings(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    The ``replica_exchange.bias_columns`` settings, checked.
+
+    ``{species: Pd, shifts_kT: [1.5, 3.0]}`` shifts mu_Pd of the extra
+    columns by -1.5 kT and -3 kT (one or several species, the same
+    shifts); ``{shifts_kT: {Pd: [...], Ag: [...]}}`` gives every species
+    its own shifts (lists of the same length).
+
+    Parameters
+    ----------
+    config : dict
+        The parsed config.
+
+    Returns
+    -------
+    dict or None
+        None without ``bias_columns``; else ``species`` (list),
+        ``shifts_kT`` ({species: list of float}) and ``n_columns``.
+
+    Raises
+    ------
+    ValueError
+        If the section is malformed, a species is not exchanged, the
+        shifts are not positive and strictly increasing, the lists differ
+        in length, the run has no pressure ladder or scheme regc, or it is
+        combined with ``adapt_ladder``, ``phase_diagram.merge`` or
+        ``phase_diagram.suggest_ladder``.
+    """
+    re_cfg = config.get("replica_exchange") or {}
+    cfg = re_cfg.get("bias_columns")
+    if cfg is None:
+        return None
+    where = "replica_exchange.bias_columns"
+    if not isinstance(cfg, dict):
+        raise ValueError(f"{where} must be a mapping, e.g. {{species: Pd, shifts_kT: [1.5, 3.0]}}")
+    _check_keys(cfg, {"species", "shifts_kT"}, where)
+    if _scheme(re_cfg) != "regc" or "pressures" not in re_cfg:
+        raise ValueError(f"{where} needs scheme: regc and a gas-feed pressure ladder "
+                         f"(replica_exchange.pressures): the extra columns sit at the highest "
+                         f"pressure")
+    if re_cfg.get("adapt_ladder"):
+        raise ValueError(f"{where} cannot be combined with replica_exchange.adapt_ladder yet: "
+                         f"the ladder optimisers move pressures, which the bias columns do not "
+                         f"have; drop one of them")
+    pd_cfg = config.get("phase_diagram") or {}
+    for key in ("merge", "suggest_ladder"):
+        if pd_cfg.get(key):
+            raise ValueError(f"{where} cannot be combined with phase_diagram.{key}: the bias "
+                             f"columns are not on the gas feed's (T, p) plane")
+    shifts = cfg.get("shifts_kT")
+    if isinstance(shifts, dict):
+        table = {str(sp): v for sp, v in shifts.items()}
+        if "species" in cfg:
+            named = [cfg["species"]] if isinstance(cfg["species"], str) else list(cfg["species"])
+            if sorted(map(str, named)) != sorted(table):
+                raise ValueError(f"{where}.species {named} does not match the species of "
+                                 f"shifts_kT {sorted(table)}")
+    else:
+        if "species" not in cfg or shifts is None:
+            raise ValueError(f"{where} needs 'species' and 'shifts_kT' (a list, or a mapping "
+                             f"species -> list)")
+        named = [cfg["species"]] if isinstance(cfg["species"], str) else list(cfg["species"])
+        table = {str(sp): shifts for sp in named}
+    if not table:
+        raise ValueError(f"{where} names no species")
+    exchanged = _species_list(config)
+    out = {}
+    for sp, values in table.items():
+        if sp not in exchanged:
+            raise ValueError(f"{where}: {sp!r} is not an exchanged species {exchanged}")
+        if isinstance(values, (str, bytes)) or not hasattr(values, "__len__"):
+            raise ValueError(f"{where}.shifts_kT for {sp} must be a list of numbers")
+        vals = _floats(values, f"{where}.shifts_kT")
+        if not vals:
+            raise ValueError(f"{where}.shifts_kT for {sp} needs at least one shift")
+        if vals[0] <= 0.0 or any(b <= a for a, b in zip(vals[:-1], vals[1:])):
+            raise ValueError(f"{where}.shifts_kT for {sp} must be positive and strictly "
+                             f"increasing (in kT; positive lowers mu), got {vals}")
+        out[sp] = vals
+    lengths = {len(v) for v in out.values()}
+    if len(lengths) != 1:
+        raise ValueError(f"{where}.shifts_kT: every species needs the same number of shifts "
+                         f"(one per column), got {({sp: len(v) for sp, v in out.items()})}")
+    species = [sp for sp in exchanged if sp in out]
+    return {"species": species, "shifts_kT": {sp: out[sp] for sp in species},
+            "n_columns": lengths.pop()}
+
+
+def bias_column_mu_grid(mu_grid, temperatures_K: Sequence[float], species: Sequence[str],
+                        shifts_kT: Dict[str, Sequence[float]]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Append bias columns to a (T x p) chemical-potential grid.
+
+    Column n_p + j (j = 0..k-1) has every species' mu of the last
+    (highest-pressure) column, except that each species in `shifts_kT`
+    has mu lowered by shifts_kT[species][j] * k_B T of its row: the same
+    reduced field beta * Delta mu down every column.
+
+    Parameters
+    ----------
+    mu_grid : array_like
+        Shape (n_T, n_p) for one species, (n_T, n_p, n_species) otherwise.
+    temperatures_K : sequence of float
+        The rows' temperatures, in Kelvin.
+    species : sequence of str
+        The exchanged species, in the order of the last axis.
+    shifts_kT : dict
+        Species -> k shifts in units of k_B T (positive lowers mu).
+
+    Returns
+    -------
+    tuple
+        ``(mu_ext, shift_grid)``: `mu_grid` with k more columns (same
+        layout), and the shifts in kT of every state, shape
+        (n_T, n_p + k, n_species) (zero in the physical columns).
+
+    Raises
+    ------
+    ValueError
+        If the shapes do not match, a species is unknown or the shift
+        lists differ in length.
+    """
+    from .units import kelvin_to_eV
+    mu = np.asarray(mu_grid, dtype=float)
+    single = mu.ndim == 2
+    m3 = mu[..., None] if single else mu
+    if m3.ndim != 3 or m3.shape[0] != len(temperatures_K) or m3.shape[2] != len(species):
+        raise ValueError(f"mu_grid of shape {mu.shape} does not match {len(temperatures_K)} "
+                         f"temperatures and species {list(species)}")
+    unknown = sorted(set(shifts_kT) - set(species))
+    lengths = {len(v) for v in shifts_kT.values()}
+    if unknown or len(lengths) != 1:
+        raise ValueError(f"shifts_kT needs exchanged species {list(species)} and one shift list "
+                         f"length; got {dict(shifts_kT)}")
+    n_T, n_p, n_s = m3.shape
+    k = lengths.pop()
+    shift = np.zeros((n_T, n_p + k, n_s))
+    for s, sp in enumerate(species):
+        if sp in shifts_kT:
+            shift[:, n_p:, s] = np.asarray(shifts_kT[sp], dtype=float)
+    kT = np.array([kelvin_to_eV(T) for T in temperatures_K])[:, None, None]
+    ext = np.concatenate([m3, np.repeat(m3[:, -1:, :], k, axis=1)], axis=1) - shift * kT
+    return (ext[..., 0] if single else ext), shift
+
+
+def _bias_column_labels(pressures: Sequence[float], unit: str,
+                        shifts_kT: Dict[str, Sequence[float]]) -> List[str]:
+    """
+    Labels of every mu column: the pressure, and for bias columns the shift.
+
+    Parameters
+    ----------
+    pressures : sequence of float
+        The physical pressures.
+    unit : str
+        Their unit.
+    shifts_kT : dict
+        Species -> shifts in kT, one per bias column.
+
+    Returns
+    -------
+    list of str
+        One label per column, e.g. ``'1 bar, mu_Pd - 1.5 kT'``.
+    """
+    cols = [f"{p:.3g} {unit}" for p in pressures]
+    k = len(next(iter(shifts_kT.values())))
+    for j in range(k):
+        cols.append(f"{pressures[-1]:.3g} {unit}, " + ", ".join(
+            f"mu_{sp} - {v[j]:g} kT" for sp, v in shifts_kT.items()))
+    return cols
 
 
 def _validate_site_exchange(config: Dict[str, Any]) -> None:
@@ -2123,9 +2300,13 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
         ``pressures``/``pressure_unit`` (None for an explicit mu ladder),
         ``lambda_cubed_of_T``, ``insertion_z_range`` (slab) or
         ``insertion_shell`` (cluster), ``system_factory``, ``subsurface``
-        (`Subsurface` or None) and ``site_exchange`` (list of `Subsurface`
-        channels), and ``metadata`` (JSON-able; what a resumed run must agree with,
-        and what `analyze_from_config` reads).
+        (`Subsurface` or None), ``site_exchange`` (list of `Subsurface`
+        channels), ``bias_columns`` (the ``replica_exchange.bias_columns``
+        settings plus ``n_physical_columns``, or None; ``mu_grid`` then holds
+        the bias columns after the physical ones, ``pressures`` only the
+        physical ones), ``column_labels`` (one per mu column with bias
+        columns, else None) and ``metadata`` (JSON-able; what a resumed run
+        must agree with, and what `analyze_from_config` reads).
 
     Raises
     ------
@@ -2250,6 +2431,14 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
         mu_grid = np.array(re_cfg["mu_eV"], dtype=object)
         mu_grid = np.vectorize(lambda v: _as_float(v, "replica_exchange.mu_eV"), otypes=[float])(mu_grid)
         pressure_unit = None
+    bias = _bias_columns_settings(config) if _scheme(re_cfg) == "regc" else None
+    column_labels = shift_grid = None
+    if bias is not None:   # extra columns at p_max with lowered mu of the biased species
+        n_physical = len(pressures)
+        mu_grid, shift_grid = bias_column_mu_grid(mu_grid, temperatures_K, species,
+                                                  bias["shifts_kT"])
+        bias["n_physical_columns"] = n_physical
+        column_labels = _bias_column_labels(pressures, pressure_unit, bias["shifts_kT"])
     if feed is not None:
         lambda_cubed_of_T = feed.lambda_cubed_of_T()
     elif len(species) == 1:
@@ -2304,6 +2493,15 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
     }
     if feed is not None:
         metadata.update(_feed_to_meta(feed))
+    if bias is not None:   # (only then: older runs' metadata stay unchanged)
+        metadata["bias_columns"] = {"species": bias["species"], "shifts_kT": bias["shifts_kT"],
+                                    "n_physical_columns": bias["n_physical_columns"],
+                                    "n_bias_columns": bias["n_columns"]}
+        n_cols = bias["n_physical_columns"] + bias["n_columns"]
+        metadata["pressure_grid"] = [[float(pressures[min(j, len(pressures) - 1)])
+                                      for j in range(n_cols)] for _ in temperatures_K]
+        metadata["bias_shift_kT_grid"] = shift_grid.tolist()
+        metadata["column_labels"] = column_labels
     if subsurface is not None:
         metadata["subsurface"] = subsurface.metadata()
     if site_exchange:
@@ -2383,7 +2581,17 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
                   f"{', switched atom held' if c.freeze_switched else ''}, weight {c.weight:g}")
         n_mu = np.shape(mu_grid)[-1 if len(species) == 1 else -2]
         print(f"replica grid: {len(temperatures_K)} T x {n_mu} "
-              f"{'p' if pressures is not None else 'mu'} = {len(temperatures_K) * n_mu} replicas")
+              f"{'p' if pressures is not None else 'mu'} = {len(temperatures_K) * n_mu} replicas"
+              + (f" ({bias['n_physical_columns']} physical + {bias['n_columns']} bias columns)"
+                 if bias else ""))
+        if bias:
+            from .units import kelvin_to_eV
+            print(f"bias columns at p = {pressures[-1]:g} {pressure_unit}: "
+                  + "; ".join(f"mu_{sp} - {v} kT" for sp, v in bias["shifts_kT"].items()))
+            for T in temperatures_K:
+                print(f"  {T:g} K: largest shift "
+                      + ", ".join(f"mu_{sp} {-v[-1] * kelvin_to_eV(T):+.4f} eV"
+                                  for sp, v in bias["shifts_kT"].items()))
         adapt = sampling.get("adapt_ladder")
         if adapt and adapt.get("method") == "es":
             n_eval = adapt["generations"] * adapt["population"] + (
@@ -2417,6 +2625,7 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
             "system_factory": system_factory, "sgc": sgc,
             "molecules": molecule_moves, "atomic_exchange": atomic_exchange,
             "subsurface": subsurface, "site_exchange": site_exchange,
+            "bias_columns": bias, "column_labels": column_labels,
             "metadata": metadata}
 
 
@@ -2702,11 +2911,17 @@ def run_from_config(config: Dict[str, Any], verbose: bool = True, resume: bool =
                              configurations_every=int(conf_cfg.get("every", 1)),
                              records_path=rec_path,
                              records_potential=str(rec_cfg.get("potential", "sampling")),
-                             records_every=int(rec_cfg.get("every", 1))) as sim:
-        sim.save_status(os.path.join(out_dir, STATUS_FILE), extra={
-            "temperatures_K": [float(T) for T in setup["temperatures_K"]],
-            "pressures": None if setup["pressures"] is None else [float(p) for p in setup["pressures"]],
-            "pressure_unit": setup["pressure_unit"], "species": list(setup["species"])})
+                             records_every=int(rec_cfg.get("every", 1)),
+                             n_physical_mu=(setup["bias_columns"]["n_physical_columns"]
+                                            if setup["bias_columns"] else None)) as sim:
+        labels = {"temperatures_K": [float(T) for T in setup["temperatures_K"]],
+                  "pressures": (None if setup["pressures"] is None
+                                else [float(p) for p in setup["pressures"]]),
+                  "pressure_unit": setup["pressure_unit"], "species": list(setup["species"])}
+        if setup["column_labels"]:   # bias columns: one label per column
+            labels["column_labels"] = list(setup["column_labels"])
+            labels["n_physical_columns"] = setup["bias_columns"]["n_physical_columns"]
+        sim.save_status(os.path.join(out_dir, STATUS_FILE), extra=labels)
         if rec_path is not None and rec_cfg.get("positions"):
             sim.save_records(rec_path, str(rec_cfg.get("potential", "sampling")),
                              int(rec_cfg.get("every", 1)), str(rec_cfg["positions"]))
@@ -3085,7 +3300,9 @@ def _reliability(analysis, samples, meta: Dict[str, Any], out_dir: str,
     dict
         Arrays for ``phase_diagram_data.npz``: ``n_independent`` and
         ``statistical_inefficiency`` (replica grid), ``overlap_min``
-        (replica grid, smallest MBAR overlap with a neighbour).
+        (replica grid, smallest MBAR overlap with a neighbour), the
+        walkers' ``round_trips_T`` and, with bias columns,
+        ``round_trips_bias``.
     """
     from .diagnostics import OVERLAP_THRESHOLD, neighbour_overlap, replica_inefficiencies
     from .driver import MIXING_FILE
@@ -3127,6 +3344,8 @@ def _reliability(analysis, samples, meta: Dict[str, Any], out_dir: str,
             mix = json.load(f)
         trips = np.asarray(mix.get("round_trips_T", []))
         out["round_trips_T"] = trips
+        if "round_trips_bias" in mix:
+            out["round_trips_bias"] = np.asarray(mix["round_trips_bias"])
         if verbose:
             w = mix.get("worst_pair")
             if w:
@@ -3134,7 +3353,67 @@ def _reliability(analysis, samples, meta: Dict[str, Any], out_dir: str,
                       f"{w['acceptance']:.2f} of {w['attempts']} attempts; T round trips per "
                       f"walker: median {np.median(trips) if trips.size else 0:.0f}, "
                       f"{int(np.sum(trips == 0))} walkers with none")
+            if "round_trips_bias" in out:
+                rb = out["round_trips_bias"]
+                print(f"bias columns: {int(np.sum(rb > 0))} of {rb.size} walkers went from the "
+                      f"physical columns to the bias columns and back (or the reverse), "
+                      f"{int(rb.sum())} round trips in all")
     return out
+
+
+def _bias_state_maps(samples, meta: Dict[str, Any], out_dir: str, root: str, ext: str,
+                     verbose: bool) -> Dict[str, Any]:
+    """
+    <N> of every biased species on the sampled states, bias columns included.
+
+    Direct per-state averages (no reweighting): whether Pd (or another
+    biased species) actually leaves the surface in the bias columns.
+
+    Parameters
+    ----------
+    samples : SampleSet
+        The run's samples (equilibration discarded).
+    meta : dict
+        Run metadata with ``bias_columns``.
+    out_dir, root, ext : str
+        Output location and file name parts.
+    verbose : bool
+        Print a summary.
+
+    Returns
+    -------
+    dict
+        ``states_N_<species>``: shape (n_T, n_columns), and
+        ``column_labels``.
+    """
+    from .plotting import plot_state_grid
+    bias, species = meta["bias_columns"], list(meta["species"])
+    n_T = len(meta["temperatures_K"])
+    labels = meta["column_labels"]
+    start = meta.get("initial_mobile_counts") or {}
+    raw = {"column_labels": np.array(labels)}
+    for sp in bias["species"]:
+        k = species.index(sp)
+        grid = np.full((n_T, len(labels)), np.nan)
+        for key, d in samples.samples.items():
+            N = (np.asarray(d["N_s"], dtype=float).reshape(-1, len(species))[:, k]
+                 if len(species) > 1 else np.asarray(d["N"], dtype=float))
+            if N.size:
+                grid[key[0], key[1]] = N.mean()
+        raw[f"states_N_{sp}"] = grid
+        plot_state_grid(grid, [f"{T:g} K" for T in meta["temperatures_K"]],
+                        [c.replace("mu_", "μ_") for c in labels],
+                        os.path.join(out_dir, f"{root}_states_N_{sp}{ext}"),
+                        n_physical=bias["n_physical_columns"], cmap="viridis",
+                        colorbar_label=f"<N_{sp}>",
+                        title=f"<N_{sp}> per sampled state, not reweighted"
+                              + (f" (start: {start[sp]})" if sp in start else ""))
+        if verbose:
+            phys, b = grid[:, :bias["n_physical_columns"]], grid[:, bias["n_physical_columns"]:]
+            print(f"<N_{sp}> on the sampled states: physical columns {np.nanmin(phys):.3g} to "
+                  f"{np.nanmax(phys):.3g}, bias columns {np.nanmin(b):.3g} to {np.nanmax(b):.3g}"
+                  + (f" (start: {start[sp]})" if sp in start else ""))
+    return raw
 
 
 def _merge_runs(config: Dict[str, Any], out_dir: str, meta: Dict[str, Any], samples, others,
@@ -3184,6 +3463,9 @@ def _merge_runs(config: Dict[str, Any], out_dir: str, meta: Dict[str, Any], samp
                 raise FileNotFoundError(f"phase_diagram.merge: {path} not found")
         with open(mpath) as f:
             om = json.load(f)
+        if om.get("bias_columns"):
+            raise ValueError(f"phase_diagram.merge: {other} has bias columns, which are not on "
+                             f"the gas feed's (T, p) plane; it cannot be merged")
         for key in ("species", "structure", "calculator", "reservoirs", "lattice_constant_angstrom",
                     "masses_amu", "geometry", "sgc"):
             if om.get(key) != meta.get(key):
@@ -3317,6 +3599,10 @@ def analyze_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[st
         ``'theta_<name>'``, and for an exchangeable slab species
         (``structure.exchangeable_top_layers``) ``'removed_<species>'``: the
         atoms gone to the reservoir, (N_start - <N>) per normalisation unit.
+        With ``replica_exchange.bias_columns``, ``'states_N_<species>'``
+        holds <N> of every biased species on each sampled state (bias
+        columns included, not reweighted); the maps are always at the
+        physical chemical potentials of the gas feed.
 
     Raises
     ------
@@ -3352,6 +3638,13 @@ def analyze_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[st
                          "reservoir section (or a pressure ladder) to the config and rerun")
     species = meta["species"]
     feed = _feed_from_meta(meta)
+    bias = meta.get("bias_columns")
+    if bias:
+        for key in ("merge", "suggest_ladder"):
+            if pd_cfg.get(key):
+                raise ValueError(f"phase_diagram.{key} is not available for a run with "
+                                 f"replica_exchange.bias_columns: the bias columns are not on "
+                                 f"the gas feed's (T, p) plane")
 
     T_grid_K, p_grid, unit = _phase_diagram_grid(pd_cfg, meta.get("pressure_unit"))
     observable = str(pd_cfg.get("observable", "N"))
@@ -3419,6 +3712,9 @@ def analyze_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[st
                      xlabel=xlabel, ylabel=ylabel,
                      title=f"{sp} removed from the surface (start: {start[sp]} atoms)",
                      invalid_label=invalid)
+    if bias:
+        raw.update(_bias_state_maps(samples, meta, out_dir, root, ext, verbose))
+        result.update({k: v for k, v in raw.items() if k.startswith("states_N_")})
     raw.update(diag)
     if boot is not None:
         lo, hi = boot["theta"].interval(boot["level"])
@@ -3447,7 +3743,7 @@ def analyze_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[st
     if pd_cfg.get("heat_capacity"):
         cv = analysis.heat_capacity(T_grid_eV, p_grid, pressure=True)
         ladder_p = meta.get("pressures")
-        if meta.get("pressure_grid") is not None:   # an adapted ladder
+        if meta.get("pressure_grid") is not None and not bias:   # an adapted ladder
             pg = np.asarray(meta["pressure_grid"], dtype=float)
             # per-row pressures: no single sampled pressure list to flag ridges against
             ladder_p = pg[0].tolist() if np.allclose(pg, pg[:1], rtol=1e-12) else None
@@ -3614,10 +3910,15 @@ def check_config(config: Dict[str, Any]) -> Dict[str, Any]:
     if mu.ndim == 1:
         mu = np.tile(mu, (len(setup["temperatures_K"]), 1))
     cols = cols if cols is not None else list(range(mu.shape[1]))
+    bias = setup.get("bias_columns")
+    if bias:   # bias columns: B1, B2, ... after the pressures (see the setup summary)
+        label += ", then bias columns B1.."
+        cols = list(cols) + [f"B{j + 1}" for j in range(bias["n_columns"])]
     for k, sp in enumerate(setup["species"]):
         grid = mu if mu.ndim == 2 else mu[..., k]
         print(f"\nmu_{sp} (eV): rows T (K), columns {label}")
-        print("        " + " ".join(f"{c:9.2e}" if isinstance(c, float) else f"{c:9d}" for c in cols))
+        print("        " + " ".join(f"{c:9.2e}" if isinstance(c, float) else f"{c:>9}"
+                                    for c in cols))
         for T, row in zip(setup["temperatures_K"], grid):
             print(f"{T:6.0f}  " + " ".join(f"{m:9.3f}" for m in row))
     bare = setup["system_factory"](np.random.default_rng(0))

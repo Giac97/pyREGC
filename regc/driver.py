@@ -57,7 +57,8 @@ def write_mixing(sim, path: str, step: Optional[int] = None) -> dict:
     -------
     dict
         What was written: acceptance per pattern, per pair (with the worst
-        pair), the round trips of every walker along T and mu, and
+        pair), the round trips of every walker along T and mu (and, with
+        bias columns, between the physical and the bias columns), and
         ``chunks``: per interval between snapshots, ``step_start``,
         ``step_end``, ``ladder_version`` and ``attempts`` / ``accepted``
         aligned with ``pairs``.
@@ -76,6 +77,8 @@ def write_mixing(sim, path: str, step: Optional[int] = None) -> dict:
                                                   "acceptance": worst[1][1]},
         "round_trips_T": trips["T"].tolist(), "round_trips_mu": trips["mu"].tolist(),
     }
+    if "bias" in trips:   # bias columns: physical -> bias -> physical
+        data["round_trips_bias"] = trips["bias"].tolist()
     order = sorted(pairs)
     chunks = sim.pair_acceptance_by_chunk() if hasattr(sim, "pair_acceptance_by_chunk") else []
     data["chunks"] = [{"step_start": c["step_start"], "step_end": c["step_end"],

@@ -358,3 +358,85 @@ def plot_radial_distribution(curves: dict, save_path: str,
     fig.savefig(save_path, dpi=dpi)
     plt.close(fig)
     print(f"Saved {save_path}")
+
+
+def plot_state_grid(values: np.ndarray, row_labels: Sequence[str], col_labels: Sequence[str],
+                    save_path: str, n_physical: Optional[int] = None, colorbar_label: str = "",
+                    title: str = "", cmap: str = "viridis", fmt: str = "{:.3g}",
+                    dpi: int = 200) -> None:
+    """
+    Plot one value per sampled replica state, on the replica grid itself.
+
+    Every (T, mu-column) state is a labelled cell annotated with its value;
+    with bias columns (`n_physical`), a vertical line separates the
+    physical columns from the bias columns after them.
+
+    Parameters
+    ----------
+    values : numpy.ndarray
+        Shape (n_T, n_columns); NaN cells are left grey.
+    row_labels : sequence of str
+        One label per row (temperature).
+    col_labels : sequence of str
+        One label per column (pressure, or pressure and mu shift).
+    save_path : str
+        Output image.
+    n_physical : int, optional
+        Number of physical columns; the rest are bias columns. Default
+        None (no separator).
+    colorbar_label, title : str, optional
+        Labels.
+    cmap : str, optional
+        Matplotlib colormap. Default ``'viridis'``.
+    fmt : str, optional
+        Format of the cell annotations. Default ``'{:.3g}'``.
+    dpi : int, optional
+        Resolution of the saved image. Default 200.
+
+    Returns
+    -------
+    None
+        Saves the figure.
+
+    Raises
+    ------
+    ValueError
+        If the labels do not match the shape of `values`.
+    """
+    vals = np.asarray(values, dtype=float)
+    if vals.ndim != 2 or vals.shape != (len(row_labels), len(col_labels)):
+        raise ValueError(f"values of shape {vals.shape} do not match {len(row_labels)} row and "
+                         f"{len(col_labels)} column labels")
+    try:
+        import matplotlib as mpl
+        import matplotlib.pyplot as plt
+        from matplotlib import patheffects
+    except ImportError:
+        print("matplotlib not installed -- skipping plot (pip install matplotlib).")
+        return
+    n_T, n_c = vals.shape
+    fig, ax = plt.subplots(figsize=(max(5.0, 0.9 * n_c + 2.5), max(3.0, 0.45 * n_T + 1.8)),
+                           layout="constrained")
+    cm = mpl.colormaps[cmap].with_extremes(bad="#bdbdbd")
+    mesh = ax.pcolormesh(np.arange(n_c + 1), np.arange(n_T + 1),
+                         np.ma.masked_invalid(vals), cmap=cm)
+    stroke = [patheffects.withStroke(linewidth=2.0, foreground="black")]
+    for i in range(n_T):
+        for j in range(n_c):
+            if np.isfinite(vals[i, j]):
+                ax.text(j + 0.5, i + 0.5, fmt.format(vals[i, j]), ha="center", va="center",
+                        fontsize=7, color="white", path_effects=stroke)
+    if n_physical is not None and 0 < n_physical < n_c:
+        ax.axvline(n_physical, color="black", lw=1.5)
+        ax.axvline(n_physical, color="white", lw=0.6, ls="--")
+    ax.set_xticks(np.arange(n_c) + 0.5, list(col_labels), rotation=40, ha="right", fontsize=7)
+    ax.set_yticks(np.arange(n_T) + 0.5, list(row_labels), fontsize=8)
+    ax.set_xlabel("replica column" + (" (right of the line: bias columns)"
+                                      if n_physical is not None and n_physical < n_c else ""))
+    ax.set_ylabel("temperature")
+    fig.colorbar(mesh, ax=ax, label=colorbar_label)
+    if title:
+        ax.set_title(title, fontsize=10)
+    fig.savefig(save_path, dpi=dpi)
+    plt.close(fig)
+    print(f"Saved {save_path}")

@@ -1051,6 +1051,9 @@ def parse_config(text: str) -> dict:
     try:
         n_T = len(re_cfg.get("temperatures_K") or [])
         n_mu = len(re_cfg.get("pressures") or re_cfg.get("mu_eV") or [])
+        shifts = (re_cfg.get("bias_columns") or {}).get("shifts_kT") or []
+        n_mu += len(next(iter(shifts.values()))) if isinstance(shifts, dict) and shifts \
+            else len(shifts)
         n_steps = int(re_cfg.get("n_steps") or 0)
         every = int(re_cfg.get("record_every") or 100)
         summary = {"replicas": n_T * n_mu, "n_T": n_T, "n_mu": n_mu, "n_steps": n_steps,

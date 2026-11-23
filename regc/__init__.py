@@ -50,7 +50,8 @@ analysis  MBARSurfaceAnalysis, heat_capacity_ridges, export_phase_configurations
           (needs pymbar)
 diagnostics  statistical_inefficiency, replica_inefficiencies, bootstrap,
              neighbour_overlap, ridge_support -- how far to trust a map (needs pymbar)
-plotting  plot_phase_diagram, plot_map, plot_radial_distribution  (needs matplotlib)
+plotting  plot_phase_diagram, plot_map, plot_radial_distribution, plot_state_grid
+          (needs matplotlib)
 runner    run_from_config      -- the YAML/JSON-driven pipeline
 
 Optional dependencies are imported lazily, inside the functions that need
@@ -78,7 +79,7 @@ from .observables import (CoordinationHistogram, CoordinationNumber, FunctionObs
                           MoleculeCounts, Observable, RadialDistribution)
 from .molecules import MoleculeMove
 from .subsurface import Subsurface
-from .plotting import plot_map, plot_phase_diagram, plot_radial_distribution
+from .plotting import plot_map, plot_phase_diagram, plot_radial_distribution, plot_state_grid
 from .records import RecordWriter, Records, attach_energies, reevaluate
 from .units import (
     PRESSURE_UNITS,
@@ -155,6 +156,7 @@ __all__ = [
     "LadderAdapter", "LadderES", "LadderProposal", "propose_ladder",
     "save_samples", "load_samples", "SampleSet",
     "MBARSurfaceAnalysis", "plot_phase_diagram", "plot_map", "plot_radial_distribution",
+    "plot_state_grid",
     "heat_capacity_ridges", "export_phase_configurations",
     # observables
     "Observable", "CoordinationNumber", "CoordinationHistogram", "RadialDistribution",

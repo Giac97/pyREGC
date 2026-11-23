@@ -20,7 +20,7 @@ Everything below is importable as `from regc import <name>`, except the runner f
 - [Reduced-unit pressure conventions (`regc.pressure`)](#reduced-unit-pressure-conventions-regcpressure): `p0_reduced_units`, `p0_ideal_gas_wavelength`, `mu_from_pressure`, `pressure_from_mu`, `mu_grid_from_pressures`, `invert_mu_of_Tp`
 - [Gas reservoirs (`regc.reservoir`)](#gas-reservoirs-regcreservoir): `Reservoir`, `MonatomicIdealGasReservoir`, `DiatomicReservoir`, `MolecularGas`, `BulkSolidReservoir`, `MolecularGasFeed`, `diatomic_dissociation_energy_eV`, `diatomic_gas_mu_eV`, `mu_atomic_from_diatomic_reservoir_eV`, `pressure_from_atomic_mu_reservoir_pascal`, `H2_BOND_LENGTH_ANGSTROM`, `H2_VIBRATIONAL_WAVENUMBER_CM`, `H_MASS_AMU`, `H2_MASS_AMU`, `H2_D0_EXPERIMENTAL_EV`
 - [MBAR analysis (`regc.analysis`)](#mbar-analysis-regcanalysis): `MBARSurfaceAnalysis`, `heat_capacity_ridges`, `export_phase_configurations`
-- [Plotting (`regc.plotting`)](#plotting-regcplotting): `plot_phase_diagram`, `plot_map`, `plot_radial_distribution`
+- [Plotting (`regc.plotting`)](#plotting-regcplotting): `plot_phase_diagram`, `plot_map`, `plot_radial_distribution`, `plot_state_grid`
 - [Per-sample records and other potentials (`regc.records`)](#per-sample-records-and-other-potentials-regcrecords): `RecordWriter`, `Records`, `attach_energies`, `reevaluate`
 - [Config runner (`regc.runner`)](#config-runner-regcrunner): `load_config`, `validate_config`, `setup_from_config`, `run_from_config`, `analyze_from_config`, `check_config`, `reevaluate_from_config`, `main`, `reevaluate_main`
 
@@ -2542,7 +2542,7 @@ Compute the acceptance rate of each move type attempted so far.
 ### `ReplicaExchangeGCMC`
 
 ```python
-ReplicaExchangeGCMC(temperatures: List[float], mus, system_factory: Callable[[np.random.Generator], ParticleSystem], seed: int = 0, max_disp: float = 0.2, n_workers: int = 1, lambda_cubed_of_T: Callable[[float], float] = <function ReplicaExchangeGCMC.<lambda>>, hmc_enabled: bool = False, hmc_leapfrog_steps: int = 10, hmc_dt: float = 0.005, adsorbed_cutoff: Optional[float] = None, observables: Optional[Sequence[Observable]] = None, configurations_dir: Optional[str] = None, configurations_every: int = 1, skip_empty_swaps: bool = True, records_path: Optional[str] = None, records_potential: str = 'sampling', records_every: int = 1, sgc_dmu: Optional[Sequence[float]] = None, sgc_attempts: int = 1, sgc_log_ratio: Optional[Sequence[float]] = None)
+ReplicaExchangeGCMC(temperatures: List[float], mus, system_factory: Callable[[np.random.Generator], ParticleSystem], seed: int = 0, max_disp: float = 0.2, n_workers: int = 1, lambda_cubed_of_T: Callable[[float], float] = <function ReplicaExchangeGCMC.<lambda>>, hmc_enabled: bool = False, hmc_leapfrog_steps: int = 10, hmc_dt: float = 0.005, adsorbed_cutoff: Optional[float] = None, observables: Optional[Sequence[Observable]] = None, configurations_dir: Optional[str] = None, configurations_every: int = 1, skip_empty_swaps: bool = True, records_path: Optional[str] = None, records_potential: str = 'sampling', records_every: int = 1, sgc_dmu: Optional[Sequence[float]] = None, sgc_attempts: int = 1, sgc_log_ratio: Optional[Sequence[float]] = None, n_physical_mu: Optional[int] = None)
 ```
 
 Manages a 2D ladder of replicas over (temperature, chemical potential).
@@ -2614,10 +2614,11 @@ Construct the replica-exchange ladder.
 - `sgc_dmu` (*sequence of float, optional*): Semi-grand-canonical substrate: the field mu_k - mu_ref, one value per `system.sgc_species` (reference first, 0), the same at every grid point (`ThermoState.sgc_dmu`). Required when the systems have `sgc_species`, ignored otherwise; with canonical pair swaps (`system.sgc_canonical`) None or zeros. Each sample then also records the counts (`regc.observables.SGCCounts`, carrying the field for the analysis), and replica exchange includes the -(beta_a dmu_a - beta_b dmu_b) . (N_a - N_b) term (docs/REGC_algorithm.md, Sec. 9). Default None.
 - `sgc_attempts` (*int, optional*): Identity-swap attempts per replica per REGC step (`Replica._move_identity`). Default 1.
 - `sgc_log_ratio` (*sequence of float, optional*): Ideal-mixing part of the field, ln(x_k / x_ref) of the bulk reservoir, one per species: the field at temperature T is then `sgc_dmu + T * sgc_log_ratio` (docs Sec. 9). It is the same for every grid point in units of kT, so it drops out of replica exchange and MBAR and acts only in the identity moves. Default None (zero: a 50-50 reservoir, or `sgc_dmu` the full field).
+- `n_physical_mu` (*int, optional*): With bias columns (`regc.runner.bias_column_mu_grid`): the number of physical mu columns, the rest being bias columns. It only adds a mixing diagnostic, the round trips between the physical and the bias columns (`round_trip_counts`); the sampling does not depend on it. Default None (no bias columns).
 
 **Raises**
 
-- *ValueError*: If `mus` doesn't have one of the shapes above (for the number of exchanged species the systems declare), if the systems don't all exchange the same species, or if `lambda_cubed_of_T` doesn't give one value (or one per species).
+- *ValueError*: If `mus` doesn't have one of the shapes above (for the number of exchanged species the systems declare), if the systems don't all exchange the same species, if `lambda_cubed_of_T` doesn't give one value (or one per species), or if `n_physical_mu` is not in [1, n_mu].
 
 #### `ReplicaExchangeGCMC.close`
 
@@ -2862,7 +2863,7 @@ the low-T replicas may still remember their start.
 
 **Returns**
 
-- *dict*: `{'T': array, 'mu': array}`, one entry per walker (completed end-to-end-and-back trips).
+- *dict*: `{'T': array, 'mu': array}`, one entry per walker (completed end-to-end-and-back trips); with bias columns also `'bias'` (physical columns -> bias columns -> physical columns, or the reverse).
 
 #### `ReplicaExchangeGCMC.run`
 
@@ -6184,6 +6185,40 @@ the curves stay distinguishable in greyscale.
 
 - *None*: Saves the figure.
 
+---
+
+### `plot_state_grid`
+
+```python
+plot_state_grid(values: np.ndarray, row_labels: Sequence[str], col_labels: Sequence[str], save_path: str, n_physical: Optional[int] = None, colorbar_label: str = '', title: str = '', cmap: str = 'viridis', fmt: str = '{:.3g}', dpi: int = 200) -> None
+```
+
+Plot one value per sampled replica state, on the replica grid itself.
+
+Every (T, mu-column) state is a labelled cell annotated with its value;
+with bias columns (`n_physical`), a vertical line separates the
+physical columns from the bias columns after them.
+
+**Parameters**
+
+- `values` (*numpy.ndarray*): Shape (n_T, n_columns); NaN cells are left grey.
+- `row_labels` (*sequence of str*): One label per row (temperature).
+- `col_labels` (*sequence of str*): One label per column (pressure, or pressure and mu shift).
+- `save_path` (*str*): Output image.
+- `n_physical` (*int, optional*): Number of physical columns; the rest are bias columns. Default None (no separator).
+- `colorbar_label, title` (*str, optional*): Labels.
+- `cmap` (*str, optional*): Matplotlib colormap. Default `'viridis'`.
+- `fmt` (*str, optional*): Format of the cell annotations. Default `'{:.3g}'`.
+- `dpi` (*int, optional*): Resolution of the saved image. Default 200.
+
+**Returns**
+
+- *None*: Saves the figure.
+
+**Raises**
+
+- *ValueError*: If the labels do not match the shape of `values`.
+
 ## Per-sample records and other potentials (`regc.records`)
 
 ### `RecordWriter`
@@ -7142,7 +7177,7 @@ Everything a run needs, built from a config but nothing sampled yet.
 
 **Returns**
 
-- *dict*: `geometry` (`SlabGeometry` or `ClusterGeometry`), `lattice_constant` (A, or None), `calc_spec`, `species`, `masses`, `feed` (`GasFeed`, or None when the run needs no reservoir), `temperatures_K`, `mu_grid`, `pressures`/`pressure_unit` (None for an explicit mu ladder), `lambda_cubed_of_T`, `insertion_z_range` (slab) or `insertion_shell` (cluster), `system_factory`, `subsurface` (`Subsurface` or None) and `site_exchange` (list of `Subsurface` channels), and `metadata` (JSON-able; what a resumed run must agree with, and what `analyze_from_config` reads).
+- *dict*: `geometry` (`SlabGeometry` or `ClusterGeometry`), `lattice_constant` (A, or None), `calc_spec`, `species`, `masses`, `feed` (`GasFeed`, or None when the run needs no reservoir), `temperatures_K`, `mu_grid`, `pressures`/`pressure_unit` (None for an explicit mu ladder), `lambda_cubed_of_T`, `insertion_z_range` (slab) or `insertion_shell` (cluster), `system_factory`, `subsurface` (`Subsurface` or None), `site_exchange` (list of `Subsurface` channels), `bias_columns` (the `replica_exchange.bias_columns` settings plus `n_physical_columns`, or None; `mu_grid` then holds the bias columns after the physical ones, `pressures` only the physical ones), `column_labels` (one per mu column with bias columns, else None) and `metadata` (JSON-able; what a resumed run must agree with, and what `analyze_from_config` reads).
 
 **Raises**
 
@@ -7204,7 +7239,7 @@ other `phase_diagram` settings (`regc-run --analyze-only`).
 
 **Returns**
 
-- *dict*: `'analysis'` (`MBARSurfaceAnalysis`), `'theta_grid'` (shape (n_T, n_p)), `'T_grid_K'`, `'p_grid'` (in `'pressure_unit'`), `'p_grid_atm'`, `'coverage_per'`, `'observable'` and, with `most_probable: true`, `'most_probable_N'`. Each of `phase_diagram.extra_observables` (e.g. `[N_Pd]`) adds `'theta_<name>'`, and for an exchangeable slab species (`structure.exchangeable_top_layers`) `'removed_<species>'`: the atoms gone to the reservoir, (N_start - <N>) per normalisation unit.
+- *dict*: `'analysis'` (`MBARSurfaceAnalysis`), `'theta_grid'` (shape (n_T, n_p)), `'T_grid_K'`, `'p_grid'` (in `'pressure_unit'`), `'p_grid_atm'`, `'coverage_per'`, `'observable'` and, with `most_probable: true`, `'most_probable_N'`. Each of `phase_diagram.extra_observables` (e.g. `[N_Pd]`) adds `'theta_<name>'`, and for an exchangeable slab species (`structure.exchangeable_top_layers`) `'removed_<species>'`: the atoms gone to the reservoir, (N_start - <N>) per normalisation unit. With `replica_exchange.bias_columns`, `'states_N_<species>'` holds <N> of every biased species on each sampled state (bias columns included, not reweighted); the maps are always at the physical chemical potentials of the gas feed.
 
 **Raises**
 

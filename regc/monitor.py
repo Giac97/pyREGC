@@ -849,6 +849,8 @@ function axes(st,meta){const lab=st&&st.labels||{};const nT=st?st.shape[0]:0,nM=
 const TK=lab.temperatures_K||(meta&&meta.temperatures_K);let y=TK?TK.map(t=>(+Number(t).toPrecision(4))+" K"):st.temperatures.map(t=>"T="+fmtN(t,4));
 const P=lab.pressures||(meta&&meta.pressures),u=lab.pressure_unit||(meta&&meta.pressure_unit)||"";
 const PG=lab.pressure_grid||(meta&&meta.pressure_grid);
+const CL=lab.column_labels||(meta&&meta.column_labels);
+if(CL&&CL.length==nM)return {x:CL.map((c,j)=>`${j}: ${c.replace(/mu_/g,"μ_")}`),y,xt:"pressure (bias columns: shifted μ)",yt:"temperature"};
 let x=[];for(let j=0;j<nM;j++){if(PG&&PG.length==nT){const c=PG.map(r=>r[j]),lo=Math.min(...c),hi=Math.max(...c);
 x.push(`${j}: ${fmtP(lo)}${hi>lo*(1+1e-9)?"–"+fmtP(hi):""} ${u}`);continue}
 x.push(P?`${fmtP(P[j])} ${u}`:`μ=${fmtN(Array.isArray(st.mu_grid[0][j])?st.mu_grid[0][j][0]:st.mu_grid[0][j],4)}`)}

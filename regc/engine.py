@@ -145,7 +145,8 @@ class ReplicaExchangeGCMC:
                  skip_empty_swaps: bool = True, records_path: Optional[str] = None,
                  records_potential: str = "sampling", records_every: int = 1,
                  sgc_dmu: Optional[Sequence[float]] = None, sgc_attempts: int = 1,
-                 sgc_log_ratio: Optional[Sequence[float]] = None):
+                 sgc_log_ratio: Optional[Sequence[float]] = None,
+                 n_physical_mu: Optional[int] = None):
         """
         Construct the replica-exchange ladder.
 
@@ -256,14 +257,21 @@ class ReplicaExchangeGCMC:
             for every grid point in units of kT, so it drops out of replica
             exchange and MBAR and acts only in the identity moves. Default
             None (zero: a 50-50 reservoir, or `sgc_dmu` the full field).
+        n_physical_mu : int, optional
+            With bias columns (`regc.runner.bias_column_mu_grid`): the
+            number of physical mu columns, the rest being bias columns. It
+            only adds a mixing diagnostic, the round trips between the
+            physical and the bias columns (`round_trip_counts`); the
+            sampling does not depend on it. Default None (no bias columns).
 
         Raises
         ------
         ValueError
             If `mus` doesn't have one of the shapes above (for the number
             of exchanged species the systems declare), if the systems
-            don't all exchange the same species, or if `lambda_cubed_of_T`
-            doesn't give one value (or one per species).
+            don't all exchange the same species, if `lambda_cubed_of_T`
+            doesn't give one value (or one per species), or if
+            `n_physical_mu` is not in [1, n_mu].
         """
         self.temperatures = list(temperatures)
         n_T = len(self.temperatures)
@@ -291,6 +299,9 @@ class ReplicaExchangeGCMC:
         self.n_species = len(species)
         self.mu_grid = self._parse_mus(mus_arr, n_T, self.n_species)
         self.shape = self.mu_grid.shape[:2]
+        if n_physical_mu is not None and not 1 <= int(n_physical_mu) <= self.shape[1]:
+            raise ValueError(f"n_physical_mu must be in [1, {self.shape[1]}], got {n_physical_mu}")
+        self.n_physical_mu = None if n_physical_mu is None else int(n_physical_mu)
         for it, imu in itertools.product(range(self.shape[0]), range(self.shape[1])):
             if (it, imu) != (0, 0):
                 rng = np.random.default_rng(master_rng.integers(0, 2 ** 62))
@@ -736,7 +747,21 @@ class ReplicaExchangeGCMC:
         n = len(self.grid)
         self.walker_last_end = {"T": [None] * n, "mu": [None] * n}
         self.round_trips = {"T": [0] * n, "mu": [0] * n}
+        if self._has_bias_columns():
+            self.walker_last_end["bias"], self.round_trips["bias"] = [None] * n, [0] * n
         self._track_walkers()
+
+    def _has_bias_columns(self) -> bool:
+        """
+        Whether the mu axis ends in bias columns (`n_physical_mu`).
+
+        Returns
+        -------
+        bool
+            True if some columns lie beyond the physical ones.
+        """
+        n_phys = getattr(self, "n_physical_mu", None)
+        return n_phys is not None and n_phys < self.shape[1]
 
     def _track_walkers(self) -> None:
         """
@@ -746,8 +771,18 @@ class ReplicaExchangeGCMC:
         ladder (index 0) to the other and back. It is counted when the
         walker reaches the end opposite to the last one it visited, and a
         full round trip is two such traversals.
+
+        With bias columns (`n_physical_mu`), the ``'bias'`` axis has the
+        physical columns as one end and the bias columns as the other: a
+        round trip there is a walker going into the bias columns and back
+        (configurations made there, e.g. with fewer substrate atoms,
+        reaching the physical states).
         """
         n_axis = {"T": self.mu_grid.shape[0], "mu": self.mu_grid.shape[1]}
+        bias = self._has_bias_columns()
+        if bias and "bias" not in self.round_trips:   # e.g. restored from an older checkpoint
+            n = len(self.round_trips["T"])
+            self.walker_last_end["bias"], self.round_trips["bias"] = [None] * n, [0] * n
         for key, r in self.grid.items():
             w = getattr(r.system, "walker_id", None)
             if w is None:
@@ -761,6 +796,12 @@ class ReplicaExchangeGCMC:
                     if last is not None:
                         self.round_trips[axis][w] += 1   # one traversal = half a round trip
                     self.walker_last_end[axis][w] = end
+            if bias:
+                end = "bias" if key[1] >= self.n_physical_mu else "physical"
+                if end != self.walker_last_end["bias"][w]:
+                    if self.walker_last_end["bias"][w] is not None:
+                        self.round_trips["bias"][w] += 1
+                    self.walker_last_end["bias"][w] = end
 
     def check_energies(self, tol: float = 1e-6) -> Dict[Tuple[int, int], Tuple[float, bool]]:
         """
@@ -1045,7 +1086,9 @@ class ReplicaExchangeGCMC:
         -------
         dict
             ``{'T': array, 'mu': array}``, one entry per walker (completed
-            end-to-end-and-back trips).
+            end-to-end-and-back trips); with bias columns also ``'bias'``
+            (physical columns -> bias columns -> physical columns, or the
+            reverse).
         """
         return {axis: np.array(v) // 2 for axis, v in self.round_trips.items()}
 
@@ -2058,6 +2101,7 @@ class ReplicaExchangeGCMC:
             "pairs": [{"a": list(a), "b": list(b), "attempts": int(n), "acceptance": float(acc)}
                       for (a, b), (n, acc) in sorted(self.pair_acceptance().items())],
             "round_trips_T": trips["T"].tolist(), "round_trips_mu": trips["mu"].tolist(),
+            **({"round_trips_bias": trips["bias"].tolist()} if "bias" in trips else {}),
             "convergence_history": [float(c) for c in self.convergence_history],
             "convergence": {"settings": self.convergence_settings,
                             "checks": [{k: v for k, v in c.items() if k != "ratios"}

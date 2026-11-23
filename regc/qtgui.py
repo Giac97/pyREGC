@@ -1861,6 +1861,10 @@ QTabBar::tab {{ padding: 7px 16px; }}
             PG = lab.get("pressure_grid") or meta.get("pressure_grid")
             unit = lab.get("pressure_unit") or meta.get("pressure_unit") or ""
             rows = [f"{t:.4g} K" for t in T] if T else [str(i) for i in range(shape[0])]
+            CL = lab.get("column_labels") or meta.get("column_labels")
+            if CL and len(CL) == shape[1]:   # bias columns: pressure, then the mu shift
+                return rows, [c.replace("mu_", "μ_") for c in CL], \
+                    f"pressure ({unit}); bias columns: shifted μ"
             if PG and len(PG) == shape[0]:   # an adapted ladder: pressures differ per row
                 cols = []
                 for j in range(shape[1]):
