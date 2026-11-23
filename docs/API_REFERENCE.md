@@ -14,7 +14,7 @@ Everything below is importable as `from regc import <name>`, except the runner f
 - [Replicas (`regc.replica`)](#replicas-regcreplica): `Replica`
 - [The replica-exchange engine (`regc.engine`)](#the-replica-exchange-engine-regcengine): `ReplicaExchangeGCMC`, `SWAP_TYPES`
 - [Checkpointed runs (`regc.driver`)](#checkpointed-runs-regcdriver): `run_with_checkpoints`, `RunStatus`, `EXIT_RESUBMIT`
-- [Adaptive replica ladder (`regc.ladder`)](#adaptive-replica-ladder-regcladder): `LadderAdapter`, `LadderProposal`, `propose_ladder`
+- [Adaptive replica ladder (`regc.ladder`)](#adaptive-replica-ladder-regcladder): `LadderAdapter`, `LadderES`, `LadderProposal`, `propose_ladder`
 - [Sample I/O (`regc.io`)](#sample-io-regcio): `save_samples`, `load_samples`, `SampleSet`
 - [Units (`regc.units`)](#units-regcunits): `kelvin_to_eV`, `eV_to_kelvin`, `pascal_per`, `PRESSURE_UNITS`, `ThermalWavelengthCubed`, `SpeciesLambdaCubed`, `thermal_wavelength_angstrom`, `thermal_wavelength_cubed_angstrom3`, `default_mass_amu`
 - [Reduced-unit pressure conventions (`regc.pressure`)](#reduced-unit-pressure-conventions-regcpressure): `p0_reduced_units`, `p0_ideal_gas_wavelength`, `mu_from_pressure`, `pressure_from_mu`, `mu_grid_from_pressures`, `invert_mu_of_Tp`
@@ -2793,6 +2793,61 @@ the new ladder can be told apart (`pair_acceptance_by_chunk`).
 
 - *ValueError*: If the shapes do not match the grid or a temperature is not positive.
 
+#### `ReplicaExchangeGCMC.assign_states`
+
+```python
+ReplicaExchangeGCMC.assign_states(temperatures: Sequence[float], mu_grid) -> None
+```
+
+Give every slot the `ThermoState` of a ladder, and nothing else.
+
+The state part of `set_ladder`: samples, versions and pair counts are
+untouched (used to evaluate trial ladders, `regc.ladder.LadderES`).
+
+**Parameters**
+
+- `temperatures` (*sequence of float*): Temperature ladder, length n_T.
+- `mu_grid` (*array_like*): Chemical potentials, the shape of `self.mu_grid`.
+
+**Raises**
+
+- *ValueError*: If the shapes do not match the grid or a temperature is not positive.
+
+#### `ReplicaExchangeGCMC.snapshot_state`
+
+```python
+ReplicaExchangeGCMC.snapshot_state() -> bytes
+```
+
+An in-memory copy of the simulation's state, to come back to with `restore_state`.
+
+Holds the replicas (configurations, energies, states, random streams,
+move counters), the engine's random stream, the walkers and round
+trips, the samples, swap and pair counts, convergence history and
+the ladder bookkeeping. Replicas come back to the main process after
+every block, so this works with worker processes too.
+
+**Returns**
+
+- *bytes*: Pickled state.
+
+#### `ReplicaExchangeGCMC.restore_state`
+
+```python
+ReplicaExchangeGCMC.restore_state(blob: bytes, configurations_only: bool = False) -> None
+```
+
+Go back to a state from `snapshot_state`.
+
+Each restored replica keeps the calculator of the replica now in its
+slot (as `load_checkpoint` does: calculators are interchangeable,
+and a live one, e.g. a LAMMPS instance, is not rebuilt).
+
+**Parameters**
+
+- `blob` (*bytes*): From `snapshot_state`.
+- `configurations_only` (*bool, optional*): Restore only the trajectory (replicas, the engine's random stream, walkers and round trips), keeping the samples, counts, convergence history and ladder bookkeeping. Default False.
+
 #### `ReplicaExchangeGCMC.round_trip_counts`
 
 ```python
@@ -3203,7 +3258,7 @@ Run `sim.run_regc` in checkpointed chunks.
 - `metadata` (*dict, optional*): JSON-serialisable description of the run (potential, lattice constant, protocol, ...). Saved on a fresh start; on resume every key must match the saved value.
 - `progress` (*callable, optional*): Called with a one-line status after every chunk. Default `print`; None for silence.
 - `energy_tol` (*float, optional*): After every chunk each replica's running energy is compared with a full recomputation (`ReplicaExchangeGCMC.check_energies`); a drift above this, per atom, is resynced with a warning. Default 1e-6.
-- `adapt_ladder` (*regc.ladder.LadderAdapter, optional*): Adapt the ladder after every chunk until it is frozen (see `regc.ladder`): each change discards the samples so far (kept in `samples_ladder<version>.npz`), restarts the convergence checks (skipped until the ladder is frozen) and is logged in `ladder.json`; `run_metadata.json` is updated to the current ladder. Never after the last chunk. Default None (fixed ladder).
+- `adapt_ladder` (*regc.ladder.LadderAdapter or regc.ladder.LadderES, optional*): `LadderAdapter`: adapt the ladder after every chunk until it is frozen (see `regc.ladder`): each change discards the samples so far (kept in `samples_ladder<version>.npz`), restarts the convergence checks (skipped until the ladder is frozen) and is logged in `ladder.json`; `run_metadata.json` is updated to the current ladder. Never after the last chunk. `LadderES`: run its generations before the first chunk (each evaluation lasts its `eval_steps`, default `chunk`; these steps do not count toward `n_steps`), with a checkpoint and `ladder.json` after every generation; the production run starts on the frozen ladder. Default None (fixed ladder).
 - `**diffusion_kwargs`: Passed to `run_regc` (e.g. `timestep_fs`, `taut_fs`).
 
 **Returns**
@@ -3317,22 +3372,6 @@ The adaptation settings.
 
 - *dict*: JSON-able.
 
-#### `LadderAdapter.history` (staticmethod)
-
-```python
-LadderAdapter.history(sim) -> List[dict]
-```
-
-The adaptations made so far (kept by the simulation, so in its checkpoint).
-
-**Parameters**
-
-- `sim` (*ReplicaExchangeGCMC*): The simulation.
-
-**Returns**
-
-- *list of dict*: One record per adaptation.
-
 #### `LadderAdapter.pending`
 
 ```python
@@ -3348,22 +3387,6 @@ Whether adaptations remain (the ladder is not frozen yet).
 **Returns**
 
 - *bool*: True while fewer than `chunks` adaptations were made.
-
-#### `LadderAdapter.current_log10p`
-
-```python
-LadderAdapter.current_log10p(sim) -> np.ndarray
-```
-
-log10 p of every current state.
-
-**Parameters**
-
-- `sim` (*ReplicaExchangeGCMC*): The simulation.
-
-**Returns**
-
-- *numpy.ndarray*: Shape (n_T, n_mu).
 
 #### `LadderAdapter.propose`
 
@@ -3440,29 +3463,123 @@ One line summarising an adaptation.
 
 - *str*: The line.
 
-#### `LadderAdapter.to_json`
+---
+
+### `LadderES`
 
 ```python
-LadderAdapter.to_json(sim) -> dict
+LadderES(mu_of: Callable, lambda_cubed_of_T: Callable, temperatures, log10p, generations: int = 3, population: int = 4, sigma: float = 0.3, eval_steps: Optional[int] = None, fitness: str = 'uniform', per_row: bool = True, reevaluate_parent: bool = True, min_gap_fraction: float = 0.0, warmup_steps: int = 0, min_attempts_per_pair: Optional[int] = None, eval_steps_max: Optional[int] = None, seed: int = 0, kelvin_per_unit: Optional[float] = None, pressure_unit: Optional[str] = None)
 ```
 
-Everything `ladder.json` holds: settings, initial ladder, adaptations.
+Optimise the ladder by an evolution strategy on measured swap rates, before the run.
+
+Kowaguchi, Endo, Brumby, Nomura, Yasuoka, J. Chem. Inf. Model. 62, 6544
+(2022), ES method 1, on the (T, p) grid. Each generation (`run_generation`):
+
+1. `population` candidates are mutated from the parent (`mutate`):
+   Gaussian noise of width `sigma` on the log gap fractions of the ln T
+   ladder and of every row's log10 p ladder (one shared ladder with
+   `per_row=False`), renormalised, so the corners stay and the order
+   is kept.
+2. Every candidate, and the parent (`reevaluate_parent`), runs
+   `eval_steps` REGC steps from the same snapshot of the configurations
+   (`ReplicaExchangeGCMC.snapshot_state`); its per-pair swap counts give
+   both fitnesses (`fitness_uniform`, `fitness_resistance`), and its
+   samples are discarded.
+3. The best candidate replaces the parent if its fitness (`fitness`) is
+   lower than the parent's (`select_survivor`). The run continues from
+   the survivor's configurations at the end of its evaluation
+   (equilibrated to its ladder), or the parent's.
+
+After `generations` generations the ladder is frozen. The history is
+kept in `sim.ladder_history` (one record per generation, so it is in
+the checkpoint), with the random state of the ES after the generation.
 
 **Parameters**
 
-- `sim` (*ReplicaExchangeGCMC*): The simulation.
+- `mu_of` (*callable*): `mu_of(T, y)`: chemical potential(s) at engine temperature T and pressure 10**y.
+- `lambda_cubed_of_T` (*callable*): Lambda^3(T) (only kept for symmetry with `LadderAdapter`).
+- `temperatures` (*array_like*): The initial (configured) ladder, engine units.
+- `log10p` (*array_like*): Its log10 pressures, shape (n_mu,) or (n_T, n_mu).
+- `generations` (*int, optional*): Generations before the ladder is frozen. Default 3.
+- `population` (*int, optional*): Candidates per generation. Default 4.
+- `sigma` (*float, optional*): Width of the noise on the log gap fractions. Default 0.3.
+- `eval_steps` (*int, optional*): REGC steps per evaluation. Default None (the driver uses its chunk).
+- `fitness` (*str, optional*): `'uniform'` (default) or `'resistance'`: what selection uses (both are recorded).
+- `per_row` (*bool, optional*): One pressure ladder per temperature (True) or one shared. Default True.
+- `reevaluate_parent` (*bool, optional*): Run the parent again in every generation, so a lucky noisy estimate does not survive for ever. Default True.
+- `min_gap_fraction` (*float, optional*): Smallest gap of a candidate, as a fraction of its block's span. Default 0 (none).
+- `warmup_steps` (*int, optional*): REGC steps on the initial ladder before generation 1 (samples and swap counts discarded, configurations kept), so the evaluations do not measure the drift of a system still equilibrating. Default 0.
+- `min_attempts_per_pair` (*int, optional*): Extend every evaluation in blocks of its evaluation length until every pair of the swap patterns has this many attempts (the swap schedule does not depend on the ladder, so every evaluation of a generation gets the same length). Default None (one block).
+- `eval_steps_max` (*int, optional*): Longest evaluation with `min_attempts_per_pair`. Default None (10 x the evaluation length).
+- `seed` (*int, optional*): Seed of the ES's random stream (the run seed). Default 0.
+- `kelvin_per_unit` (*float, optional*): Kelvin per engine temperature unit, for the reports. Default None.
+- `pressure_unit` (*str, optional*): Unit of 10**y, for the reports. Default None.
+
+**Raises**
+
+- *ValueError*: On invalid settings or a ladder with nothing to optimise.
+
+**Constructor**
+
+Store the settings and the initial ladder.
+
+**Parameters**
+
+- `mu_of` (*callable*): `mu_of(T, y)`.
+- `lambda_cubed_of_T` (*callable*): Lambda^3(T).
+- `temperatures` (*array_like*): Initial ladder.
+- `log10p` (*array_like*): Initial log10 pressures.
+- `generations` (*int, optional*): Generations. Default 3.
+- `population` (*int, optional*): Candidates per generation. Default 4.
+- `sigma` (*float, optional*): Mutation width. Default 0.3.
+- `eval_steps` (*int, optional*): Steps per evaluation. Default None.
+- `fitness` (*str, optional*): Selection fitness. Default `'uniform'`.
+- `per_row` (*bool, optional*): Per-row pressure ladders. Default True.
+- `reevaluate_parent` (*bool, optional*): Re-run the parent every generation. Default True.
+- `min_gap_fraction` (*float, optional*): Smallest gap fraction. Default 0.
+- `warmup_steps` (*int, optional*): Steps on the initial ladder before generation 1. Default 0.
+- `min_attempts_per_pair` (*int, optional*): Attempts every pair needs per evaluation. Default None.
+- `eval_steps_max` (*int, optional*): Longest evaluation. Default None (10 x the evaluation length).
+- `seed` (*int, optional*): Seed. Default 0.
+- `kelvin_per_unit` (*float, optional*): Kelvin per engine temperature unit. Default None.
+- `pressure_unit` (*str, optional*): Pressure unit. Default None.
+
+**Raises**
+
+- *ValueError*: On invalid settings or a ladder with nothing to optimise.
+
+#### `LadderES.settings`
+
+```python
+LadderES.settings() -> dict
+```
+
+The ES settings.
 
 **Returns**
 
 - *dict*: JSON-able.
 
-#### `LadderAdapter.metadata_update`
+#### `LadderES.n_evaluations`
 
 ```python
-LadderAdapter.metadata_update(sim) -> dict
+LadderES.n_evaluations() -> int
 ```
 
-The run-metadata entries describing the current ladder.
+Evaluations of the whole ES.
+
+**Returns**
+
+- *int*: generations x population, plus the parent's (every generation with `reevaluate_parent`, else once).
+
+#### `LadderES.pending`
+
+```python
+LadderES.pending(sim) -> bool
+```
+
+Whether generations remain (the ladder is not frozen yet).
 
 **Parameters**
 
@@ -3470,23 +3587,125 @@ The run-metadata entries describing the current ladder.
 
 **Returns**
 
-- *dict*: `temperatures_K` (or `temperatures` without `kelvin_per_unit`), `mu_grid_eV`, `pressure_grid` (n_T, n_mu) and `ladder_version`.
+- *bool*: True while fewer than `generations` generations were run.
 
-#### `LadderAdapter.status_labels`
+#### `LadderES.rng`
 
 ```python
-LadderAdapter.status_labels(sim) -> dict
+LadderES.rng(sim) -> np.random.Generator
 ```
 
-The monitor labels of the current ladder (`status.json`).
+The ES's random stream where the last generation left it (or fresh from the seed).
 
 **Parameters**
 
-- `sim` (*ReplicaExchangeGCMC*): The simulation.
+- `sim` (*ReplicaExchangeGCMC*): The simulation (its ladder history).
 
 **Returns**
 
-- *dict*: `temperatures_K` (if known) and `pressure_grid`.
+- *numpy.random.Generator*: The stream.
+
+#### `LadderES.mutate`
+
+```python
+LadderES.mutate(temperatures, log10p, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray]
+```
+
+One candidate ladder from a parent.
+
+**Parameters**
+
+- `temperatures` (*array_like*): Parent ladder, shape (n_T,).
+- `log10p` (*array_like*): Parent log10 p, shape (n_T, n_mu).
+- `rng` (*numpy.random.Generator*): Random stream (the T block draws first, then the pressure rows).
+
+**Returns**
+
+- *tuple of numpy.ndarray*: `(temperatures, log10p)`: corners and every row's first and last pressure unchanged, order kept.
+
+**Raises**
+
+- *ValueError*: If the parent is not strictly monotonic or, with `per_row=False`, its rows differ.
+
+#### `LadderES.mu_grid`
+
+```python
+LadderES.mu_grid(temperatures, log10p) -> np.ndarray
+```
+
+Chemical potentials of a ladder.
+
+**Parameters**
+
+- `temperatures` (*array_like*): Ladder, shape (n_T,).
+- `log10p` (*array_like*): log10 p, shape (n_T, n_mu).
+
+**Returns**
+
+- *numpy.ndarray*: Shape (n_T, n_mu) or (n_T, n_mu, n_species).
+
+#### `LadderES.describe_evaluation`
+
+```python
+LadderES.describe_evaluation(generation: int, rec: dict) -> str
+```
+
+One line summarising an evaluation.
+
+**Parameters**
+
+- `generation` (*int*): Generation number (from 1).
+- `rec` (*dict*): From the generation record's `evaluations`.
+
+**Returns**
+
+- *str*: The line.
+
+#### `LadderES.run_generation`
+
+```python
+LadderES.run_generation(sim, run_kwargs: Optional[dict] = None, step: Optional[int] = None, eval_steps: Optional[int] = None, progress: Optional[Callable[[str], None]] = None, evaluate: Optional[Callable] = None) -> dict
+```
+
+Run one generation on a simulation and continue it from the survivor.
+
+Generation 1 starts with `warmup_steps` on the initial ladder (record
+`warmup`). Each evaluation runs the evaluation length, repeated
+while a pair has fewer than `min_attempts_per_pair` attempts (up to
+`eval_steps_max`).
+
+**Parameters**
+
+- `sim` (*ReplicaExchangeGCMC*): The simulation; it ends on the survivor's ladder (`set_ladder` if it changed) with the survivor's end-of-evaluation configurations, and its samples, swap and pair counts as before the generation. The record is appended to `sim.ladder_history`.
+- `run_kwargs` (*dict, optional*): Passed to `ReplicaExchangeGCMC.run_regc` for every evaluation (`x0`, `diffusion`, ...; not `n_steps`, `burn_in_steps` or `verbose`). Default None.
+- `step` (*int, optional*): Steps done (recorded). Default None.
+- `eval_steps` (*int, optional*): Steps per evaluation if `eval_steps` was not set. Default None.
+- `progress` (*callable, optional*): Called with one line per evaluation. Default None.
+- `evaluate` (*callable, optional*): `evaluate(temperatures, log10p, mu_grid) -> counts` (or `(counts, steps)`) replacing the simulation (tests); the configurations are then left alone and there is no warm-up. Default None.
+
+**Returns**
+
+- *dict*: The generation record: `evaluations` (parent first if evaluated, then the candidates), `survivor` (its index in `evaluations`, or that of the parent), `changed`, the new parent's ladder (`temperatures`, `log10p`, `mu_grid`, `pressure_grid`) and `fitness`, and `rng_state`.
+
+**Raises**
+
+- *ValueError*: If the ladder is frozen, or no evaluation length is known.
+
+#### `LadderES.describe`
+
+```python
+LadderES.describe(rec: dict) -> str
+```
+
+One line summarising a generation.
+
+**Parameters**
+
+- `rec` (*dict*): A record from `run_generation`.
+
+**Returns**
+
+- *str*: The line.
 
 ---
 

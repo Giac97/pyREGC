@@ -896,6 +896,42 @@ class ReplicaExchangeGCMC:
         ValueError
             If the shapes do not match the grid or a temperature is not positive.
         """
+        T_new, mus = self._check_ladder(temperatures, mu_grid)
+        last = self.pair_stats_history[-1]["pairs"] if self.pair_stats_history else {}
+        if {k: list(v) for k, v in self.pair_stats.items()} != last:
+            self.snapshot_pair_stats(step)   # close the interval sampled on the old ladder
+        self.assign_states(T_new, mus)
+        n_old = max((len(v["U"]) for v in self.samples.values()), default=0)
+        self.first_index += n_old
+        for v in self.samples.values():
+            for name in v:
+                v[name] = []
+        self.convergence_history, self.convergence_details = [], []
+        self.ladder_version += 1
+        self.ladder_history.append({**(info or {}), "version": self.ladder_version})
+
+    def _check_ladder(self, temperatures: Sequence[float], mu_grid
+                      ) -> Tuple[List[float], np.ndarray]:
+        """
+        Validate a ladder for this grid.
+
+        Parameters
+        ----------
+        temperatures : sequence of float
+            Temperature ladder, length n_T.
+        mu_grid : array_like
+            Chemical potentials, the shape of ``self.mu_grid``.
+
+        Returns
+        -------
+        tuple
+            ``(temperatures as floats, mu_grid as a float array)``.
+
+        Raises
+        ------
+        ValueError
+            If the shapes do not match the grid or a temperature is not positive.
+        """
         T_new = [float(T) for T in temperatures]
         mus = np.asarray(mu_grid, dtype=float)
         expected = self.mu_grid.shape
@@ -904,9 +940,28 @@ class ReplicaExchangeGCMC:
                              f"shape {expected}; got {len(T_new)} and {mus.shape}")
         if min(T_new) <= 0.0:
             raise ValueError("temperatures must be positive")
-        last = self.pair_stats_history[-1]["pairs"] if self.pair_stats_history else {}
-        if {k: list(v) for k, v in self.pair_stats.items()} != last:
-            self.snapshot_pair_stats(step)   # close the interval sampled on the old ladder
+        return T_new, mus
+
+    def assign_states(self, temperatures: Sequence[float], mu_grid) -> None:
+        """
+        Give every slot the `ThermoState` of a ladder, and nothing else.
+
+        The state part of `set_ladder`: samples, versions and pair counts are
+        untouched (used to evaluate trial ladders, `regc.ladder.LadderES`).
+
+        Parameters
+        ----------
+        temperatures : sequence of float
+            Temperature ladder, length n_T.
+        mu_grid : array_like
+            Chemical potentials, the shape of ``self.mu_grid``.
+
+        Raises
+        ------
+        ValueError
+            If the shapes do not match the grid or a temperature is not positive.
+        """
+        T_new, mus = self._check_ladder(temperatures, mu_grid)
         for (it, imu), r in self.grid.items():
             T = T_new[it]
             if self.n_species == 1:
@@ -919,14 +974,64 @@ class ReplicaExchangeGCMC:
                                   sgc_dmu=None if self.sgc_dmu is None
                                   else self.sgc_dmu + T * self.sgc_log_ratio)
         self.temperatures, self.mu_grid = T_new, mus.copy()
-        n_old = max((len(v["U"]) for v in self.samples.values()), default=0)
-        self.first_index += n_old
-        for v in self.samples.values():
-            for name in v:
-                v[name] = []
-        self.convergence_history, self.convergence_details = [], []
-        self.ladder_version += 1
-        self.ladder_history.append({**(info or {}), "version": self.ladder_version})
+
+    #: What `restore_state` puts back with ``configurations_only=True``: the trajectory.
+    _TRAJECTORY_STATE = ("grid", "rng_state", "round_trips", "walker_last_end")
+
+    def snapshot_state(self) -> bytes:
+        """
+        An in-memory copy of the simulation's state, to come back to with `restore_state`.
+
+        Holds the replicas (configurations, energies, states, random streams,
+        move counters), the engine's random stream, the walkers and round
+        trips, the samples, swap and pair counts, convergence history and
+        the ladder bookkeeping. Replicas come back to the main process after
+        every block, so this works with worker processes too.
+
+        Returns
+        -------
+        bytes
+            Pickled state.
+        """
+        import pickle
+        return pickle.dumps({
+            "grid": self.grid, "rng_state": self.rng.bit_generator.state,
+            "round_trips": self.round_trips, "walker_last_end": self.walker_last_end,
+            "samples": self.samples, "swap_stats": self.swap_stats,
+            "pair_stats": self.pair_stats, "pair_stats_history": self.pair_stats_history,
+            "convergence_history": self.convergence_history,
+            "convergence_details": self.convergence_details,
+            "temperatures": self.temperatures, "mu_grid": self.mu_grid,
+            "first_index": self.first_index, "ladder_version": self.ladder_version,
+            "ladder_history": self.ladder_history}, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def restore_state(self, blob: bytes, configurations_only: bool = False) -> None:
+        """
+        Go back to a state from `snapshot_state`.
+
+        Each restored replica keeps the calculator of the replica now in its
+        slot (as `load_checkpoint` does: calculators are interchangeable,
+        and a live one, e.g. a LAMMPS instance, is not rebuilt).
+
+        Parameters
+        ----------
+        blob : bytes
+            From `snapshot_state`.
+        configurations_only : bool, optional
+            Restore only the trajectory (replicas, the engine's random
+            stream, walkers and round trips), keeping the samples, counts,
+            convergence history and ladder bookkeeping. Default False.
+        """
+        import pickle
+        st = pickle.loads(blob)
+        for key, r in st["grid"].items():
+            r.system.calculator = self.grid[key].system.calculator
+        keys = self._TRAJECTORY_STATE if configurations_only else tuple(st)
+        for name in keys:
+            if name == "rng_state":
+                self.rng.bit_generator.state = st[name]
+            else:
+                setattr(self, name, st[name])
 
     def round_trip_counts(self) -> Dict[str, np.ndarray]:
         """

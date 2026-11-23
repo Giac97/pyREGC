@@ -200,6 +200,66 @@ def _check_metadata(path: str, metadata: dict) -> None:
             raise ValueError(f"cannot resume: '{key}' is {value!r} now but {saved[key]!r} in {path}")
 
 
+def _run_ladder_es(sim, es, out_dir: str, done: int, n_steps: int, chunk: int, run_kwargs: dict,
+                   time_limit: Optional[float], t0: float,
+                   progress: Optional[Callable[[str], None]], meta_path: str, ckpt: str,
+                   extra: dict) -> bool:
+    """
+    Run the remaining generations of a `regc.ladder.LadderES`, checkpointing after each.
+
+    Parameters
+    ----------
+    sim : ReplicaExchangeGCMC
+        The simulation.
+    es : regc.ladder.LadderES
+        The evolution strategy.
+    out_dir : str
+        Run directory (``ladder.json``).
+    done, n_steps : int
+        Steps done and the run's total (status file).
+    chunk : int
+        Evaluation length if the ES does not set one.
+    run_kwargs : dict
+        Passed to `run_regc` in the evaluations.
+    time_limit : float or None
+        Seconds since `t0` after which no generation starts that would end later.
+    t0 : float
+        Start of the call (``time.time()``).
+    progress : callable or None
+        Log lines.
+    meta_path, ckpt : str
+        ``run_metadata.json`` and the checkpoint.
+    extra : dict
+        Driver state saved with the checkpoint (besides ``steps_done``).
+
+    Returns
+    -------
+    bool
+        True if it stopped for the time limit (resume to continue).
+    """
+    last = 0.0
+    while es.pending(sim):
+        if time_limit is not None and time.time() - t0 + 1.5 * last > time_limit:
+            if progress:
+                progress(f"stopping in the ladder ES before generation "
+                         f"{len(es.history(sim)) + 1} for the time limit; resume to continue")
+            return True
+        t_gen = time.time()
+        rec = es.run_generation(sim, run_kwargs, step=done, eval_steps=chunk, progress=progress)
+        if rec["changed"]:
+            update_metadata(meta_path, es.metadata_update(sim))
+        if hasattr(sim, "status_extra"):
+            sim.status_extra.update(es.status_labels(sim))
+            sim._status_offset, sim._status_total = done, n_steps
+            sim._maybe_write_status(0, 0, "regc", force=True)
+        _write_json_atomic(os.path.join(out_dir, LADDER_FILE), es.to_json(sim))
+        sim.save_checkpoint(ckpt, extra={"steps_done": done, **extra})
+        last = time.time() - t_gen
+        if progress:
+            progress(es.describe(rec) + f" ({last:.0f} s)")
+    return False
+
+
 def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
                          x0: float = 0.99, diffusion: str = "mc", diffusion_steps: int = 10,
                          record_every: int = 100, convergence_every: Optional[int] = None,
@@ -277,13 +337,18 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
         After every chunk each replica's running energy is compared with a
         full recomputation (`ReplicaExchangeGCMC.check_energies`); a drift
         above this, per atom, is resynced with a warning. Default 1e-6.
-    adapt_ladder : regc.ladder.LadderAdapter, optional
-        Adapt the ladder after every chunk until it is frozen (see
-        `regc.ladder`): each change discards the samples so far (kept in
-        ``samples_ladder<version>.npz``), restarts the convergence checks
-        (skipped until the ladder is frozen) and is logged in
+    adapt_ladder : regc.ladder.LadderAdapter or regc.ladder.LadderES, optional
+        `LadderAdapter`: adapt the ladder after every chunk until it is
+        frozen (see `regc.ladder`): each change discards the samples so far
+        (kept in ``samples_ladder<version>.npz``), restarts the convergence
+        checks (skipped until the ladder is frozen) and is logged in
         ``ladder.json``; ``run_metadata.json`` is updated to the current
-        ladder. Never after the last chunk. Default None (fixed ladder).
+        ladder. Never after the last chunk. `LadderES`: run its generations
+        before the first chunk (each evaluation lasts its ``eval_steps``,
+        default `chunk`; these steps do not count toward `n_steps`), with a
+        checkpoint and ``ladder.json`` after every generation; the
+        production run starts on the frozen ladder. Default None (fixed
+        ladder).
     **diffusion_kwargs
         Passed to `run_regc` (e.g. ``timestep_fs``, ``taut_fs``).
 
@@ -346,6 +411,16 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
                                     "min_round_trips": int(convergence_min_round_trips),
                                     "every": int(convergence_every)}
     t0, last_chunk = time.time(), 0.0
+    if getattr(adapt_ladder, "method", None) == "es" and adapt_ladder.pending(sim):
+        run_kwargs = dict(x0=x0, diffusion=diffusion, diffusion_steps=diffusion_steps,
+                          record_every=record_every, **diffusion_kwargs)
+        stopped = _run_ladder_es(sim, adapt_ladder, out_dir, done, n_steps, chunk, run_kwargs,
+                                 time_limit, t0, progress, meta_path, ckpt,
+                                 {"n_at_last_check": n_at_last_check,
+                                  "n_at_check_before": n_at_check_before,
+                                  "rho_u_changes": changes, "converged": converged})
+        if stopped:
+            return RunStatus(done, False, False, changes, resumed_from)
     while done < n_steps and not converged:
         if time_limit is not None and time.time() - t0 + 1.5 * last_chunk > time_limit:
             if progress:
@@ -366,7 +441,8 @@ def run_with_checkpoints(sim, out_dir: str, n_steps: int, chunk: int = 1000,
                           f"drift means the calculator's incremental and full energies disagree",
                           stacklevel=2)
         detail = None
-        adapting = adapt_ladder is not None and adapt_ladder.pending(sim)
+        adapting = (adapt_ladder is not None and getattr(adapt_ladder, "method", "model") != "es"
+                    and adapt_ladder.pending(sim))
         if adapting:
             pass   # the ladder will still move: no convergence checks yet
         elif (convergence_every is not None and mode == "noise"

@@ -1212,6 +1212,145 @@ fill runs are still product grids. The records file keeps the ladder it
 was opened with in its attributes; its samples map to `samples.npz`
 through `first_index`.
 
+### 7.4 Optimising the ladder by an evolution strategy (model free)
+
+The method of §7.3 predicts how acceptances change with a model calibrated
+on the measured rates. `LadderES` (`adapt_ladder: {method: es}`) measures
+instead: it runs short trials of candidate ladders and keeps the best one.
+This is "ES method 1" of Kowaguchi, Endo, Brumby, Nomura and Yasuoka,
+J. Chem. Inf. Model. 62, 6544 (2022), extended from a temperature ladder
+to the (T, p) grid. It runs before the production run, then freezes the
+ladder.
+
+```python
+from regc import LadderES, run_with_checkpoints
+
+es = LadderES(lambda T, y: feed.mu_at_T_eV(T, 10 ** y, unit="bar"), sim.lambda_cubed_of_T,
+              temperatures_eV, np.log10(pressures_bar), generations=3, population=4,
+              sigma=0.3, eval_steps=300, fitness="uniform", per_row=True,
+              reevaluate_parent=True, warmup_steps=2000, seed=0,
+              kelvin_per_unit=1 / 8.617333262e-5, pressure_unit="bar")
+print(es.n_evaluations() * 300, "trial steps")
+run_with_checkpoints(sim, "run_dir", n_steps=40000, chunk=4000, adapt_ladder=es, ...)
+```
+
+In a config file this is `replica_exchange.adapt_ladder` with `method: es`
+([§14.5](#145-replica_exchange)).
+
+**One generation.**
+
+1. *Mutation.* The parametrisation is that of §7.3: the gaps of ln T and
+   of every row's log10 p, as fractions of the fixed spans. The corners
+   stay, and so do the first and last pressure of every row. Each of the
+   `population` candidates adds Gaussian noise of width `sigma` to the
+   logs of the parent's gap fractions and renormalises them. So the order
+   is kept by construction, and `sigma = 0.3` changes a gap by about ±30 %.
+   With `per_row: true` every row's pressure ladder gets its own noise;
+   with `false` one shared ladder does (a product grid). There is no trust
+   region and no coverage bound. `min_gap_fraction` (default 0) can keep
+   every candidate gap above that fraction of its span.
+2. *Evaluation.* Every candidate, and the parent, starts from the same
+   snapshot of the configurations (`ReplicaExchangeGCMC.snapshot_state`;
+   the replicas come back to the main process after every block, so this
+   also works with worker processes). It gets its states
+   (`assign_states`) and runs `eval_steps` REGC steps with nothing
+   recorded. Its per-pair swap counts give the fitness, and the run is
+   then undone (`restore_state`). The engine's random draws of GC steps and
+   swap patterns do not depend on the ladder. So every evaluation of a
+   generation attempts the same pairs the same number of times (common
+   random numbers), and the candidates differ only in what gets accepted.
+3. *Selection.* The best candidate replaces the parent if its fitness is
+   strictly lower than the parent's. The run continues from the end
+   configurations of the survivor's evaluation, which are equilibrated to
+   its ladder, or from the parent's if the parent survives. Samples, swap
+   and pair counts, and `mixing.json` stay as before the generation. Only
+   `ladder.json` holds the trial swaps.
+
+After `generations` generations the ladder is frozen. The production run
+starts on it, with no samples lost. There are no convergence checks
+before.
+
+**Fitness** (lower is better; both are recorded, `fitness` selects):
+
+- `uniform` (default): the paper's Eq. 6, Σ_i (R_i − R̄)², the spread of
+  the measured acceptances R_i, computed per swap pattern (T, μ, both
+  diagonals) and summed. Pairs never attempted in an evaluation are left
+  out. It rewards even traffic, but it is blind to the level: equal but
+  low acceptances also score 0.
+- `resistance`: ln R_T + ln R_μ of the swap graph (§7.3) with the measured
+  conductances: acceptance (at least 10⁻¹²) × the pair's share of the
+  attempts. Every T and μ neighbour pair is an edge, so the graph stays
+  connected. It rewards end-to-end transport, which is what replica
+  exchange is for. If some cut of the grid has no accepted swap at all in
+  a trial, the floor dominates (ln 10¹² ≈ 28). Candidates that differ only
+  elsewhere then score almost alike, and the selection follows the noise
+  of the other axis. A small test (EMT Pd(100)+O, 4 × 4, two attempts per
+  pair per trial) showed exactly this. Give the trials enough attempts
+  (`min_attempts_per_pair`).
+
+**Noise.** A fitness from a short trial is noisy, and early in a run it
+also measures drift. Four settings make the noise smaller, or at least
+visible:
+
+- `reevaluate_parent: true` (default) runs the parent again in every
+  generation. A parent that won on a lucky estimate is then judged on a
+  fresh one and does not survive for ever.
+- `warmup_steps` (default 0) runs that many steps on the initial ladder
+  before generation 1 and keeps only the configurations. A system that is
+  still equilibrating changes its acceptances between chunks even on an
+  unchanged ladder. One Pd(100)+O run halved its T acceptance between two
+  300-step chunks. Recommended: warm up until the mean N and the per-chunk
+  acceptances of a fixed-ladder test stop trending.
+- `min_attempts_per_pair` (default off) repeats each evaluation in blocks
+  of `eval_steps` until every pair has that many attempts, up to
+  `eval_steps_max` steps (default 10 × `eval_steps`). The swap schedule
+  is the same for all evaluations, so all of them get the same length. A
+  300-step chunk with x0 = 0.99 attempts each pair only about ten times.
+- Each evaluation records a standard error for both fitnesses
+  (`fitness_noise`). It comes from a parametric bootstrap: 200 resamples
+  of every pair's accepts from Binomial(attempts, p), with p the measured
+  rate clipped to [0.5/n, 1 − 0.5/n]. The log prints it next to the
+  fitness ("0.12 +- 0.03"). It covers sampling noise only, not drift. The
+  selection rule stays "strictly better survives". The error bars only
+  show whether a selection was meaningful.
+
+**Cost.** generations × (population + 1) × eval_steps REGC steps, or
+generations × population + 1 evaluations without `reevaluate_parent`,
+plus the warm-up (more with `min_attempts_per_pair`). The setup prints it.
+These steps do **not** count toward `n_steps`: the production run has
+`n_steps` steps on the frozen ladder. `eval_steps` defaults to the
+checkpoint chunk. Snapshots are pickles of the replicas. A generation
+holds at most three (the start, the parent's end and the best
+candidate's end).
+
+**Outputs and resume.** `ladder.json` (`method: es`) holds one record per
+generation. Each record has the warm-up (generation 1), every evaluation,
+the survivor, whether the ladder changed, the new parent's ladder and
+fitness, and the ES random state after the mutations. An evaluation lists
+its T (also in K), the log10 p and pressure grids, the steps it ran, each
+pair's attempts and accepts, the mean and minimum acceptance per pattern,
+both fitnesses with their standard errors, and the measured R_T and R_μ.
+The log has one line per evaluation and one per generation. A checkpoint
+is written after every generation (at step 0), and `run_metadata.json`
+and `samples.npz` describe the current ladder as in §7.3. A resumed run
+restarts the interrupted generation from the checkpointed configurations
+and the ES random state stored in the history, so it continues
+bit-identically. The ES stream is derived from the run seed and is
+separate from the simulation's.
+
+**Model based or ES?** The model of §7.3 extrapolates from one window of
+measured rates through Gaussian fluctuations. It is cheap, needs no
+trial runs and moves every gap at once, but it can be misled where
+fluctuations are not Gaussian (near transitions), and it needs the trust
+and coverage bounds to keep it from gaming itself. The ES assumes
+nothing: a candidate wins only if its measured trial run was better. But
+it pays (population + 1) trial runs per generation, explores only a few
+random directions in a space of n_T − 2 + n_T (n_p − 2) gap
+parameters, and is as noisy as its trials are short. Use the model for
+large grids and cheap adaptation. Use the ES (with a warm-up, enough
+attempts per pair and the `resistance` fitness) when the model's
+predictions disagree with what the next chunk measures.
+
 ## 8. Saving and loading samples
 
 ```python
@@ -3142,7 +3281,25 @@ The ladder: give `temperatures_K` and **exactly one** of `pressures` or
 | `swap_types` | all four | Subset of `[T, mu, cross_left, cross_right]`. |
 | `displace_substrate` | false | With `mc`: move displaceable substrate atoms too. |
 | `md` | – | `{timestep_fs: 1.0, thermostat: bussi, taut_fs: 20.0, friction_per_fs: 0.01}` for `diffusion: md`. |
-| `adapt_ladder` | off | Move the (T, p) ladder after the first chunks from the measured swap rates, then freeze it ([§7.3](#73-adapting-the-ladder-during-a-run)). `true` or `{chunks: 3, trust: 1.5, per_row: true, min_gap_ratio: 0.25, max_gap_ratio: 4.0, min_attempts: 20, min_samples: 5, max_evals: 20000, max_time_s: null}`. Needs `pressures`, a `checkpoint` section with `chunk` < `n_steps`, at least 3 temperatures or 3 pressures, and scipy. Every change discards the samples so far. |
+| `adapt_ladder` | off | Move the (T, p) ladder after the first chunks from the measured swap rates, then freeze it ([§7.3](#73-adapting-the-ladder-during-a-run)). `true` or `{method: model, chunks: 3, trust: 1.5, per_row: true, min_gap_ratio: 0.25, max_gap_ratio: 4.0, min_attempts: 20, min_samples: 5, max_evals: 20000, max_time_s: null}`. Needs `pressures`, a `checkpoint` section with `chunk` < `n_steps`, at least 3 temperatures or 3 pressures, and scipy. Every change discards the samples so far. With `method: es` the ladder is optimised before the run by an evolution strategy on short trial runs ([§7.4](#74-optimising-the-ladder-by-an-evolution-strategy-model-free)); its keys are in the table below. |
+
+`adapt_ladder` keys with `method: es` (other keys are refused):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `generations` | 3 | Generations before the ladder is frozen. |
+| `population` | 4 | Candidates per generation. |
+| `sigma` | 0.3 | Width of the Gaussian noise on the log gap fractions. |
+| `eval_steps` | the checkpoint `chunk` | REGC steps per evaluation. |
+| `fitness` | `uniform` | `uniform` (spread of the acceptances per swap pattern, Eq. 6 of Kowaguchi et al.) or `resistance` (ln R_T + ln R_μ of the measured swap graph). |
+| `per_row` | true | One pressure ladder per temperature, or one shared. |
+| `reevaluate_parent` | true | Run the parent again in every generation. |
+| `min_gap_fraction` | 0.0 | Smallest candidate gap, as a fraction of its span (below 1 / the number of gaps). |
+| `warmup_steps` | 0 | Steps on the initial ladder before generation 1 (configurations kept, nothing recorded). |
+| `min_attempts_per_pair` | null | Extend every evaluation in blocks of `eval_steps` until each pair has this many attempts. |
+| `eval_steps_max` | null (10 × `eval_steps`) | Longest evaluation with `min_attempts_per_pair`. |
+
+Cost: `generations` × (`population` + 1) × `eval_steps` steps (+ warm-up), not counted in `n_steps`. Needs `pressures`, a `checkpoint` section and at least 3 temperatures or 3 pressures.
 
 `scheme: sweep` keys: `n_cycles`, `sweeps_per_cycle` (100),
 `exchange_every` (1), `burn_in_cycles` (0), `diagonal_swaps` (true),
@@ -3340,7 +3497,7 @@ Everything goes to `output.directory`:
 | `records.h5` | With `records.save`: per-sample records and energies under re-evaluated potentials ([§9.6](#96-other-potentials-records-re-evaluation-and-reweighting)). |
 | `phase_diagram_<name>.png`, `_<name>_difference.png`, `_<name>_ess.png` | With `phase_diagram.potentials`. |
 | `mixing.json` | Swap acceptance per pattern and per neighbouring pair (with the worst pair), round trips per walker along T and μ, and `chunks` (per-chunk pair attempts and accepts, aligned with `pairs`, and the `ladder_version` they were sampled on); rewritten after every chunk. |
-| `ladder.json`, `samples_ladder<v>.npz` | With `adapt_ladder`: every adaptation (ladder, measured and predicted acceptances, resistances), and the samples of each replaced ladder ([§7.3](#73-adapting-the-ladder-during-a-run)). `samples.npz` and `run_metadata.json` then hold the current ladder (`pressure_grid`: the pressure of every state). |
+| `ladder.json`, `samples_ladder<v>.npz` | With `adapt_ladder`: every adaptation (ladder, measured and predicted acceptances, resistances), and the samples of each replaced ladder ([§7.3](#73-adapting-the-ladder-during-a-run)); with `method: es`, every generation (all evaluations with their pair counts, both fitnesses and their errors, the survivor; [§7.4](#74-optimising-the-ladder-by-an-evolution-strategy-model-free)). `samples.npz` and `run_metadata.json` then hold the current ladder (`pressure_grid`: the pressure of every state). |
 | `phase_diagram_uncertainty.png` | With `bootstrap`: half-width of the coverage interval. |
 | reliability keys of `phase_diagram_data.npz` | Always: `statistical_inefficiency`, `n_independent`, `overlap_min` (replica grid), `round_trips_T` (with `mixing.json`); C_V: `heat_capacity_ridges_kept` (and `heat_capacity_ridges_on_ladder` with a pressure ladder). With `bootstrap`: `theta_ci_low`/`theta_ci_high`, `most_probable_agreement`, `heat_capacity_ci_low`/`heat_capacity_ci_high`, `heat_capacity_ridges_support`, `bootstrap_level`, `bootstrap_n`. |
 

@@ -177,6 +177,13 @@ _HMC_KEYS = {"enabled", "leapfrog_steps", "timestep_fs", "dt"}
 _ADAPT_LADDER_DEFAULTS = {"chunks": 3, "trust": 1.5, "per_row": True, "min_gap_ratio": 0.25,
                           "max_gap_ratio": 4.0, "min_attempts": 20, "max_evals": 20000,
                           "max_time_s": None, "min_samples": 5}
+#: Keys of ``replica_exchange.adapt_ladder`` with ``method: es`` (`regc.ladder.LadderES`);
+#: ``eval_steps: null`` means the checkpoint chunk.
+_ADAPT_LADDER_ES_DEFAULTS = {"method": "es", "generations": 3, "population": 4, "sigma": 0.3,
+                             "eval_steps": None, "fitness": "uniform", "per_row": True,
+                             "reevaluate_parent": True, "min_gap_fraction": 0.0,
+                             "warmup_steps": 0, "min_attempts_per_pair": None,
+                             "eval_steps_max": None}
 _MD_KEYS = {"timestep_fs", "thermostat", "taut_fs", "friction_per_fs"}
 
 
@@ -569,10 +576,19 @@ def _adapt_ladder_settings(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     cfg = re_cfg.get("adapt_ladder")
     if cfg is None or cfg is False:
         return None
+    where = "replica_exchange.adapt_ladder"
     cfg = {} if cfg is True else cfg
+    if not isinstance(cfg, dict):
+        raise ValueError(f"{where} must be true, false or a mapping, got {cfg!r}")
+    cfg = dict(cfg)
+    method = cfg.get("method", "model")
+    if method == "es":
+        return _adapt_ladder_es_settings(config, cfg)
+    if method != "model":
+        raise ValueError(f"{where}.method must be 'model' or 'es', got {method!r}")
+    cfg.pop("method", None)   # the default: the metadata of older runs stay unchanged
     _check_keys(cfg, set(_ADAPT_LADDER_DEFAULTS), "replica_exchange.adapt_ladder")
     out = dict(_ADAPT_LADDER_DEFAULTS, **cfg)
-    where = "replica_exchange.adapt_ladder"
     for key in ("chunks", "min_attempts", "max_evals", "min_samples"):
         v = _as_float(out[key], f"{where}.{key}")
         if v != int(v) or v < (2 if key == "min_samples" else 1):
@@ -607,6 +623,80 @@ def _adapt_ladder_settings(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if n_T < 3 and n_p < 3:
         raise ValueError(f"{where} needs at least 3 temperatures or 3 pressures: the corners "
                          f"of the ladder stay fixed")
+    return out
+
+
+def _adapt_ladder_es_settings(config: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    The ``replica_exchange.adapt_ladder`` settings with ``method: es``, checked and with defaults.
+
+    Parameters
+    ----------
+    config : dict
+        The parsed config.
+    cfg : dict
+        The ``adapt_ladder`` section.
+
+    Returns
+    -------
+    dict
+        The settings (`_ADAPT_LADDER_ES_DEFAULTS` keys), ``eval_steps``
+        resolved to the checkpoint chunk if not given.
+
+    Raises
+    ------
+    ValueError
+        On an unknown key or a bad value, or outside a checkpointed regc run
+        with a pressure ladder of at least 3 temperatures or 3 pressures.
+    """
+    where = "replica_exchange.adapt_ladder"
+    re_cfg = config["replica_exchange"]
+    _check_keys(cfg, set(_ADAPT_LADDER_ES_DEFAULTS), where + " (method: es)")
+    out = dict(_ADAPT_LADDER_ES_DEFAULTS, **cfg)
+    if "pressures" not in re_cfg:
+        raise ValueError(f"{where} needs a pressure ladder (replica_exchange.pressures with a "
+                         f"gas reservoir): the ladder is moved in (T, log10 p)")
+    if "checkpoint" not in config:
+        raise ValueError(f"{where} (method: es) needs a checkpoint section: the run is "
+                         f"checkpointed after every generation")
+    for key in ("generations", "population", "eval_steps"):
+        if key == "eval_steps" and out[key] is None:
+            chunk = (config["checkpoint"] or {}).get("chunk", re_cfg.get("n_steps"))
+            out[key] = None if chunk is None else int(chunk)
+            continue
+        v = _as_float(out[key], f"{where}.{key}")
+        if v != int(v) or v < 1:
+            raise ValueError(f"{where}.{key} must be an integer >= 1, got {out[key]!r}")
+        out[key] = int(v)
+    for key, low in (("warmup_steps", 0), ("min_attempts_per_pair", 1), ("eval_steps_max", 1)):
+        if out[key] is None:
+            continue
+        v = _as_float(out[key], f"{where}.{key}")
+        if v != int(v) or v < low:
+            raise ValueError(f"{where}.{key} must be an integer >= {low}, got {out[key]!r}")
+        out[key] = int(v)
+    if (out["eval_steps_max"] is not None and out["eval_steps"] is not None
+            and out["eval_steps_max"] < out["eval_steps"]):
+        raise ValueError(f"{where}.eval_steps_max ({out['eval_steps_max']}) must be >= "
+                         f"eval_steps ({out['eval_steps']})")
+    for key in ("sigma", "min_gap_fraction"):
+        out[key] = _as_float(out[key], f"{where}.{key}")
+    if not out["sigma"] > 0:
+        raise ValueError(f"{where}.sigma must be > 0, got {out['sigma']}")
+    if out["fitness"] not in ("uniform", "resistance"):
+        raise ValueError(f"{where}.fitness must be 'uniform' or 'resistance', got "
+                         f"{out['fitness']!r}")
+    for key in ("per_row", "reevaluate_parent"):
+        if not isinstance(out[key], bool):
+            raise ValueError(f"{where}.{key} must be true or false, got {out[key]!r}")
+    n_T, n_p = len(re_cfg.get("temperatures_K") or []), len(re_cfg.get("pressures") or [])
+    if n_T < 3 and n_p < 3:
+        raise ValueError(f"{where} needs at least 3 temperatures or 3 pressures: the corners "
+                         f"of the ladder stay fixed")
+    most_gaps = max(n - 1 for n in (n_T, n_p) if n > 2)
+    if not 0.0 <= out["min_gap_fraction"] < 1.0 / most_gaps:
+        raise ValueError(f"{where}.min_gap_fraction must be in [0, 1/{most_gaps}), got "
+                         f"{out['min_gap_fraction']}")
     return out
 
 
@@ -2295,7 +2385,23 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
         print(f"replica grid: {len(temperatures_K)} T x {n_mu} "
               f"{'p' if pressures is not None else 'mu'} = {len(temperatures_K) * n_mu} replicas")
         adapt = sampling.get("adapt_ladder")
-        if adapt:
+        if adapt and adapt.get("method") == "es":
+            n_eval = adapt["generations"] * adapt["population"] + (
+                adapt["generations"] if adapt["reevaluate_parent"] else 1)
+            print(f"ladder ES (model free): {adapt['generations']} generations x "
+                  f"({adapt['population']} candidates"
+                  f"{' + parent' if adapt['reevaluate_parent'] else ''}) x "
+                  f"{adapt['eval_steps']} steps = {n_eval * (adapt['eval_steps'] or 0)} REGC "
+                  f"steps"
+                  + (f" (evaluations extended to >= {adapt['min_attempts_per_pair']} attempts "
+                     f"per pair, up to {adapt['eval_steps_max'] or 10 * adapt['eval_steps']} "
+                     f"steps each)" if adapt["min_attempts_per_pair"] else "")
+                  + (f" + {adapt['warmup_steps']} warm-up" if adapt["warmup_steps"] else "")
+                  + f" before the run (not counted in n_steps), sigma {adapt['sigma']:g}, "
+                  f"{adapt['fitness']} fitness, "
+                  f"{'one p ladder per T' if adapt['per_row'] else 'one shared p ladder'}; "
+                  f"then frozen")
+        elif adapt:
             print(f"adaptive ladder: after each of the first {adapt['chunks']} chunks (with >= "
                   f"{adapt['min_attempts']} swap attempts per pair), "
                   f"{'one p ladder per T' if adapt['per_row'] else 'one shared p ladder'}, gaps "
@@ -2634,7 +2740,8 @@ def run_from_config(config: Dict[str, Any], verbose: bool = True, resume: bool =
                     sim, out_dir, chunk=chunk, time_limit=None if limit is None else float(limit),
                     resume=resume, overwrite=overwrite, metadata=setup["metadata"],
                     progress=(lambda line: print(line, flush=True)) if verbose else None,
-                    adapt_ladder=_ladder_adapter(setup, sim), **common, **kwargs)
+                    adapt_ladder=_ladder_adapter(setup, sim, int(re_cfg.get("seed", 0))),
+                    **common, **kwargs)
                 finished = status.finished
             else:
                 sim.run_regc(**common, burn_in_steps=burn_in, verbose=verbose,
@@ -2680,9 +2787,9 @@ def run_from_config(config: Dict[str, Any], verbose: bool = True, resume: bool =
     return result
 
 
-def _ladder_adapter(setup: Dict[str, Any], sim) -> Any:
+def _ladder_adapter(setup: Dict[str, Any], sim, seed: int = 0) -> Any:
     """
-    The `LadderAdapter` of a run with ``replica_exchange.adapt_ladder``.
+    The ladder optimiser of a run with ``replica_exchange.adapt_ladder``.
 
     Parameters
     ----------
@@ -2690,13 +2797,15 @@ def _ladder_adapter(setup: Dict[str, Any], sim) -> Any:
         From `setup_from_config`.
     sim : ReplicaExchangeGCMC
         The simulation (its Lambda^3(T)).
+    seed : int, optional
+        The run seed (the ES's random stream). Default 0.
 
     Returns
     -------
-    regc.ladder.LadderAdapter or None
-        None without ``adapt_ladder``.
+    regc.ladder.LadderAdapter or regc.ladder.LadderES or None
+        None without ``adapt_ladder``; `LadderES` with ``method: es``.
     """
-    from .ladder import LadderAdapter
+    from .ladder import LadderAdapter, LadderES
     from .units import kelvin_to_eV
     settings = setup["metadata"]["sampling"].get("adapt_ladder")
     if not settings:
@@ -2705,10 +2814,13 @@ def _ladder_adapter(setup: Dict[str, Any], sim) -> Any:
 
     def mu_of(T, y):
         return feed.mu_at_T_eV(T, 10.0 ** y, unit=unit)
-    return LadderAdapter(mu_of, sim.lambda_cubed_of_T,
-                         [kelvin_to_eV(T) for T in setup["temperatures_K"]],
-                         np.log10(np.asarray(setup["pressures"], dtype=float)),
-                         kelvin_per_unit=1.0 / kelvin_to_eV(1.0), pressure_unit=unit, **settings)
+    args = (mu_of, sim.lambda_cubed_of_T, [kelvin_to_eV(T) for T in setup["temperatures_K"]],
+            np.log10(np.asarray(setup["pressures"], dtype=float)))
+    labels = dict(kelvin_per_unit=1.0 / kelvin_to_eV(1.0), pressure_unit=unit)
+    if settings.get("method") == "es":
+        es = {k: v for k, v in settings.items() if k != "method"}
+        return LadderES(*args, seed=seed, **labels, **es)
+    return LadderAdapter(*args, **labels, **settings)
 
 
 def _records_path(config: Dict[str, Any], out_dir: Optional[str] = None) -> str:
