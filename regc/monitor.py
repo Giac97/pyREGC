@@ -78,6 +78,92 @@ def _read_json(path: str) -> Optional[dict]:
         return None
 
 
+_ES_EVAL = re.compile(r"ladder ES (\d+)/(\d+) (.+?): fitness uniform ([-\d.eE+]+) \+- ([-\d.eE+na]+), "
+                      r"resistance ([-\d.eE+]+) \+- ([-\d.eE+na]+)")
+
+
+def _ladder_summary(d: str, log_path: Optional[str]) -> Optional[dict]:
+    """
+    The adaptive-ladder history of a run, light enough for the browser.
+
+    Reads ``ladder.json`` (written after every generation / adaptation) without the
+    per-pair counts, and adds the evaluations of the generation in progress from the
+    ES lines of the log.
+
+    Parameters
+    ----------
+    d : str
+        Run directory.
+    log_path : str or None
+        The run's log.
+
+    Returns
+    -------
+    dict or None
+        ``method``, ``settings``, ``initial``, ``frozen``, ``history`` (one entry per
+        generation or adaptation) and ``pending`` (evaluations logged for the next
+        generation); None if the run has no adaptive ladder.
+    """
+    lad = _read_json(os.path.join(d, "ladder.json"))
+    drop = {"pairs", "attempts", "accepted", "mu_grid", "rng_state", "kappa",
+            "predicted_before", "predicted_after", "measured"}
+    hist = []
+    for rec in (lad or {}).get("history", []):
+        r = {k: v for k, v in rec.items() if k not in drop}
+        if "evaluations" in r:
+            r["evaluations"] = [{k: v for k, v in e.items() if k not in drop}
+                                for e in r["evaluations"]]
+        hist.append(r)
+    pending, warm, total = [], None, None
+    if log_path and os.path.isfile(log_path):
+        try:
+            with open(log_path, errors="replace") as f:
+                lines = [ln for ln in f if "ladder ES" in ln]
+        except OSError:
+            lines = []
+        done = len([h for h in hist if "evaluations" in h])
+        for ln in lines:
+            if "warm-up" in ln:
+                warm = ln.strip()
+            m = _ES_EVAL.search(ln)
+            if m and int(m.group(1)) > done:
+                total = int(m.group(2))
+                f = lambda s: float(s) if s not in ("nan", "na") else None
+                pending.append({"generation": int(m.group(1)), "label": m.group(3),
+                                "fitness_uniform": f(m.group(4)), "fitness_uniform_se": f(m.group(5)),
+                                "fitness_resistance": f(m.group(6)),
+                                "fitness_resistance_se": f(m.group(7))})
+    if lad is None and not pending and warm is None:
+        return None
+    lad = lad or {}
+    return {"method": lad.get("method", "es" if (pending or warm) else None),
+            "settings": lad.get("settings"), "initial": lad.get("initial"),
+            "pressure_unit": lad.get("pressure_unit"), "frozen": lad.get("frozen", False),
+            "history": hist, "pending": pending, "warmup": warm, "generations": total}
+
+
+def _pid_alive(d: str) -> bool:
+    """
+    Whether the run's process (``run.pid`` in its directory) is alive.
+
+    Parameters
+    ----------
+    d : str
+        Run directory.
+
+    Returns
+    -------
+    bool
+        True if the pid file names a live process on this host.
+    """
+    try:
+        with open(os.path.join(d, "run.pid")) as f:
+            os.kill(int(f.read().strip()), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def parse_log(path: str, tail: int = 40) -> dict:
     """
     Progress, state and last lines of a run's log.
@@ -333,7 +419,7 @@ class Run:
                                        log and log["mtime"]) if t] or [0.0])
         finished = bool((log and log["finished"]) or (status and status.get("converged"))
                         or (status and status["n_steps"] and status["step"] >= status["n_steps"]
-                            and (not log or now - last_update > 30)))
+                            and (not log or now - last_update > 30) and not _pid_alive(d)))
         if log and log["error"] and not finished:
             state = "error"
         elif finished:
@@ -341,8 +427,9 @@ class Run:
         elif last_update == 0.0:
             state = "waiting"
         elif now - last_update > STALE_S:
-            # a heartbeat comes every few seconds; a log line may come every 10 % of the run
-            state = "stalled" if status else "quiet"
+            # a heartbeat comes every few seconds; a log line may come every 10 % of the run;
+            # ladder trials (ES) run without heartbeat, so a live process is still running
+            state = "running" if _pid_alive(d) else ("stalled" if status else "quiet")
         else:
             state = "running"
         step = n_steps = mean_n = None
@@ -392,6 +479,7 @@ class Run:
             "mixing": _read_json(os.path.join(d, "mixing.json")),
             "samples": samples, "records": records, "files": files, "images": images,
             "composition": composition or None,
+            "ladder": _ladder_summary(d, log_path),
             "history": [[t, s, m] for t, s, m in hist],
         }
 
@@ -829,6 +917,10 @@ header{padding:10px 12px}.updated{max-width:none;flex-basis:100%;order:9}}
 .note{font-size:12.5px;color:var(--muted)}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
 .plot{width:100%;height:300px}.plot.tall{height:380px}.plot.short{height:200px}
+.ladgrid{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr) minmax(0,1fr);gap:16px;margin-bottom:10px}
+.ladgrid .ph{font-size:12px;color:var(--muted);margin:0 0 4px}
+@media (max-width:1180px){.ladgrid{grid-template-columns:1fr}}
+td.win{font-weight:600}tr.kept td{opacity:.75}
 /* ---- progress ----------------------------------------------------------------------------- */
 .prog{display:flex;align-items:center;gap:14px;margin:4px 0 14px}
 .bar{flex:1;height:10px;background:var(--track);border-radius:999px;overflow:hidden}
@@ -952,6 +1044,12 @@ animation:blink 1.05s steps(1) infinite}
 <div class="prog"><div class="bar" role="progressbar" aria-label="run progress"><div id="pbar" style="width:0"></div></div><span class="pct" id="pct">0 %</span></div>
 <div class="kpis" id="kpis"></div><div class="where" id="where"></div></section>
 
+<section class="card" id="ladcard" hidden><div class="card-h"><h2>Adaptive ladder</h2><span class="sub" id="ladsub"></span></div>
+<div class="ladgrid"><div><p class="ph">fitness of every evaluated ladder (lower is better; ◆ parent, ● candidates, ring = survivor, hollow = generation in progress)</p><div id="ladfit" class="plot"></div></div>
+<div><p class="ph">temperature ladder per generation</p><div id="ladT" class="plot"></div></div>
+<div><div class="row" style="margin:0 0 4px"><span class="ph" style="margin:0">pressure ladder of</span><select id="ladrow" class="sel" aria-label="temperature row"></select></div><div id="ladp" class="plot"></div></div></div>
+<div class="tablewrap" id="ladtab"></div></section>
+
 <section class="card s7"><div class="card-h"><h2>Replica grid</h2><span class="sub">click a cell to show its traces</span></div>
 <div class="row"><select id="gridq" class="sel" aria-label="grid quantity">
 <option value="mean_N">mean N</option><option value="current_N">current N</option>
@@ -1073,10 +1171,61 @@ const ss=st&&st.subsurface;if(ss){const sp=ss.species.join("+");k.push([`subsurf
 ["subsurface removals accepted",`${ss.removed.toLocaleString()} / ${ss.delete_attempts.toLocaleString()}`])}
 $("kpis").innerHTML=k.map(([a,b])=>`<div class="kpi" title="${esc(a)}: ${esc(b)}"><b>${esc(b)}</b><span>${esc(a)}</span></div>`).join("");
 $("where").innerHTML=`<span title="${esc(d.directory)}">${esc(tail(d.directory,4))}</span>`+(st?"":`<span>no status.json: progress from the log only</span>`);
-drawGrid(d);drawTraces(d);drawComp(d);drawHist(d);drawSwaps(d);drawConv(d);drawData(d);renderLog(d);
+drawLadder(d);drawGrid(d);drawTraces(d);drawComp(d);drawHist(d);drawSwaps(d);drawConv(d);drawData(d);renderLog(d);
 const imgs=d.images||[];$("imgcard").hidden=!imgs.length;
 $("imgs").innerHTML=imgs.map(n=>`<a href="file/${cur}/${encodeURIComponent(n)}" target="_blank" rel="noopener"><img loading="lazy" src="file/${cur}/${encodeURIComponent(n)}?t=${Math.round(d.now)}" alt="${esc(n)}"><div class="note" title="${esc(n)}">${esc(n)}</div></a>`).join("");}
 const allNull=z=>!z||!z.flat().some(v=>v!=null);
+function drawLadder(d){const L=d.ladder;$("ladcard").hidden=!L;if(!L)return;
+const es=L.method==="es",fk=(L.settings&&L.settings.fitness)||"uniform",H=L.history||[],P=L.pending||[];
+const gens=H.filter(h=>h.evaluations),total=L.generations||(L.settings&&(L.settings.generations||L.settings.chunks))||"?";
+$("ladsub").textContent=es?`evolution strategy · generation ${gens.length}/${total}${P.length&&!L.frozen?` (generation ${gens.length+1} running: ${P.length} evaluated)`:""} · fitness: ${fk}${L.frozen?" · frozen":""}`
+:`model-based · ${H.length} adaptation(s)${L.frozen?" · frozen":""}`;
+/* fitness per generation */
+const tr=[];const key="fitness_"+fk,sk=key+"_se";
+if(es){const xs=[],ys=[],es_=[],sym=[],col=[],size=[],txt=[],line=[];
+gens.forEach(h=>{h.evaluations.forEach((e,k)=>{const par=/parent/i.test(e.label),win=k===h.survivor;
+xs.push(h.generation+(k-(h.evaluations.length-1)/2)*0.09);ys.push(e[key]);es_.push(e[sk]||0);
+sym.push(par?"diamond":"circle");size.push(win?13:8);col.push(win?C("--accent"):C("--warn"));
+txt.push(`gen ${h.generation} · ${e.label}${win?" (survivor)":""}<br>${fk} ${fmtN(e[key],4)} ± ${fmtN(e[sk],2)}<br>R_T ${fmtN(e.R_T,3)}, R_μ ${fmtN(e.R_mu,3)}`)});
+line.push([h.generation,h.fitness])});
+tr.push({x:xs,y:ys,mode:"markers",type:"scatter",name:"evaluations",error_y:{type:"data",array:es_,visible:true,thickness:1,width:3,color:C("--warn")},
+marker:{symbol:sym,size,color:col,line:{width:1.5,color:C("--accent")}},text:txt,hovertemplate:"%{text}<extra></extra>"});
+if(line.length)tr.push({x:line.map(l=>l[0]),y:line.map(l=>l[1]),mode:"lines",name:"kept ladder",line:{color:C("--accent"),width:2}});
+if(P.length){const g0=P[0].generation,n=P.length;tr.push({x:P.map((e,k)=>e.generation+(k-(n-1)/2)*0.09),y:P.map(e=>e[key]),
+error_y:{type:"data",array:P.map(e=>e[sk]||0),visible:true,thickness:1,width:3,color:C("--ok")},mode:"markers",name:`generation ${g0} (running)`,
+marker:{symbol:P.map(e=>/parent/i.test(e.label)?"diamond-open":"circle-open"),size:10,color:C("--ok"),line:{width:2}},
+text:P.map(e=>`gen ${e.generation} · ${e.label}<br>${fk} ${fmtN(e[key],4)} ± ${fmtN(e[sk],2)}`),hovertemplate:"%{text}<extra></extra>"})}
+Plotly.react("ladfit",tr,layout({xaxis:{title:"generation",dtick:1},yaxis:{title:`${fk} fitness`},showlegend:true}),cfg)}
+else{const x=H.map((_,i)=>i+1);Plotly.react("ladfit",[
+{x,y:H.map(h=>(h.resistance_before||[])[0]),name:"R_T before",mode:"lines+markers",line:{color:C("--accent"),dash:"dot"}},
+{x,y:H.map(h=>(h.resistance_after||[])[0]),name:"R_T predicted",mode:"lines+markers",line:{color:C("--accent")}},
+{x,y:H.map(h=>(h.resistance_before||[])[1]),name:"R_μ before",mode:"lines+markers",line:{color:C("--warn"),dash:"dot"}},
+{x,y:H.map(h=>(h.resistance_after||[])[1]),name:"R_μ predicted",mode:"lines+markers",line:{color:C("--warn")}}],
+layout({xaxis:{title:"adaptation",dtick:1},yaxis:{title:"effective resistance"}}),cfg)}
+/* ladder evolution: generation 0 = initial ladder */
+const init=L.initial||{};const steps=[{g:0,T:init.temperatures_K||init.temperatures,Y:init.log10p}];
+(es?gens:H).forEach((h,i)=>steps.push({g:es?h.generation:i+1,T:h.temperatures_K||h.temperatures,Y:h.log10p}));
+const ok=steps.filter(s=>s.T&&s.Y);if(!ok.length){empty("ladT","No ladder recorded yet.");empty("ladp","–");$("ladtab").innerHTML="";return}
+const nT=ok[0].T.length,nM=ok[0].Y[0].length,gx=ok.map(s=>s.g);
+Plotly.react("ladT",[...Array(nT).keys()].map(i=>({x:gx,y:ok.map(s=>s.T[i]),mode:"lines+markers",name:`T${i}`,showlegend:false,
+line:{color:C(i==0||i==nT-1?"--warn":"--accent"),width:i==0||i==nT-1?1:2},marker:{size:5},hovertemplate:`rung ${i}: %{y:.0f} K (gen %{x})<extra></extra>`})),
+layout({xaxis:{title:"generation",dtick:1},yaxis:{title:"T (K)"}}),cfg);
+const rs=$("ladrow");const opts=ok[ok.length-1].T.map((t,i)=>`<option value="${i}">${(+t).toFixed(0)} K row</option>`).join("");
+if(rs.dataset.n!=String(nT)){rs.innerHTML=opts;rs.dataset.n=String(nT)}
+const r=+rs.value||0;const u=L.pressure_unit||"bar";
+Plotly.react("ladp",[...Array(nM).keys()].map(j=>({x:gx,y:ok.map(s=>s.Y[r][j]),mode:"lines+markers",name:`p${j}`,showlegend:false,
+line:{color:C(j==0||j==nM-1?"--warn":"--accent"),width:j==0||j==nM-1?1:2},marker:{size:5},hovertemplate:`column ${j}: 10^%{y:.2f} ${u} (gen %{x})<extra></extra>`})),
+layout({xaxis:{title:"generation",dtick:1},yaxis:{title:`log₁₀ p (${u})`}}),cfg);
+/* table */
+if(es){$("ladtab").innerHTML=`<table><tr><th>gen</th><th class="num">parent ${fk}</th><th class="num">best candidate</th><th class="num">Δ / σ</th><th>survivor</th><th class="num">steps / eval</th><th class="num">time</th></tr>${gens.map(h=>{
+const ev=h.evaluations,pi=ev.findIndex(e=>/parent/i.test(e.label)),cand=ev.filter((e,k)=>k!==pi),best=cand.reduce((a,b)=>a&&a[key]<=b[key]?a:b,null),par=pi>=0?ev[pi]:null;
+const pf=par?par[key]:h.parent_fitness,ps=par?par[sk]:h.parent_fitness_se;const dz=best&&pf!=null?(best[key]-pf)/Math.hypot(best[sk]||0,ps||0):null;
+const steps_=ev.map(e=>e.steps).filter(x=>x!=null),secs=ev.reduce((s,e)=>s+(e.seconds||0),0);
+return `<tr class="${h.changed?"":"kept"}"><td>${h.generation}</td><td class="num">${fmtN(pf,4)} ± ${fmtN(ps,2)}</td><td class="num">${best?fmtN(best[key],4)+" ± "+fmtN(best[sk],2):"–"}</td><td class="num">${dz==null||!isFinite(dz)?"–":(dz>0?"+":"")+dz.toFixed(Math.abs(dz)<1?2:1)}</td>
+<td class="${h.changed?"win":""}">${h.changed?esc(ev[h.survivor].label):"parent kept"}</td><td class="num">${steps_.length?Math.round(steps_.reduce((a,b)=>a+b)/steps_.length):"–"}</td><td class="num">${fmtT(secs)}</td></tr>`}).join("")}</table>
+<p class="note">Δ / σ: best candidate minus parent, in combined standard errors; a survivor with |Δ/σ| ≲ 2 is within the noise.${L.warmup?` · ${esc(L.warmup.replace(/^.*?warm-up:\s*/,"warm-up: "))}`:""}</p>`}
+else $("ladtab").innerHTML="";}
+$("ladrow").onchange=()=>last&&drawLadder(last);
 function gridData(d){const st=d.status;if(st){const q=$("gridq").value;let z=st.replicas[q],note="";
 const cur={mean_N:"current_N",std_N:"current_N",mean_U:"current_U",n_samples:"current_N"}[q];
 if(allNull(z)&&cur&&!allNull(st.replicas[cur])){z=st.replicas[cur];note=`No samples recorded yet (warm-up, ladder trials or burn-in): showing ${cur.replace("_"," ")} instead.`}
