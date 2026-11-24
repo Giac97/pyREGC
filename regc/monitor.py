@@ -760,86 +760,248 @@ def main(argv: Optional[list] = None) -> int:
 
 
 PAGE = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
+<html lang="en" data-theme="auto"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>regc monitor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Fira+Sans:wght@400;500;600;700&family=VT323&display=swap">
 <script src="plotly.min.js"></script>
 <script>if(typeof Plotly==="undefined")document.write('<script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"><\/script>')</script>
 <script>if(typeof Plotly==="undefined")document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.27.0/plotly.min.js"><\/script>')</script>
+<script>try{const t=localStorage.getItem("regc.theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
 <style>
-:root{--bg:#f7f7f5;--panel:#fff;--ink:#1d1d1f;--muted:#6b6b70;--line:#e2e2e0;--accent:#0072b2;
---ok:#009e73;--warn:#e69f00;--bad:#d55e00;--idle:#8a8a8f;--track:#ececea}
-@media (prefers-color-scheme:dark){:root{--bg:#141416;--panel:#1d1d20;--ink:#ececee;--muted:#9a9aa2;
---line:#2e2e33;--accent:#56b4e9;--ok:#2fc39a;--warn:#f0b43c;--bad:#ff7a3d;--idle:#7d7d85;--track:#2a2a2f}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);
-font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
-header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:14px 20px;
-border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
-h1{font-size:16px;margin:0 8px 0 0;font-weight:650}select,button{font:inherit;color:var(--ink);
-background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:4px 8px}
-.badge{border-radius:999px;padding:2px 10px;font-weight:600;font-size:12px;color:#fff}
-.running{background:var(--ok)}.finished{background:var(--accent)}.stalled{background:var(--warn)}
+/* ---- tokens: light, dark (auto follows the system), CRT phosphors ------------------------ */
+:root{--bg:#f3f5f9;--panel:#ffffff;--panel2:#f7f9fc;--ink:#0f172a;--muted:#55607a;--line:#e1e6ef;
+--accent:#0a6cc2;--accent-ink:#ffffff;--ok:#12a150;--warn:#b77900;--bad:#d1432c;--idle:#6f7a90;--track:#e6ebf3;
+--shadow:0 1px 2px rgba(15,23,42,.06),0 4px 16px rgba(15,23,42,.05);
+--sans:"Fira Sans",system-ui,-apple-system,"Segoe UI",sans-serif;--mono:"Fira Code",ui-monospace,Menlo,Consolas,monospace;
+--crt:"VT323","Courier New",ui-monospace,monospace;--radius:12px}
+:root[data-theme="dark"]{--bg:#0b1020;--panel:#121a2b;--panel2:#162036;--ink:#e6ebf5;--muted:#9aa7c0;--line:#24304a;
+--accent:#4cc2ff;--accent-ink:#06121f;--ok:#2fd37a;--warn:#f5b83d;--bad:#ff6b5a;--idle:#7c879c;--track:#1d2840;
+--shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.25)}
+@media (prefers-color-scheme:dark){:root[data-theme="auto"]{--bg:#0b1020;--panel:#121a2b;--panel2:#162036;--ink:#e6ebf5;
+--muted:#9aa7c0;--line:#24304a;--accent:#4cc2ff;--accent-ink:#06121f;--ok:#2fd37a;--warn:#f5b83d;--bad:#ff6b5a;--idle:#7c879c;
+--track:#1d2840;--shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.25)}}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--sans);transition:background .2s,color .2s}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
+button,select,input{font:inherit;color:var(--ink)}
+/* ---- header ------------------------------------------------------------------------------- */
+header{position:sticky;top:0;z-index:10;display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;
+padding:10px 24px;background:color-mix(in srgb,var(--panel) 88%,transparent);backdrop-filter:blur(10px);
+border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:16px;letter-spacing:.01em;white-space:nowrap}
+.brand svg{width:26px;height:26px;flex:none}
+.sel{appearance:none;background:var(--panel2) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2388a' stroke-width='2.5'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") no-repeat right 10px center;
+border:1px solid var(--line);border-radius:8px;padding:6px 30px 6px 10px;min-height:36px;cursor:pointer;max-width:min(52vw,420px);
+text-overflow:ellipsis;transition:border-color .15s}
+.sel:hover{border-color:var(--accent)}
+.pill{display:inline-flex;align-items:center;gap:7px;border-radius:999px;padding:4px 12px 4px 10px;font-size:12px;font-weight:600;
+text-transform:uppercase;letter-spacing:.06em;color:#fff;white-space:nowrap}
+.pill i{width:8px;height:8px;border-radius:50%;background:currentColor;opacity:.9}
+.running{background:var(--ok)}.finished{background:var(--accent);color:var(--accent-ink)}.stalled{background:var(--warn);color:#1a1200}
 .error{background:var(--bad)}.waiting,.quiet{background:var(--idle)}
-.muted{color:var(--muted)}main{padding:16px 20px;display:grid;gap:16px;
-grid-template-columns:repeat(auto-fit,minmax(420px,1fr))}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;min-width:0}
-.card h2{font-size:13px;margin:0 0 8px;font-weight:650;letter-spacing:.02em;text-transform:uppercase;
-color:var(--muted)}.wide{grid-column:1/-1}
-.bar{height:10px;background:var(--track);border-radius:6px;overflow:hidden;margin:8px 0}
-.bar>div{height:100%;background:var(--accent);transition:width .6s}
-.kpis{display:flex;flex-wrap:wrap;gap:22px}.kpi b{display:block;font-size:20px;font-weight:650;
-font-variant-numeric:tabular-nums}.kpi span{font-size:12px;color:var(--muted)}
+.running i{animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(255,255,255,.7)}50%{box-shadow:0 0 0 5px rgba(255,255,255,0)}}
+.updated{color:var(--muted);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:40ch}
+.spacer{flex:1}
+.toggle{display:inline-flex;align-items:center;gap:8px;cursor:pointer;color:var(--muted);font-size:13px;white-space:nowrap;
+min-height:36px;user-select:none}
+.toggle input{appearance:none;width:34px;height:20px;border-radius:999px;background:var(--track);position:relative;cursor:pointer;
+transition:background .2s;flex:none;margin:0}
+.toggle input::after{content:"";position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;background:#fff;
+box-shadow:0 1px 2px rgba(0,0,0,.3);transition:transform .2s}
+.toggle input:checked{background:var(--accent)}.toggle input:checked::after{transform:translateX(14px)}
+.iconbtn{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:8px;cursor:pointer;
+background:var(--panel2);border:1px solid var(--line);transition:border-color .15s,transform .15s}
+.iconbtn:hover{border-color:var(--accent)}.iconbtn svg{width:18px;height:18px}
+/* ---- layout ------------------------------------------------------------------------------- */
+main{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:16px;padding:18px 24px 28px;max-width:1800px;margin:0 auto}
+.card{grid-column:span 12;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px 12px;
+box-shadow:var(--shadow);min-width:0;display:flex;flex-direction:column}
+.s8{grid-column:span 8}.s7{grid-column:span 7}.s6{grid-column:span 6}.s5{grid-column:span 5}.s4{grid-column:span 4}
+@media (max-width:1180px){.s8,.s7,.s6,.s5,.s4{grid-column:span 6}}
+@media (max-width:760px){main{grid-template-columns:1fr;padding:12px}.card,.s8,.s7,.s6,.s5,.s4{grid-column:1/-1}
+header{padding:10px 12px}.updated{max-width:none;flex-basis:100%;order:9}}
+.card-h{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin:0 0 8px;min-width:0}
+.card-h h2{font-size:12px;margin:0;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);white-space:nowrap}
+.sub{font-size:12px;color:var(--muted);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.note{font-size:12.5px;color:var(--muted)}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
+.plot{width:100%;height:300px}.plot.tall{height:380px}.plot.short{height:200px}
+/* ---- progress ----------------------------------------------------------------------------- */
+.prog{display:flex;align-items:center;gap:14px;margin:4px 0 14px}
+.bar{flex:1;height:10px;background:var(--track);border-radius:999px;overflow:hidden}
+.bar>div{height:100%;background:linear-gradient(90deg,var(--accent),color-mix(in srgb,var(--accent) 60%,var(--ok)));
+border-radius:999px;transition:width .6s ease}
+.pct{font:600 15px var(--mono);font-variant-numeric:tabular-nums;min-width:6ch;text-align:right}
+.kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.kpi{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;min-width:0}
+.kpi b{display:block;font:600 19px/1.25 var(--sans);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kpi span{display:block;font-size:12px;color:var(--muted);margin-top:2px;overflow-wrap:anywhere}
+.where{margin-top:10px;font:12px var(--mono);color:var(--muted);display:flex;gap:16px;flex-wrap:wrap}
+.where span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+/* ---- tables ------------------------------------------------------------------------------- */
+.tablewrap{overflow-x:auto}
 table{border-collapse:collapse;width:100%;font-size:13px;font-variant-numeric:tabular-nums}
-td,th{padding:3px 6px;border-bottom:1px solid var(--line);text-align:left}th{color:var(--muted);font-weight:600}
-pre{margin:0;max-height:260px;overflow:auto;font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;
-white-space:pre-wrap}.plot{width:100%;height:300px}.imgs{display:flex;flex-wrap:wrap;gap:10px}
-.imgs a{flex:1 1 220px}.imgs img{width:100%;border:1px solid var(--line);border-radius:6px;background:#fff}
-.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
-.note{font-size:12px;color:var(--muted)}
-@media (max-width:520px){main{grid-template-columns:1fr;padding:12px}header{padding:12px}}
+td,th{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:12px;white-space:nowrap}
+td.num,th.num{text-align:right;white-space:nowrap}td.nw{white-space:nowrap}
+td.file{font-family:var(--mono);font-size:12.5px;white-space:nowrap}
+tr:hover td{background:var(--panel2)}
+.imgs{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px}
+.imgs a{color:inherit;text-decoration:none;min-width:0}.imgs img{width:100%;border:1px solid var(--line);border-radius:8px;background:#fff;
+transition:transform .15s}.imgs a:hover img{transform:translateY(-2px)}
+.imgs .note{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:4px}
+/* ---- log, modern ---------------------------------------------------------------------------- */
+.logbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:10px}
+.chip{font:12px var(--mono);color:var(--muted);background:var(--panel2);border:1px solid var(--line);border-radius:6px;
+padding:2px 8px;max-width:min(60vw,640px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.screen{position:relative;border-radius:10px;background:var(--panel2);border:1px solid var(--line)}
+pre#log{margin:0;height:380px;overflow:auto;padding:12px 14px;font:12.5px/1.55 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
+pre#log.nowrap{white-space:pre;overflow-wrap:normal}
+.bezel-label,.led{display:none}
+.phos{display:none}
+/* ---- log, vintage CRT (1960s/70s video terminal) ---------------------------------------------- */
+.crt-on{--ph:#41ff7a;--ph-dim:#1f9f4a;--ph-glow:rgba(65,255,122,.45);--glass:#0d1a10,#050906,#010201}
+.crt-on.ph-amber{--ph:#ffb238;--ph-dim:#a8701a;--ph-glow:rgba(255,178,56,.42)}
+.crt-on.ph-white{--ph:#e9f1ff;--ph-dim:#8995a8;--ph-glow:rgba(205,222,255,.35)}
+.crt-on .phos{display:inline-flex}
+.crt-on .bezel{padding:22px 24px 34px;border-radius:26px;position:relative;
+background:linear-gradient(160deg,#e3dbc6 0%,#cfc6ae 45%,#b9b099 100%);
+box-shadow:inset 0 2px 0 rgba(255,255,255,.6),inset 0 -3px 0 rgba(0,0,0,.18),0 10px 30px rgba(0,0,0,.35)}
+.crt-on .bezel-label{display:block;position:absolute;left:28px;bottom:9px;font:600 11px/1 var(--sans);letter-spacing:.22em;
+color:#6a6352;text-shadow:0 1px 0 rgba(255,255,255,.55)}
+.crt-on .led{display:block;position:absolute;right:30px;bottom:11px;width:9px;height:9px;border-radius:50%;
+background:var(--ph);box-shadow:0 0 6px var(--ph),0 0 14px var(--ph-glow)}
+.crt-on .screen{border:0;border-radius:22px/30px;overflow:hidden;
+background:radial-gradient(ellipse at 50% 45%,#0d1a10 0%,#050906 62%,#010201 100%);
+box-shadow:inset 0 0 70px rgba(0,0,0,.95),inset 0 0 10px rgba(0,0,0,.9),0 0 0 3px #2c2a24,0 0 0 6px #191814}
+.crt-on.ph-amber .screen{background:radial-gradient(ellipse at 50% 45%,#1d1406 0%,#0b0703 62%,#020100 100%)}
+.crt-on.ph-white .screen{background:radial-gradient(ellipse at 50% 45%,#141922 0%,#07090d 62%,#010102 100%)}
+.crt-on pre#log{font:20px/1.18 var(--crt);color:var(--ph);padding:22px 26px;height:420px;letter-spacing:.02em;
+text-shadow:0 0 1px var(--ph),0 0 6px var(--ph-glow),0 0 14px var(--ph-glow);scrollbar-color:var(--ph-dim) transparent;
+animation:flicker 4s infinite steps(1)}
+.crt-on pre#log::selection{background:var(--ph);color:#000}
+.crt-on .screen::before{content:"";position:absolute;inset:0;pointer-events:none;z-index:2;
+background:repeating-linear-gradient(to bottom,rgba(0,0,0,.32) 0,rgba(0,0,0,.32) 1px,transparent 2px,transparent 3px)}
+.crt-on .screen::after{content:"";position:absolute;inset:0;pointer-events:none;z-index:3;
+background:radial-gradient(ellipse at center,transparent 55%,rgba(0,0,0,.55) 100%),
+linear-gradient(to bottom,rgba(255,255,255,.05),transparent 30%);mix-blend-mode:normal}
+.crt-on .cursor{display:inline-block;width:.6em;height:1em;vertical-align:-.12em;background:var(--ph);box-shadow:0 0 8px var(--ph-glow);
+animation:blink 1.05s steps(1) infinite}
+.cursor{display:none}
+.crt-on .screen.boot pre#log{animation:boot .5s ease-out,flicker 4s infinite steps(1)}
+@keyframes blink{50%{opacity:0}}
+@keyframes flicker{0%{opacity:1}47%{opacity:.985}48%{opacity:1}83%{opacity:.975}84%{opacity:1}}
+@keyframes boot{0%{transform:scaleY(.01);filter:brightness(3)}60%{transform:scaleY(1);filter:brightness(1.6)}100%{filter:none}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+.phos select{min-height:30px;padding:3px 28px 3px 8px}
 </style></head><body>
-<header><h1>regc monitor</h1><select id="run"></select><span id="badge" class="badge waiting">…</span>
-<span id="updated" class="muted"></span><span style="flex:1"></span>
-<label class="muted"><input type="checkbox" id="auto" checked> refresh every 5 s</label></header>
+<header>
+<div class="brand"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="2" y="2" width="28" height="28" rx="7" fill="var(--accent)"/>
+<g fill="var(--accent-ink)" opacity=".95"><rect x="8" y="8" width="5" height="5" rx="1"/><rect x="15" y="8" width="5" height="5" rx="1" opacity=".6"/>
+<rect x="22" y="8" width="3" height="5" rx="1" opacity=".35"/><rect x="8" y="15" width="5" height="5" rx="1" opacity=".6"/>
+<rect x="15" y="15" width="5" height="5" rx="1"/><rect x="22" y="15" width="3" height="5" rx="1" opacity=".6"/>
+<rect x="8" y="22" width="5" height="3" rx="1" opacity=".35"/><rect x="15" y="22" width="5" height="3" rx="1" opacity=".6"/>
+<rect x="22" y="22" width="3" height="3" rx="1"/></g></svg><span>regc monitor</span></div>
+<label class="visually-hidden" for="run" style="position:absolute;left:-9999px">run</label>
+<select id="run" class="sel" aria-label="run"></select>
+<span id="badge" class="pill waiting" role="status"><i></i><span id="badgetxt">…</span></span>
+<span id="updated" class="updated"></span><span class="spacer"></span>
+<label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh 5 s</label>
+<button class="iconbtn" id="theme" type="button" aria-label="colour theme" title="colour theme"></button>
+</header>
 <main>
-<section class="card wide"><h2>Progress</h2><div class="bar"><div id="pbar" style="width:0"></div></div>
-<div class="kpis" id="kpis"></div><div class="note" id="where"></div></section>
-<section class="card"><h2>Replica grid</h2><div class="row"><select id="gridq">
+<section class="card"><div class="card-h"><h2>Progress</h2><span class="sub" id="stepline"></span></div>
+<div class="prog"><div class="bar" role="progressbar" aria-label="run progress"><div id="pbar" style="width:0"></div></div><span class="pct" id="pct">0 %</span></div>
+<div class="kpis" id="kpis"></div><div class="where" id="where"></div></section>
+
+<section class="card s7"><div class="card-h"><h2>Replica grid</h2><span class="sub">click a cell to show its traces</span></div>
+<div class="row"><select id="gridq" class="sel" aria-label="grid quantity">
 <option value="mean_N">mean N</option><option value="current_N">current N</option>
 <option value="std_N">std of N</option><option value="n_samples">samples</option>
 <option value="mean_U">mean U (eV)</option><option value="current_U">current U (eV)</option>
 <option value="mean_N_ads">mean N adsorbed</option><option value="mean_N_sub">mean N subsurface</option>
 <option value="current_N_sub">current N subsurface</option><option value="sub_accepted">subsurface moves accepted</option>
-<option value="sub_acceptance">subsurface acceptance</option></select>
-<span class="note">click a cell to show its traces</span></div><div id="grid" class="plot"></div></section>
-<section class="card"><h2>Traces <span id="tracekey" class="muted"></span></h2><div id="traces" class="plot"></div></section>
-<section class="card" id="compcard" hidden><h2>Substrate composition</h2><div class="row"><select id="compq"></select>
-<span class="note">click a cell to show its traces</span></div><div id="compgrid" class="plot"></div>
-<div class="note" id="compsrc"></div></section>
-<section class="card" id="comptrcard" hidden><h2>Composition traces <span id="comptrkey" class="muted"></span></h2><div id="comptr" class="plot"></div></section>
-<section class="card"><h2>Mean N across the grid</h2><div id="hist" class="plot"></div></section>
-<section class="card"><h2>Replica exchange</h2><div id="swaps" class="plot" style="height:220px"></div>
-<div id="pairs"></div></section>
-<section class="card"><h2>Round trips per walker</h2><div id="trips" class="plot"></div></section>
-<section class="card"><h2>Convergence of ρ(u)</h2><div id="conv" class="plot"></div></section>
-<section class="card"><h2>Available data</h2><div id="data"></div></section>
-<section class="card wide" id="imgcard" hidden><h2>Plots</h2><div class="imgs" id="imgs"></div></section>
-<section class="card wide"><h2>Log <span id="logname" class="muted"></span></h2><pre id="log"></pre></section>
+<option value="sub_acceptance">subsurface acceptance</option></select></div>
+<div id="grid" class="plot tall"></div><div class="note" id="gridnote"></div></section>
+<section class="card s5"><div class="card-h"><h2>Traces</h2><span id="tracekey" class="sub"></span></div><div id="traces" class="plot tall"></div></section>
+
+<section class="card s7" id="compcard" hidden><div class="card-h"><h2>Substrate composition</h2><span class="sub">click a cell to show its traces</span></div>
+<div class="row"><select id="compq" class="sel" aria-label="composition quantity"></select></div>
+<div id="compgrid" class="plot tall"></div><div class="note" id="compsrc"></div></section>
+<section class="card s5" id="comptrcard" hidden><div class="card-h"><h2>Composition traces</h2><span id="comptrkey" class="sub"></span></div><div id="comptr" class="plot tall"></div></section>
+
+<section class="card s4"><div class="card-h"><h2>Mean N across the grid</h2></div><div id="hist" class="plot"></div></section>
+<section class="card s4"><div class="card-h"><h2>Replica exchange</h2><span class="sub">acceptance per swap pattern</span></div>
+<div id="swaps" class="plot short"></div><div class="tablewrap" id="pairs"></div></section>
+<section class="card s4"><div class="card-h"><h2>Round trips per walker</h2></div><div id="trips" class="plot"></div></section>
+
+<section class="card s6"><div class="card-h"><h2>Convergence of ρ(u)</h2><span class="sub" id="convsub"></span></div><div id="conv" class="plot"></div></section>
+<section class="card s6"><div class="card-h"><h2>Available data</h2></div><div class="tablewrap" id="data"></div></section>
+
+<section class="card" id="imgcard" hidden><div class="card-h"><h2>Plots</h2></div><div class="imgs" id="imgs"></div></section>
+
+<section class="card" id="logcard"><div class="logbar"><div class="card-h" style="margin:0"><h2>Log</h2></div>
+<span id="logname" class="chip"></span><span class="spacer"></span>
+<label class="toggle"><input type="checkbox" id="follow" checked> follow</label>
+<label class="toggle"><input type="checkbox" id="wrap" checked> wrap</label>
+<label class="toggle" title="1960s/70s video terminal"><input type="checkbox" id="crt"> vintage</label>
+<label class="phos toggle">phosphor <select id="phosphor" class="sel" aria-label="phosphor colour">
+<option value="green">P1 green</option><option value="amber">P3 amber</option><option value="white">P4 white</option></select></label></div>
+<div class="bezel"><div class="screen" id="screen"><pre id="log" tabindex="0" aria-label="run log"></pre></div>
+<span class="bezel-label">REGC&nbsp;&nbsp;MODEL&nbsp;1970&nbsp;&nbsp;VIDEO&nbsp;DISPLAY&nbsp;TERMINAL</span><span class="led" aria-hidden="true"></span></div></section>
 </main>
 <script>
 const $=id=>document.getElementById(id);let runs=[],cur=0,sel=null,last=null;
+const store={get(k,d){try{const v=localStorage.getItem("regc."+k);return v==null?d:v}catch(e){return d}},
+set(k,v){try{localStorage.setItem("regc."+k,v)}catch(e){}}};
 const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
-const fmtT=s=>{if(s==null||!isFinite(s))return"–";s=Math.round(s);const h=Math.floor(s/3600),m=Math.floor(s%3600/60);
-return h?`${h} h ${m} min`:m?`${m} min ${s%60} s`:`${s} s`};
+const fmtT=s=>{if(s==null||!isFinite(s))return"–";s=Math.round(s);const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
+return d?`${d} d ${h} h`:h?`${h} h ${m} min`:m?`${m} min ${s%60} s`:`${s} s`};
 const fmtB=b=>b>1e9?(b/1e9).toFixed(2)+" GB":b>1e6?(b/1e6).toFixed(1)+" MB":b>1e3?(b/1e3).toFixed(0)+" kB":b+" B";
 const fmtN=(x,d=3)=>x==null||!isFinite(x)?"–":Number(x).toPrecision(d).replace("-","−");
 const fmtP=x=>{const a=Math.abs(x);return (a&&(a<1e-2||a>=1e4)?Number(x).toExponential(2).replace("e+","e").replace(/e(-?)0*(\d)/,"e$1$2"):Number(x).toPrecision(3)).replace("-","−")};
-function layout(extra){const ink=css("--ink"),line=css("--line");return Object.assign({margin:{l:52,r:12,t:8,b:42},
-paper_bgcolor:"rgba(0,0,0,0)",plot_bgcolor:"rgba(0,0,0,0)",font:{color:ink,size:11},
-xaxis:{gridcolor:line,zerolinecolor:line},yaxis:{gridcolor:line,zerolinecolor:line},
-legend:{orientation:"h",y:1.12},hovermode:"closest"},extra||{})}
-const cfg={displaylogo:false,responsive:true,modeBarButtonsToRemove:["lasso2d","select2d"]};
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const ord=n=>n+(n%100>=11&&n%100<=13?"th":["th","st","nd","rd"][n%10]||"th");
+const tail=(p,n=3)=>{if(!p)return"";const a=String(p).split("/").filter(Boolean);return a.length>n?"…/"+a.slice(-n).join("/"):p};
+/* ---- theme ---------------------------------------------------------------------------------- */
+const ICON={auto:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor"/></svg>',
+light:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>',
+dark:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>'};
+function setTheme(t){document.documentElement.dataset.theme=t;store.set("theme",t);$("theme").innerHTML=ICON[t];
+$("theme").title=$("theme").ariaLabel=`colour theme: ${t} (click to change)`;if(last)draw(last)}
+$("theme").onclick=()=>{const o=["auto","light","dark"],t=document.documentElement.dataset.theme;setTheme(o[(o.indexOf(t)+1)%3])};
+matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change",()=>last&&draw(last));
+/* ---- log controls --------------------------------------------------------------------------- */
+function setCrt(on,boot){$("logcard").classList.toggle("crt-on",on);$("crt").checked=on;store.set("crt",on?"1":"0");
+if(on&&boot){const s=$("screen");s.classList.remove("boot");void s.offsetWidth;s.classList.add("boot")}renderLog(last)}
+$("crt").onchange=()=>setCrt($("crt").checked,true);
+$("phosphor").onchange=()=>{const p=$("phosphor").value;$("logcard").classList.remove("ph-amber","ph-white");if(p!="green")$("logcard").classList.add("ph-"+p);store.set("phosphor",p)};
+$("wrap").onchange=()=>{$("log").classList.toggle("nowrap",!$("wrap").checked);store.set("wrap",$("wrap").checked?"1":"0")};
+$("follow").onchange=()=>{store.set("follow",$("follow").checked?"1":"0");if($("follow").checked)$("log").scrollTop=1e9};
+$("log").addEventListener("scroll",()=>{const l=$("log");const atEnd=l.scrollHeight-l.scrollTop-l.clientHeight<24;
+if(!atEnd&&$("follow").checked&&!l._prog){$("follow").checked=false;store.set("follow","0")}});
+function renderLog(d){const l=$("log");if(!d){return}const crt=$("logcard").classList.contains("crt-on");
+const lines=d.log?d.log.tail:["(no log)"];
+let text=lines.join("\n");if(crt){text=`REGC RUN MONITOR  ·  ${new Date().toISOString().slice(0,19).replace("T"," ")} UTC\n`+
+`${"=".repeat(64)}\n`+text}
+const atEnd=l.scrollHeight-l.scrollTop-l.clientHeight<24;l.innerHTML=esc(text)+(crt?'\n<span class="cursor"></span>':"");
+if($("follow").checked||atEnd){l._prog=true;l.scrollTop=l.scrollHeight;setTimeout(()=>l._prog=false,50)}
+$("logname").textContent=d.log?tail(d.log.path,3):"";$("logname").title=d.log?d.log.path:""}
+/* ---- plotly ----------------------------------------------------------------------------------- */
+function layout(extra){const ink=css("--ink"),line=css("--line"),mut=css("--muted");
+const ax={gridcolor:line,zerolinecolor:line,linecolor:line,automargin:true,tickfont:{color:mut,size:11},title:{standoff:10,font:{color:mut,size:12}}};
+const base={margin:{l:10,r:10,t:30,b:10,pad:2},paper_bgcolor:"rgba(0,0,0,0)",plot_bgcolor:"rgba(0,0,0,0)",
+font:{color:ink,size:12,family:css("--sans")},hoverlabel:{font:{family:css("--mono")}},
+xaxis:{...ax},yaxis:{...ax},legend:{orientation:"h",x:0,y:-0.22,yanchor:"top",font:{size:11,color:mut}},hovermode:"closest"};
+const e=extra||{};for(const k of Object.keys(e)){if((k.startsWith("xaxis")||k.startsWith("yaxis"))&&typeof e[k]=="object"){
+const t=e[k].title;base[k]={...ax,...e[k],title:typeof t=="string"?{...ax.title,text:t}:{...ax.title,...(t||{})}}}else base[k]=e[k]}
+return base}
+const cfg={displaylogo:false,responsive:true,modeBarButtonsToRemove:["lasso2d","select2d","autoScale2d"]};
+const empty=(id,msg)=>{Plotly.purge(id);$(id).innerHTML=`<p class="note" style="padding:24px 4px">${msg}</p>`};
+/* ---- data ------------------------------------------------------------------------------------ */
 async function loadRuns(){runs=await (await fetch("api/runs")).json();
 $("run").innerHTML=runs.map(r=>`<option value="${r.id}">${esc(r.name)}</option>`).join("");
 $("run").onchange=()=>{cur=+$("run").value;sel=null;refresh()};fromHash()}
@@ -848,50 +1010,58 @@ window.addEventListener("hashchange",async()=>{await loadRuns();refresh()});
 function axes(st,meta){const lab=st&&st.labels||{};const nT=st?st.shape[0]:0,nM=st?st.shape[1]:0;
 const TK=lab.temperatures_K||(meta&&meta.temperatures_K);let y=TK?TK.map(t=>(+Number(t).toPrecision(4))+" K"):st.temperatures.map(t=>"T="+fmtN(t,4));
 const P=lab.pressures||(meta&&meta.pressures),u=lab.pressure_unit||(meta&&meta.pressure_unit)||"";
-const PG=lab.pressure_grid||(meta&&meta.pressure_grid);
-const CL=lab.column_labels||(meta&&meta.column_labels);
-if(CL&&CL.length==nM)return {x:CL.map((c,j)=>`${j}: ${c.replace(/mu_/g,"μ_")}`),y,xt:"pressure (bias columns: shifted μ)",yt:"temperature"};
-let x=[];for(let j=0;j<nM;j++){if(PG&&PG.length==nT){const c=PG.map(r=>r[j]),lo=Math.min(...c),hi=Math.max(...c);
-x.push(`${j}: ${fmtP(lo)}${hi>lo*(1+1e-9)?"–"+fmtP(hi):""} ${u}`);continue}
-x.push(P?`${fmtP(P[j])} ${u}`:`μ=${fmtN(Array.isArray(st.mu_grid[0][j])?st.mu_grid[0][j][0]:st.mu_grid[0][j],4)}`)}
-return {x,y,xt:PG?"pressure (column: range over T, adapted ladder)":P?"pressure":"μ (column, eV at lowest T)",yt:"temperature"}}
-function draw(d){last=d;const st=d.status,meta=d.metadata;$("badge").className="badge "+d.state;$("badge").textContent=d.state;
-$("updated").textContent=d.last_update?`updated ${fmtT(d.now-d.last_update)} ago`+(d.state=="quiet"?" (no heartbeat: the log reports every 10 % of the run)":""):"no data yet";
-const frac=d.step&&d.n_steps?d.step/d.n_steps:0;$("pbar").style.width=(100*frac).toFixed(1)+"%";
+const PG=lab.pressure_grid||(meta&&meta.pressure_grid);const CL=lab.column_labels||(meta&&meta.column_labels);
+const shortP=s=>s.replace(/\s*(bar|Pa|atm|torr)\b/i,"").replace("e+0","e").replace("e+","e").replace("e-0","e-");
+if(CL&&CL.length==nM){let b=0;const x=CL.map((c,j)=>`${j}: ${c.replace(/mu_/g,"μ_")}`);
+const xs=CL.map(c=>{const m=c.match(/,\s*mu_(\w+)\s*-\s*([\d.]+)\s*kT/);if(m){b++;return `B${b} −${+m[2]}kT`}return shortP(c)});
+return {x,xs,y,xt:`p (${u||"–"}) · B = bias columns, μ shifted`,yt:"T"}}
+let x=[],xs=[];for(let j=0;j<nM;j++){let lab_;if(PG&&PG.length==nT){const c=PG.map(r=>r[j]),lo=Math.min(...c),hi=Math.max(...c);
+lab_=`${fmtP(lo)}${hi>lo*(1+1e-9)?"–"+fmtP(hi):""}`}else lab_=P?fmtP(P[j]):`μ=${fmtN(Array.isArray(st.mu_grid[0][j])?st.mu_grid[0][j][0]:st.mu_grid[0][j],4)}`;
+x.push(`${j}: ${lab_} ${P||PG?u:""}`);xs.push(lab_)}
+return {x,xs,y,xt:PG?`p (${u}), range over T: adapted ladder`:P?`p (${u})`:"μ (eV, lowest T)",yt:"T"}}
+function draw(d){last=d;const st=d.status;$("badge").className="pill "+d.state;$("badgetxt").textContent=d.state;
+$("updated").textContent=d.last_update?`updated ${fmtT(d.now-d.last_update)} ago`+(d.state=="quiet"?" · no heartbeat (log every 10 %)":""):"no data yet";
+$("updated").title=$("updated").textContent;
+const frac=d.step&&d.n_steps?d.step/d.n_steps:0;$("pbar").style.width=(100*frac).toFixed(2)+"%";$("pct").textContent=(100*frac).toFixed(1)+" %";
+$("stepline").textContent=d.step!=null?`step ${d.step.toLocaleString()} of ${d.n_steps.toLocaleString()}`:"";
 const nrep=st?st.shape[0]*st.shape[1]:(d.samples?d.samples.keys.length:null);const ns=st?Math.max(...st.replicas.n_samples.flat().filter(x=>x!=null)):(d.samples?d.samples.n_samples:null);
-const k=[["step",d.step!=null?`${d.step.toLocaleString()} / ${d.n_steps.toLocaleString()}`:"–"],["done",(100*frac).toFixed(1)+" %"],
-["rate",d.rate?fmtN(d.rate,3)+" steps/s":"–"],["remaining",d.state=="running"||d.state=="quiet"?fmtT(d.eta_s):"–"],
-["elapsed",st&&st.started?fmtT(st.time-st.started):"–"],["mean N now",fmtN(d.mean_N,3)],
-["replicas",nrep??"–"],["samples / replica",ns??"–"]];
+const k=[["rate",d.rate?(d.rate>=0.1?fmtN(d.rate,3)+" steps/s":fmtN(1/d.rate,3)+" s/step"):"–"],
+["remaining",d.state=="running"||d.state=="quiet"?fmtT(d.eta_s):"–"],["elapsed",st&&st.started?fmtT(st.time-st.started):"–"],
+["mean N now",fmtN(d.mean_N,3)],["replicas",nrep??"–"],["samples / replica",ns??"–"]];
 const ss=st&&st.subsurface;if(ss){const sp=ss.species.join("+");k.push([`subsurface ${sp} now (all replicas)`,`${ss.n_now} in ${ss.replicas_occupied}`],
 ["subsurface insertions accepted",`${ss.inserted.toLocaleString()} / ${ss.insert_attempts.toLocaleString()}`],
 ["subsurface removals accepted",`${ss.removed.toLocaleString()} / ${ss.delete_attempts.toLocaleString()}`])}
-$("kpis").innerHTML=k.map(([a,b])=>`<div class="kpi"><b>${b}</b><span>${a}</span></div>`).join("");
-$("where").textContent=d.directory+(d.log?"  ·  log "+d.log.path:"")+(st?"":"  ·  no status.json: progress from the log only (run started without the heartbeat)");
-drawGrid(d);drawTraces(d);drawComp(d);drawHist(d);drawSwaps(d);drawConv(d);drawData(d);
-$("logname").textContent=d.log?d.log.path:"";$("log").textContent=d.log?d.log.tail.join("\n"):"(no log)";
+$("kpis").innerHTML=k.map(([a,b])=>`<div class="kpi" title="${esc(a)}: ${esc(b)}"><b>${esc(b)}</b><span>${esc(a)}</span></div>`).join("");
+$("where").innerHTML=`<span title="${esc(d.directory)}">${esc(tail(d.directory,4))}</span>`+(st?"":`<span>no status.json: progress from the log only</span>`);
+drawGrid(d);drawTraces(d);drawComp(d);drawHist(d);drawSwaps(d);drawConv(d);drawData(d);renderLog(d);
 const imgs=d.images||[];$("imgcard").hidden=!imgs.length;
-$("imgs").innerHTML=imgs.map(n=>`<a href="file/${cur}/${encodeURIComponent(n)}" target="_blank"><img loading="lazy" src="file/${cur}/${encodeURIComponent(n)}?t=${Math.round(d.now)}" alt="${esc(n)}"><div class="note">${esc(n)}</div></a>`).join("");}
+$("imgs").innerHTML=imgs.map(n=>`<a href="file/${cur}/${encodeURIComponent(n)}" target="_blank" rel="noopener"><img loading="lazy" src="file/${cur}/${encodeURIComponent(n)}?t=${Math.round(d.now)}" alt="${esc(n)}"><div class="note" title="${esc(n)}">${esc(n)}</div></a>`).join("");}
 function gridData(d){const st=d.status;if(st)return {st,z:st.replicas[$("gridq").value]};
 const s=d.samples;if(!s||!d.metadata)return null;const nT=d.metadata.temperatures_K.length,keys=s.keys,
 nM=Math.max(...keys.map(k=>k[1]))+1;const q=$("gridq").value,src={mean_N:s.mean_N,std_N:s.std_N,mean_U:s.mean_U}[q];
 if(!src)return null;const z=[...Array(nT)].map(()=>Array(nM).fill(null));keys.forEach((k,i)=>z[k[0]][k[1]]=src[i]);
 return {st:{shape:[nT,nM],temperatures:d.metadata.temperatures_K,mu_grid:d.metadata.mu_grid_eV,labels:{}},z}}
-function drawGrid(d){const g=gridData(d);if(!g||!g.z){Plotly.purge("grid");$("grid").innerHTML=g?'<p class="note">Not recorded in this run (adsorbed_cutoff / subsurface section).</p>':'<p class="note">Per-replica data appear with status.json (new runs) or samples.npz (checkpoints, end of run).</p>';return}
-const a=axes(g.st,d.metadata);const text=g.z.map(r=>r.map(v=>v==null?"":fmtN(v,3)));
-Plotly.react("grid",[{type:"heatmap",z:g.z,x:a.x,y:a.y,colorscale:"Viridis",text,texttemplate:"%{text}",
-hovertemplate:"%{y}, %{x}<br>%{z}<extra></extra>",colorbar:{thickness:10}}],
-layout({xaxis:{title:a.xt,type:"category",tickangle:-30},yaxis:{title:a.yt,type:"category"},margin:{l:70,r:10,t:8,b:70}}),cfg);
-$("grid").on&&($("grid").removeAllListeners?.("plotly_click"),$("grid").on("plotly_click",e=>{const p=e.points[0];
-sel=[a.y.indexOf(p.y),a.x.indexOf(p.x)];drawTraces(last);drawCompTraces(last)}));}
+function heat(id,z,a,opts){const nM=a.x.length,nT=a.y.length;const cellW=(($(id).clientWidth||600)-140)/Math.max(1,nM);
+const big=nM*nT<=160&&cellW>=34;   /* cell values only where they fit */
+const text=z.map(r=>r.map(v=>v==null?"":fmtN(v,opts.digits||3)));
+const cd=z.map((r,i)=>r.map((_,j)=>a.x[j]));
+Plotly.react(id,[{type:"heatmap",z,x:a.x,y:a.y,customdata:cd,colorscale:opts.colorscale||"Viridis",reversescale:!!opts.reverse,zmin:opts.zmin,zmax:opts.zmax,
+xgap:1.5,ygap:1.5,text,texttemplate:big?"%{text}":"",textfont:{size:nM>9?9.5:11,family:css("--mono")},
+hovertemplate:"%{y} · %{customdata}<br><b>%{z}</b><extra></extra>",colorbar:{thickness:10,outlinewidth:0,tickfont:{color:css("--muted"),size:10}}}],
+layout({xaxis:{title:a.xt,type:"category",tickvals:a.x,ticktext:a.xs,tickangle:nM>7?-40:0,showgrid:false},
+yaxis:{title:a.yt,type:"category",showgrid:false}}),cfg)}
+function drawGrid(d){const g=gridData(d);if(!g||!g.z){empty("grid",g?"Not recorded in this run (adsorbed_cutoff / subsurface section).":"Per-replica data appear with status.json (new runs) or samples.npz (checkpoints, end of run).");return}
+const a=axes(g.st,d.metadata);heat("grid",g.z,a,{});$("gridnote").textContent="";
+$("grid").removeAllListeners?.("plotly_click");$("grid").on&&$("grid").on("plotly_click",e=>{const p=e.points[0];
+sel=[a.y.indexOf(p.y),a.x.indexOf(p.x)];drawTraces(last);drawCompTraces(last)})}
 function drawTraces(d){const st=d.status;let tr=st?st.traces:d.samples&&d.samples.traces,keys=st?st.keys:d.samples&&d.samples.keys;
 if(!tr){Plotly.purge("traces");$("tracekey").textContent="";return}if(!sel)sel=keys[0];
 let i=keys.findIndex(k=>k[0]==sel[0]&&k[1]==sel[1]);if(i<0)i=0;const x=tr.N[i].map((_,j)=>j*tr.stride);
-$("tracekey").textContent=`replica (${keys[i][0]}, ${keys[i][1]}) · ${tr.stride>1?"every "+tr.stride+"th sample":"all samples"}`;
-Plotly.react("traces",[{x,y:tr.N[i],name:"N",mode:"lines",line:{color:css("--accent"),width:1.2}},
-{x,y:tr.U[i],name:"U (eV)",yaxis:"y2",mode:"lines",line:{color:css("--warn"),width:1,dash:"dot"}},
-...(tr.N_sub&&tr.N_sub[i]&&tr.N_sub[i].length?[{x,y:tr.N_sub[i],name:"N subsurface",mode:"lines",line:{color:css("--ok"),width:1.2}}]:[])],
-layout({xaxis:{title:"sample"},yaxis:{title:"N"},yaxis2:{title:"U (eV)",overlaying:"y",side:"right",showgrid:false},margin:{l:48,r:60,t:8,b:42}}),cfg)}
+$("tracekey").textContent=`replica (${keys[i][0]}, ${keys[i][1]}) · ${tr.stride>1?"every "+ord(tr.stride)+" sample":"all samples"}`;
+Plotly.react("traces",[{x,y:tr.N[i],name:"N",mode:"lines",line:{color:css("--accent"),width:1.6}},
+{x,y:tr.U[i],name:"U (eV)",yaxis:"y2",mode:"lines",line:{color:css("--warn"),width:1.2,dash:"dot"}},
+...(tr.N_sub&&tr.N_sub[i]&&tr.N_sub[i].length?[{x,y:tr.N_sub[i],name:"N subsurface",mode:"lines",line:{color:css("--ok"),width:1.4}}]:[])],
+layout({xaxis:{title:"sample"},yaxis:{title:"N"},yaxis2:{title:"U (eV)",overlaying:"y",side:"right",showgrid:false}}),cfg)}
 function compSt(d,c){if(d.status)return d.status;const m=d.metadata||{},z=c.grids.mean_swappable;
 return {shape:[z.length,z[0].length],temperatures:m.temperatures_K||z.map((_,i)=>i),mu_grid:m.mu_grid_eV||[z[0]],labels:{}}}
 function drawComp(d){const c=d.composition;$("compcard").hidden=$("comptrcard").hidden=!c;if(!c)return;
@@ -902,10 +1072,7 @@ const avail=Object.keys(names).filter(k=>c.grids[k]&&c.grids[k].flat().some(v=>v
 if(q.dataset.opts!==avail.join()){const keep=q.value;q.innerHTML=avail.map(k=>`<option value="${k}">${names[k]}</option>`).join("");
 q.dataset.opts=avail.join();if(avail.includes(keep))q.value=keep}
 const key=q.value||avail[0],z=c.grids[key],st=compSt(d,c),a=axes(st,d.metadata),acc=key=="identity_acceptance";
-const text=z.map(r=>r.map(v=>v==null?"":fmtN(v,2)));
-Plotly.react("compgrid",[{type:"heatmap",z,x:a.x,y:a.y,zmin:0,zmax:1,colorscale:acc?"Viridis":"RdBu",reversescale:!acc,
-text,texttemplate:"%{text}",hovertemplate:"%{y}, %{x}<br>%{z:.3f}<extra></extra>",colorbar:{thickness:10}}],
-layout({xaxis:{title:a.xt,type:"category",tickangle:-30},yaxis:{title:a.yt,type:"category"},margin:{l:70,r:10,t:8,b:70}}),cfg);
+heat("compgrid",z,a,{zmin:0,zmax:1,colorscale:acc?"Viridis":"RdBu",reverse:!acc,digits:2});
 $("compgrid").removeAllListeners?.("plotly_click");$("compgrid").on&&$("compgrid").on("plotly_click",e=>{const p=e.points[0];
 sel=[a.y.indexOf(p.y),a.x.indexOf(p.x)];drawTraces(last);drawCompTraces(last)});
 const dm=c.sgc_species.slice(1).map((s,i)=>`${s} ${fmtN(c.dmu[i+1],4)}`).join(", ");
@@ -914,45 +1081,52 @@ drawCompTraces(d)}
 function drawCompTraces(d){const c=d.composition;if(!c)return;const keys=c.keys,tr=c.traces;if(!sel)sel=keys[0];
 let i=keys.findIndex(k=>k[0]==sel[0]&&k[1]==sel[1]);if(i<0)i=0;const ys=tr.swappable[i]||[];const x=ys.map((_,j)=>j*tr.stride);
 $("comptrkey").textContent=`replica (${keys[i][0]}, ${keys[i][1]})`;
-const t=[{x,y:ys,name:`${c.species}, swappable layers`,mode:"lines",line:{color:css("--accent"),width:1.2}}];
-if(tr.top)t.push({x,y:tr.top[i],name:`${c.species}, top layer`,mode:"lines",line:{color:css("--warn"),width:1.2}});
+const t=[{x,y:ys,name:`${c.species}, swappable layers`,mode:"lines",line:{color:css("--accent"),width:1.4}}];
+if(tr.top)t.push({x,y:tr.top[i],name:`${c.species}, top layer`,mode:"lines",line:{color:css("--warn"),width:1.4}});
 Plotly.react("comptr",t,layout({xaxis:{title:"sample"},yaxis:{title:`${c.species} fraction`,range:[0,1]}}),cfg)}
 function drawHist(d){const lp=d.log?d.log.progress:[];const h=d.history||[];
-const tr=[];if(lp.length)tr.push({x:lp.map(p=>p[0]),y:lp.map(p=>p[2]),name:"log",mode:"lines+markers",line:{color:css("--accent")}});
+const tr=[];if(lp.length)tr.push({x:lp.map(p=>p[0]),y:lp.map(p=>p[2]),name:"log",mode:"lines+markers",line:{color:css("--accent"),width:2},marker:{size:5}});
 if(h.length)tr.push({x:h.map(p=>p[1]),y:h.map(p=>p[2]),name:"status (this monitor)",mode:"markers",marker:{color:css("--warn"),size:5}});
-if(!tr.length){Plotly.purge("hist");$("hist").innerHTML='<p class="note">No progress yet.</p>';return}
-Plotly.react("hist",tr,layout({xaxis:{title:"step"},yaxis:{title:"mean N"}}),cfg)}
-function drawSwaps(d){const src=d.status||d.mixing;if(!src){Plotly.purge("swaps");$("swaps").innerHTML='<p class="note">Swap statistics appear with status.json or mixing.json.</p>';$("pairs").innerHTML="";Plotly.purge("trips");return}
-const acc=src.swap_acceptance,att=src.swap_attempts||{},t=Object.keys(acc);
-Plotly.react("swaps",[{type:"bar",x:t,y:t.map(k=>acc[k]),marker:{color:css("--accent")},text:t.map(k=>att[k]!=null?att[k]+" att.":""),
-hovertemplate:"%{x}: %{y:.3f}<br>%{text}<extra></extra>"}],layout({yaxis:{title:"acceptance",range:[0,1]},margin:{l:52,r:10,t:8,b:30}}),cfg);
-const pairs=(src.pairs||[]).filter(p=>p.attempts>0).sort((a,b)=>a.acceptance-b.acceptance).slice(0,6);
-$("pairs").innerHTML=pairs.length?`<table><tr><th>worst pairs</th><th>attempts</th><th>acceptance</th></tr>${pairs.map(p=>`<tr><td>(${p.a}) ↔ (${p.b})</td><td>${p.attempts}</td><td>${fmtN(p.acceptance,3)}</td></tr>`).join("")}</table>`:"";
-const T=src.round_trips_T||[],M=src.round_trips_mu||[];const w=T.map((_,i)=>i);
-Plotly.react("trips",[{type:"bar",x:w,y:T,name:"along T",marker:{color:css("--accent")}},{type:"bar",x:w,y:M,name:"along μ/p",marker:{color:css("--ok")}}],
-layout({barmode:"group",xaxis:{title:"walker"},yaxis:{title:"half round trips"}}),cfg)}
-function drawConv(d){const c=(d.status&&d.status.convergence_history)||[];if(!c.length){Plotly.purge("conv");
-$("conv").innerHTML='<p class="note">No convergence checks yet (replica_exchange.convergence_every).</p>';return}
-const cv=(d.status&&d.status.convergence)||{},st=cv.settings||{},noise=st.mode==="noise";
-const tr=[{y:c,x:c.map((_,i)=>i+1),mode:"lines+markers",name:noise?"max TV / noise floor":"max |Δρ(u)|",line:{color:css("--accent")}}];
-if(st.tol!=null)tr.push({y:c.map(()=>st.tol),x:c.map((_,i)=>i+1),mode:"lines",name:noise?"tolerance (max)":"tolerance",line:{color:css("--ok"),dash:"dash"}});
-if(noise){const ch=cv.checks||[];if(ch.length){tr.push({y:ch.map(x=>x.median_ratio),x:ch.map((_,i)=>i+1),mode:"lines+markers",name:"median TV / noise floor",line:{color:css("--warn")||"#d08c00"}});
-if(st.median_tol!=null)tr.push({y:ch.map(()=>st.median_tol),x:ch.map((_,i)=>i+1),mode:"lines",name:"tolerance (median)",line:{color:css("--warn")||"#d08c00",dash:"dot"}})}}
-const last=(cv.checks||[]).slice(-1)[0];
-Plotly.react("conv",tr,layout({xaxis:{title:"check"},yaxis:{title:noise?"max TV / noise floor (halves)":"max |Δρ(u)| (blocks)",rangemode:"tozero"},
-title:last&&last.min_neff!=null?{text:`min n_eff ${last.min_neff.toFixed(1)}${st.min_neff!=null?" (need "+st.min_neff+")":""}`,font:{size:11}}:undefined}),cfg)}
-function drawData(d){const desc={"status.json":"live heartbeat","samples.npz":"samples (at the last checkpoint)",
+if(!tr.length){empty("hist","No progress yet.");return}
+Plotly.react("hist",tr,layout({xaxis:{title:"step"},yaxis:{title:"mean N"},showlegend:tr.length>1}),cfg)}
+function drawSwaps(d){const src=d.status||d.mixing;if(!src){empty("swaps","Swap statistics appear with status.json or mixing.json.");$("pairs").innerHTML="";empty("trips","–");return}
+const acc=src.swap_acceptance,att=src.swap_attempts||{},t=Object.keys(acc).filter(k=>att[k]==null||att[k]>0);
+Plotly.react("swaps",[{type:"bar",x:t,y:t.map(k=>acc[k]),marker:{color:t.map(k=>acc[k]<0.05?css("--bad"):acc[k]<0.15?css("--warn"):css("--accent"))},
+text:t.map(k=>fmtN(acc[k],2)),textposition:"outside",cliponaxis:false,textfont:{size:11,color:css("--ink")},
+customdata:t.map(k=>att[k]!=null?att[k].toLocaleString()+" attempts":""),hovertemplate:"%{x}: %{y:.3f}<br>%{customdata}<extra></extra>"}],
+layout({yaxis:{title:"acceptance",range:[0,1.15],dtick:.25},xaxis:{tickangle:0},bargap:.35}),cfg);
+const pairs=(src.pairs||[]).filter(p=>p.attempts>0).sort((a,b)=>a.acceptance-b.acceptance||b.attempts-a.attempts).slice(0,5);
+$("pairs").innerHTML=pairs.length?`<table><tr><th>worst pairs</th><th class="num">attempts</th><th class="num">acceptance</th></tr>${pairs.map(p=>`<tr><td class="nw">(${p.a}) ↔ (${p.b})</td><td class="num">${p.attempts}</td><td class="num">${fmtN(p.acceptance,3)}</td></tr>`).join("")}</table>`:"";
+const T=src.round_trips_T||[],M=src.round_trips_mu||[],B=src.round_trips_bias||[];const w=T.map((_,i)=>i);
+const tr=[{type:"bar",x:w,y:T,name:"along T",marker:{color:css("--accent")}},{type:"bar",x:w,y:M,name:"along μ / p",marker:{color:css("--ok")}}];
+if(B.length)tr.push({type:"bar",x:w,y:B,name:"to bias columns",marker:{color:css("--warn")}});
+const mx=Math.max(1,...T,...M,...B);
+Plotly.react("trips",tr,layout({barmode:"group",bargap:.15,xaxis:{title:"walker"},yaxis:{title:"half round trips",range:[0,mx*1.1],rangemode:"tozero"}}),cfg)}
+function drawConv(d){const c=(d.status&&d.status.convergence_history)||[];if(!c.length){$("convsub").textContent="";
+empty("conv","No convergence checks yet (replica_exchange.convergence_every).");return}
+const cv=(d.status&&d.status.convergence)||{},st=cv.settings||{},noise=st.mode==="noise";const xs=c.map((_,i)=>i+1);
+const tr=[{y:c,x:xs,mode:"lines+markers",name:noise?"max TV / noise":"max |Δρ(u)|",line:{color:css("--accent"),width:2}}];
+if(st.tol!=null)tr.push({y:c.map(()=>st.tol),x:xs,mode:"lines",name:"tolerance (max)",line:{color:css("--accent"),dash:"dash",width:1}});
+if(noise){const ch=cv.checks||[];if(ch.length){tr.push({y:ch.map(x=>x.median_ratio),x:ch.map((_,i)=>i+1),mode:"lines+markers",name:"median TV / noise",line:{color:css("--warn"),width:2}});
+if(st.median_tol!=null)tr.push({y:ch.map(()=>st.median_tol),x:ch.map((_,i)=>i+1),mode:"lines",name:"tolerance (median)",line:{color:css("--warn"),dash:"dash",width:1}})}}
+const lc=(cv.checks||[]).slice(-1)[0];
+$("convsub").textContent=lc&&lc.min_neff!=null?`min n_eff ${lc.min_neff.toFixed(1)}${st.min_neff!=null?" (need "+st.min_neff+")":""}`:"";
+Plotly.react("conv",tr,layout({xaxis:{title:"check",dtick:c.length<12?1:undefined},yaxis:{title:noise?"TV / noise floor":"max |Δρ(u)|",rangemode:"tozero"}}),cfg)}
+function drawData(d){const desc={"status.json":"live heartbeat","samples.npz":"samples (last checkpoint)",
 "checkpoint.pkl":"checkpoint","run_metadata.json":"setup","mixing.json":"swap statistics","records.h5":"per-sample records",
-"phase_diagram_data.npz":"analysis results"};
-let rows=(d.files||[]).map(f=>`<tr><td>${desc[f.name]?`<b>${f.name}</b>`:f.name}</td><td>${desc[f.name]||""}</td><td>${f.name.endsWith("/")?"":fmtB(f.size)}</td><td>${fmtT(d.now-f.mtime)} ago</td></tr>`).join("");
-let extra="";const r=d.records;if(r){extra+=`<p class="note">records.h5: ${r.rows!=null?`${r.samples} samples (${r.configurations} configurations), energies: ${Object.entries(r.potentials).map(([k,v])=>k+" "+v).join(", ")}`:r.note||""}</p>`}
+"phase_diagram_data.npz":"analysis results","ladder.json":"ladder history"};
+let rows=(d.files||[]).map(f=>`<tr><td class="file">${desc[f.name]?`<b>${esc(f.name)}</b>`:esc(f.name)}</td><td class="note">${desc[f.name]||""}</td><td class="num">${f.name.endsWith("/")?"":fmtB(f.size)}</td><td class="num">${fmtT(d.now-f.mtime)} ago</td></tr>`).join("");
+let extra="";const r=d.records;if(r){extra+=`<p class="note">records.h5: ${r.rows!=null?`${r.samples} samples (${r.configurations} configurations), energies: ${Object.entries(r.potentials).map(([k,v])=>k+" "+v).join(", ")}`:esc(r.note||"")}</p>`}
 if(d.samples)extra+=`<p class="note">samples.npz: ${d.samples.keys.length} replicas × ${d.samples.n_samples} samples</p>`;
-$("data").innerHTML=(rows?`<table><tr><th>file</th><th></th><th>size</th><th>modified</th></tr>${rows}</table>`:'<p class="note">Directory empty or not created yet.</p>')+extra}
+$("data").innerHTML=(rows?`<table><tr><th>file</th><th></th><th class="num">size</th><th class="num">modified</th></tr>${rows}</table>`:'<p class="note">Directory empty or not created yet.</p>')+extra}
 async function refresh(){try{const r=await fetch(`api/run/${cur}`);const d=await r.json();if(d.error)throw new Error(d.error);draw(d)}
-catch(e){$("badge").className="badge error";$("badge").textContent="monitor error";$("updated").textContent=String(e)}}
+catch(e){$("badge").className="pill error";$("badgetxt").textContent="monitor error";$("updated").textContent=String(e)}}
 $("gridq").onchange=()=>last&&drawGrid(last);$("compq").onchange=()=>last&&drawComp(last);
-(async()=>{if(typeof Plotly==="undefined"){document.body.insertAdjacentHTML("afterbegin",'<p style="padding:8px 20px;background:#d55e00;color:#fff">Plotly could not be loaded (from cdn.jsdelivr.net or cdnjs.cloudflare.com): give the browser internet access, or start the monitor with --plotly-js path/to/plotly.min.js.</p>');window.Plotly={react(){},purge(){}}}
-await loadRuns();await refresh();setInterval(()=>{if($("auto").checked)refresh()},5000)})();
+(async()=>{setTheme(store.get("theme","auto"));$("phosphor").value=store.get("phosphor","green");$("phosphor").onchange();
+$("wrap").checked=store.get("wrap","1")=="1";$("wrap").onchange();$("follow").checked=store.get("follow","1")=="1";
+setCrt(store.get("crt","0")=="1",false);
+if(typeof Plotly==="undefined"){document.body.insertAdjacentHTML("afterbegin",'<p style="margin:0;padding:8px 24px;background:var(--bad);color:#fff">Plotly could not be loaded (from cdn.jsdelivr.net or cdnjs.cloudflare.com): give the browser internet access, or start the monitor with --plotly-js path/to/plotly.min.js.</p>');window.Plotly={react(){},purge(){}}}
+await loadRuns();await refresh();setInterval(()=>{if($("auto").checked&&!document.hidden)refresh()},5000)})();
 </script></body></html>"""
 
 
