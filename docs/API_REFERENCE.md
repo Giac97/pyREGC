@@ -410,10 +410,11 @@ LammpsCalculator.total_energy(system) -> float
 
 Potential energy of the full configuration (`run 0`).
 
-The energies of the last two configurations are cached (exact
-match of positions, species and cell), so the energy before a
-trial move -- the configuration evaluated at the previous move --
-costs nothing; see also `_load` for the cheap re-evaluation.
+The energies (and forces) of the last two configurations are cached
+(exact match of positions, species and cell), so the energy before
+a trial move -- the configuration evaluated at the previous move --
+costs nothing; see also `_evaluate`, and `_load` for the cheap
+re-evaluation.
 
 **Parameters**
 
@@ -430,6 +431,8 @@ LammpsCalculator.forces(system) -> np.ndarray
 ```
 
 Forces on substrate + mobile atoms (frozen rows dropped).
+
+Shares the evaluation cache with `total_energy` (see `_evaluate`).
 
 **Parameters**
 

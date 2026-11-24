@@ -64,7 +64,7 @@ _LOADED_LIBRARY: Optional[str] = None
 # integrator), which skips LAMMPS's setup -- most of the cost of an energy call -- while
 # still refreshing ghost atoms and rebuilding neighbour lists when atoms moved too far.
 _LOADED: dict = {}
-_ENERGY_CACHE_SIZE = 2   # the configurations before and after the last trial move
+_ENERGY_CACHE_SIZE = 2   # before and after the last trial move; with and without the NCMC atom
 # REGC_LAMMPS_FAST=0 turns the fast path, the energy cache and the MD end-energy hand-off
 # off (every evaluation is a full reload + setup): for checks and benchmarks.
 FAST_ENV = "REGC_LAMMPS_FAST"
@@ -676,22 +676,76 @@ class LammpsCalculator(Calculator):
             return False
         others = np.vstack([system.frozen_positions, system.substrate_positions, system.positions])
         n_other = others.shape[0] - system.n
-        for i in range(system.n):
-            d = system._min_image(others - system.positions[i])
-            r2 = np.einsum('ij,ij->i', d, d)
-            r2[n_other + i] = np.inf
-            if r2.min() < self.min_distance ** 2:
-                return True
-        return False
+        d = system._min_image(others[None, :, :] - system.positions[:, None, :])
+        r2 = np.einsum('ijk,ijk->ij', d, d)
+        r2[np.arange(system.n), n_other + np.arange(system.n)] = np.inf
+        return bool(r2.min() < self.min_distance ** 2)
+
+    def _config_key(self, system) -> tuple:
+        """
+        Exact identity of a configuration, the key of the evaluation cache.
+
+        Parameters
+        ----------
+        system : ParticleSystem
+            The configuration.
+
+        Returns
+        -------
+        tuple
+            Positions (bytes), species and cell (bytes) of the full
+            configuration.
+        """
+        pos, sp = system.full_configuration()
+        return (np.ascontiguousarray(pos, dtype=float).tobytes(), tuple(map(str, sp)),
+                np.asarray(system.cell, dtype=float).tobytes())
+
+    def _evaluate(self, system, key: tuple) -> tuple:
+        """
+        Energy and forces of a configuration: one LAMMPS run, or the cache.
+
+        The last `_ENERGY_CACHE_SIZE` evaluations are kept with their forces
+        (gathered at every run: cheap next to the run), so the energy
+        before a trial move, and the forces of a configuration whose energy
+        was just computed (or the reverse), cost nothing. The NCMC kernels
+        ask for both at every configuration (`regc.subsurface._Alchemy`).
+
+        Parameters
+        ----------
+        system : ParticleSystem
+            The configuration (at least one atom).
+        key : tuple
+            Its `_config_key`.
+
+        Returns
+        -------
+        tuple
+            ``(energy, forces)``: the LAMMPS potential energy (eV) and the
+            forces on all atoms, frozen rows included, shape (n, 3) (eV/A).
+            The forces array is shared with the cache: do not modify it.
+        """
+        cache = self.__dict__.setdefault("_eval_cache", {})
+        fast = _fast()
+        if fast and key in cache:
+            return cache[key]
+        self._load(system)
+        self._lmp.command(self._run0)
+        out = (float(self._lmp.get_thermo("pe")), self._gather("f", len(key[1])))
+        if fast:
+            cache[key] = out
+            while len(cache) > _ENERGY_CACHE_SIZE:
+                cache.pop(next(iter(cache)))
+        return out
 
     def total_energy(self, system) -> float:
         """
         Potential energy of the full configuration (``run 0``).
 
-        The energies of the last two configurations are cached (exact
-        match of positions, species and cell), so the energy before a
-        trial move -- the configuration evaluated at the previous move --
-        costs nothing; see also `_load` for the cheap re-evaluation.
+        The energies (and forces) of the last two configurations are cached
+        (exact match of positions, species and cell), so the energy before
+        a trial move -- the configuration evaluated at the previous move --
+        costs nothing; see also `_evaluate`, and `_load` for the cheap
+        re-evaluation.
 
         Parameters
         ----------
@@ -704,27 +758,17 @@ class LammpsCalculator(Calculator):
             The LAMMPS potential energy in eV (0 for an empty system;
             +inf if the optional hard core is violated).
         """
-        pos, sp = system.full_configuration()
-        if pos.shape[0] == 0:
+        if system.full_configuration()[0].shape[0] == 0:
             return 0.0
         if self._violates_hard_core(system):
             return np.inf
-        key = (np.ascontiguousarray(pos, dtype=float).tobytes(), tuple(map(str, sp)),
-               np.asarray(system.cell, dtype=float).tobytes())
-        cache = self.__dict__.setdefault("_energy_cache", {})
-        if key in cache and _fast():   # e.g. the energy before a trial move
-            return cache[key]
-        self._load(system)
-        self._lmp.command(self._run0)
-        energy = float(self._lmp.get_thermo("pe"))
-        cache[key] = energy
-        while len(cache) > _ENERGY_CACHE_SIZE:
-            cache.pop(next(iter(cache)))
-        return energy
+        return self._evaluate(system, self._config_key(system))[0]
 
     def forces(self, system) -> np.ndarray:
         """
         Forces on substrate + mobile atoms (frozen rows dropped).
+
+        Shares the evaluation cache with `total_energy` (see `_evaluate`).
 
         Parameters
         ----------
@@ -740,9 +784,7 @@ class LammpsCalculator(Calculator):
         n_fr = system.frozen_positions.shape[0]
         if n_tot - n_fr == 0:
             return np.zeros((0, 3))
-        self._load(system)
-        self._lmp.command(self._run0)
-        return self._gather("f", n_tot)[n_fr:]
+        return self._evaluate(system, self._config_key(system))[1][n_fr:].copy()
 
     def energy_after_md(self, system) -> float:
         """

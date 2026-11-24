@@ -414,7 +414,7 @@ def test_fast_path_equals_full_setup_over_a_random_walk(eam_file, monkeypatch):
             for j in range(system.n):
                 system.apply_move(j, new[system.n_substrate + j])
             assert calc.energy_after_md(system) == pytest.approx(reference(), abs=1e-9)
-        calc.__dict__.pop("_energy_cache", None)          # test the evaluation itself
+        calc.__dict__.pop("_eval_cache", None)            # test the evaluation itself
         e = calc.total_energy(system)
         n_fast += "pre no" in calc._run0
         assert e == pytest.approx(reference(), abs=1e-9)

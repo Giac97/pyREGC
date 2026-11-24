@@ -662,6 +662,11 @@ calculator avoids it where it can:
 - **The energy before a trial move** is the one computed at the previous
   move: the last two configurations are cached, by exact match of
   positions, species and cell.
+- **Energy and forces come together.** Every run also gathers the forces,
+  and the cache keeps them with the energy, so asking for the forces of a
+  configuration whose energy was just computed (or the reverse) costs
+  nothing. The NCMC kernels (§10.2) ask for both at every configuration,
+  so this halves their cost; the results are unchanged.
 - **After an MD segment** the energy of its last step is reused instead of
   a new evaluation.
 - **Insertions and deletions** change the atom count and still need a full
@@ -2387,9 +2392,15 @@ def factory(rng):
   their element, valid because μ_O = μ_O2 / 2. CO, CH4 and other
   heteronuclear or larger molecules never go below the surface.
 - **Cost:** each subsurface attempt costs about
-  `ncmc_steps × kernel_steps × (leapfrog_steps + 1) × 2` force
-  evaluations. `weight` sets how often a GC attempt is a subsurface
-  one; each atomic gas channel has weight 1.
+  `ncmc_steps × kernel_steps × leapfrog_steps × 2` energy-and-force
+  evaluations with the Langevin kernel (`leapfrog_steps + 1` per
+  trajectory with HMC): every configuration is evaluated with and
+  without the switched atom. With `LammpsCalculator` one LAMMPS run
+  gives both the energy and the forces. For example 60 λ steps × 5 × 2
+  = 600 runs; on a Pd(100) slab with GRACE + D3 (about 3.4 ms a run on
+  one core) that is 2 s, some 30 times a 20-step MD segment. `weight`
+  sets how often a GC attempt is a subsurface one; each atomic gas
+  channel has weight 1.
 - **Kernels:** HMC, Langevin (`kernel="langevin"`) or single-atom MC
   (`kernel="mc"`).
   - Langevin uses the BAOAB integrator. Its momenta persist through the
