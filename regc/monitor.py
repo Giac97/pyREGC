@@ -378,11 +378,16 @@ class Run:
         Returns
         -------
         str or None
-            `log`, or the newest ``*.log`` in the directory.
+            `log`; else ``run.log`` in the directory; else its newest ``*.log``
+            other than the monitor's own ``monitor.log``.
         """
         if self.log:
             return self.log
-        logs = sorted(glob.glob(os.path.join(self.directory, "*.log")), key=os.path.getmtime)
+        run_log = os.path.join(self.directory, "run.log")
+        if os.path.isfile(run_log):
+            return run_log
+        logs = sorted((p for p in glob.glob(os.path.join(self.directory, "*.log"))
+                       if os.path.basename(p) != "monitor.log"), key=os.path.getmtime)
         return logs[-1] if logs else None
 
     def collect(self) -> dict:
