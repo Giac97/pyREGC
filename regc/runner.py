@@ -42,9 +42,12 @@ surface phase diagram, all from one YAML or JSON file.
    reservoir) or an explicit (T x mu) one (``mu_eV``); the [ZSG] REGC
    scheme (``scheme: regc``, MC/HMC/MD diffusion) or the sweep scheme;
    optional ``adsorbed_cutoff`` to record the adsorbed count ``N_ads``;
-   ``bias_columns`` appends replicas at p_max with one species' mu lowered
-   by multiples of kT (`bias_column_mu_grid`), which reach the physical
-   states by replica exchange and enter MBAR.
+   ``bias_columns`` appends replicas at p_max (or their own ``pressure``)
+   with one species' mu lowered by multiples of kT (`bias_column_mu_grid`),
+   which reach the physical states by replica exchange and enter MBAR;
+   ``initial_configurations`` starts the replicas from given frames (e.g.
+   an earlier run's last trajectory frames, `regc.initial_configurations`)
+   instead of the template.
 5. **checkpoint** (regc only) -- run in chunks with `run_with_checkpoints`
    (``checkpoint.pkl``/``samples.npz``), resumable (``--resume``) and
    stopping cleanly before ``--time-limit`` (exit code 75, `EXIT_RESUBMIT`).
@@ -164,7 +167,10 @@ _CALCULATOR_KEYS = {
     "ASE": {"class", "kwargs"},
 }
 _RE_COMMON = {"temperatures_K", "mu_eV", "pressures", "pressure_unit", "scheme", "seed",
-              "max_disp", "n_workers", "adsorbed_cutoff", "hmc", "record_every"}
+              "max_disp", "n_workers", "adsorbed_cutoff", "hmc", "record_every",
+              "initial_configurations"}
+#: Keys of ``replica_exchange.initial_configurations`` (`regc.initial_configurations`).
+_INITIAL_CONFIGURATIONS_KEYS = {"files", "assign", "species", "index"}
 _RE_SCHEME = {
     "regc": {"n_steps", "x0", "diffusion", "diffusion_steps", "burn_in_steps",
              "convergence_every", "convergence_tol", "convergence_mode", "convergence_bins",
@@ -236,7 +242,9 @@ def load_config(path: str) -> Dict[str, Any]:
         The parsed config. A relative ``structure.file`` is resolved
         against the config file's own directory, and so are the potential
         files of the ``calculator`` section when they exist there (see the
-        module docstring), so the config works from any working directory.
+        module docstring) and the paths and patterns of
+        ``replica_exchange.initial_configurations.files``, so the config
+        works from any working directory.
     """
     with open(path) as f:
         text = f.read()
@@ -264,6 +272,13 @@ def load_config(path: str) -> Dict[str, Any]:
     for sec in (config.get("molecules") or {}).values():
         if isinstance(sec, dict) and isinstance(sec.get("template"), str):
             sec["template"] = _resolve_existing(sec["template"], base)
+    init = (config.get("replica_exchange") or {}).get("initial_configurations")
+    if isinstance(init, dict) and init.get("files"):   # paths and glob patterns
+
+        def absolute(f):
+            return os.path.join(base, f) if isinstance(f, str) and not os.path.isabs(f) else f
+        files = init["files"]
+        init["files"] = [absolute(f) for f in files] if isinstance(files, list) else absolute(files)
     return config
 
 
@@ -502,6 +517,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     if scheme == "regc":
         _bias_columns_settings(config)   # first: it names the adapt_ladder conflict
         _adapt_ladder_settings(config)
+    _initial_configurations_settings(config)
     if "sgc" in config:
         sgc = config["sgc"] or {}
         if scheme != "regc":
@@ -712,7 +728,9 @@ def _bias_columns_settings(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     ``{species: Pd, shifts_kT: [1.5, 3.0]}`` shifts mu_Pd of the extra
     columns by -1.5 kT and -3 kT (one or several species, the same
     shifts); ``{shifts_kT: {Pd: [...], Ag: [...]}}`` gives every species
-    its own shifts (lists of the same length).
+    its own shifts (lists of the same length). ``pressure`` (in the run's
+    ``pressure_unit``) puts the bias columns at a gas pressure above the
+    last physical one; default: that last pressure.
 
     Parameters
     ----------
@@ -723,15 +741,18 @@ def _bias_columns_settings(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     -------
     dict or None
         None without ``bias_columns``; else ``species`` (list),
-        ``shifts_kT`` ({species: list of float}) and ``n_columns``.
+        ``shifts_kT`` ({species: list of float}), ``n_columns`` and
+        ``pressure`` (float, or None when not given: the last physical
+        pressure).
 
     Raises
     ------
     ValueError
         If the section is malformed, a species is not exchanged, the
         shifts are not positive and strictly increasing, the lists differ
-        in length, the run has no pressure ladder or scheme regc, or it is
-        combined with ``adapt_ladder``, ``phase_diagram.merge`` or
+        in length, ``pressure`` is below the last physical pressure, the
+        run has no pressure ladder or scheme regc, or it is combined with
+        ``adapt_ladder``, ``phase_diagram.merge`` or
         ``phase_diagram.suggest_ladder``.
     """
     re_cfg = config.get("replica_exchange") or {}
@@ -741,7 +762,7 @@ def _bias_columns_settings(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     where = "replica_exchange.bias_columns"
     if not isinstance(cfg, dict):
         raise ValueError(f"{where} must be a mapping, e.g. {{species: Pd, shifts_kT: [1.5, 3.0]}}")
-    _check_keys(cfg, {"species", "shifts_kT"}, where)
+    _check_keys(cfg, {"species", "shifts_kT", "pressure"}, where)
     if _scheme(re_cfg) != "regc" or "pressures" not in re_cfg:
         raise ValueError(f"{where} needs scheme: regc and a gas-feed pressure ladder "
                          f"(replica_exchange.pressures): the extra columns sit at the highest "
@@ -790,18 +811,29 @@ def _bias_columns_settings(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         raise ValueError(f"{where}.shifts_kT: every species needs the same number of shifts "
                          f"(one per column), got {({sp: len(v) for sp, v in out.items()})}")
     species = [sp for sp in exchanged if sp in out]
+    p_bias = None
+    if cfg.get("pressure") is not None:
+        p_bias = _as_float(cfg["pressure"], f"{where}.pressure")
+        p_last = _floats(re_cfg["pressures"], "replica_exchange.pressures")[-1]
+        if not p_bias >= p_last:
+            unit = re_cfg.get("pressure_unit", "bar")
+            raise ValueError(f"{where}.pressure ({p_bias:g} {unit}) must be at least the last "
+                             f"physical pressure ({p_last:g} {unit}): the bias columns come "
+                             f"after it on the mu axis")
     return {"species": species, "shifts_kT": {sp: out[sp] for sp in species},
-            "n_columns": lengths.pop()}
+            "n_columns": lengths.pop(), "pressure": p_bias}
 
 
 def bias_column_mu_grid(mu_grid, temperatures_K: Sequence[float], species: Sequence[str],
-                        shifts_kT: Dict[str, Sequence[float]]) -> Tuple[np.ndarray, np.ndarray]:
+                        shifts_kT: Dict[str, Sequence[float]],
+                        base=None) -> Tuple[np.ndarray, np.ndarray]:
     """
     Append bias columns to a (T x p) chemical-potential grid.
 
     Column n_p + j (j = 0..k-1) has every species' mu of the last
-    (highest-pressure) column, except that each species in `shifts_kT`
-    has mu lowered by shifts_kT[species][j] * k_B T of its row: the same
+    (highest-pressure) column -- or of `base`, the gas feed at the bias
+    columns' own pressure -- except that each species in `shifts_kT` has
+    mu lowered by shifts_kT[species][j] * k_B T of its row: the same
     reduced field beta * Delta mu down every column.
 
     Parameters
@@ -814,6 +846,10 @@ def bias_column_mu_grid(mu_grid, temperatures_K: Sequence[float], species: Seque
         The exchanged species, in the order of the last axis.
     shifts_kT : dict
         Species -> k shifts in units of k_B T (positive lowers mu).
+    base : array_like, optional
+        The unshifted mu of the bias columns, shape (n_T,) for one
+        species, (n_T, n_species) otherwise (e.g. ``feed.mu_grid(T,
+        [p_bias])[:, 0]``). Default None: the last column of `mu_grid`.
 
     Returns
     -------
@@ -846,13 +882,21 @@ def bias_column_mu_grid(mu_grid, temperatures_K: Sequence[float], species: Seque
     for s, sp in enumerate(species):
         if sp in shifts_kT:
             shift[:, n_p:, s] = np.asarray(shifts_kT[sp], dtype=float)
+    if base is None:
+        last = m3[:, -1:, :]
+    else:
+        last = np.asarray(base, dtype=float).reshape(n_T, 1, -1)
+        if last.shape[2] != n_s:
+            raise ValueError(f"base of shape {np.shape(base)} does not match {n_T} temperatures "
+                             f"and species {list(species)}")
     kT = np.array([kelvin_to_eV(T) for T in temperatures_K])[:, None, None]
-    ext = np.concatenate([m3, np.repeat(m3[:, -1:, :], k, axis=1)], axis=1) - shift * kT
+    ext = np.concatenate([m3, np.repeat(last, k, axis=1)], axis=1) - shift * kT
     return (ext[..., 0] if single else ext), shift
 
 
 def _bias_column_labels(pressures: Sequence[float], unit: str,
-                        shifts_kT: Dict[str, Sequence[float]]) -> List[str]:
+                        shifts_kT: Dict[str, Sequence[float]],
+                        pressure: Optional[float] = None) -> List[str]:
     """
     Labels of every mu column: the pressure, and for bias columns the shift.
 
@@ -864,6 +908,8 @@ def _bias_column_labels(pressures: Sequence[float], unit: str,
         Their unit.
     shifts_kT : dict
         Species -> shifts in kT, one per bias column.
+    pressure : float, optional
+        The bias columns' pressure. Default None: the last of `pressures`.
 
     Returns
     -------
@@ -872,10 +918,140 @@ def _bias_column_labels(pressures: Sequence[float], unit: str,
     """
     cols = [f"{p:.3g} {unit}" for p in pressures]
     k = len(next(iter(shifts_kT.values())))
+    p_bias = pressures[-1] if pressure is None else pressure
     for j in range(k):
-        cols.append(f"{pressures[-1]:.3g} {unit}, " + ", ".join(
+        cols.append(f"{p_bias:.3g} {unit}, " + ", ".join(
             f"mu_{sp} - {v[j]:g} kT" for sp, v in shifts_kT.items()))
     return cols
+
+
+def _initial_configurations_settings(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    The ``replica_exchange.initial_configurations`` settings, checked (no file is read).
+
+    Parameters
+    ----------
+    config : dict
+        The parsed config.
+
+    Returns
+    -------
+    dict or None
+        None without the section; else ``files`` (as given: a path or
+        pattern, or a list), ``assign`` (``by_count`` or ``cyclic``),
+        ``species`` (default: the first exchanged species) and ``index``
+        (the frame, default -1). This is what the run metadata keeps.
+
+    Raises
+    ------
+    ValueError
+        If the section is not a mapping, has unknown keys or no
+        ``files``, an unknown ``assign``, a species that is not
+        exchanged, or a non-integer ``index``.
+    """
+    from .initial_configurations import ASSIGN_MODES
+    cfg = (config.get("replica_exchange") or {}).get("initial_configurations")
+    if cfg is None:
+        return None
+    where = "replica_exchange.initial_configurations"
+    if not isinstance(cfg, dict):
+        raise ValueError(f"{where} must be a mapping, e.g. {{files: 'previous/trajectories/"
+                         f"*.xyz', assign: by_count, species: O}}")
+    _check_keys(cfg, _INITIAL_CONFIGURATIONS_KEYS, where)
+    files = cfg.get("files")
+    if not files or not (isinstance(files, str) or (
+            isinstance(files, list) and all(isinstance(f, str) and f for f in files))):
+        raise ValueError(f"{where}.files must be a path or glob pattern (relative to the "
+                         f"config file), or a list of them; got {files!r}")
+    assign = str(cfg.get("assign", "by_count"))
+    if assign not in ASSIGN_MODES:
+        raise ValueError(f"{where}.assign must be one of {list(ASSIGN_MODES)}, got {assign!r}")
+    exchanged = _species_list(config)
+    species = str(cfg.get("species", exchanged[0]))
+    if species not in exchanged:
+        raise ValueError(f"{where}.species {species!r} is not an exchanged species {exchanged}")
+    index = cfg.get("index", -1)
+    if isinstance(index, bool) or not isinstance(index, (int, np.integer)):
+        raise ValueError(f"{where}.index must be an integer frame index (-1: the last frame), "
+                         f"got {index!r}")
+    return {"files": files, "assign": assign, "species": species, "index": int(index)}
+
+
+def _start_from_initial_configurations(config: Dict[str, Any], setup: Dict[str, Any], sim,
+                                       out_dir: str, resuming: bool, verbose: bool) -> None:
+    """
+    Apply ``replica_exchange.initial_configurations`` to a freshly built simulation.
+
+    On a fresh start the files are read, checked and put into the
+    replicas, and ``initial_configurations`` (the settings plus which
+    file every grid point got, with its SHA-256) is added to the run
+    metadata. When resuming a checkpoint the checkpoint's configurations
+    are used: nothing is read, and the saved metadata entry is carried
+    over (a changed, added or removed section only gives a warning), so
+    the section never stands in the way of a resume.
+
+    Parameters
+    ----------
+    config : dict
+        The parsed config.
+    setup : dict
+        From `setup_from_config`; its ``metadata`` is updated.
+    sim : ReplicaExchangeGCMC
+        The simulation, before its first step.
+    out_dir : str
+        The output directory (the saved metadata of a resumed run).
+    resuming : bool
+        Whether a checkpoint will be resumed.
+    verbose : bool
+        Print what each grid point starts from.
+
+    Raises
+    ------
+    ValueError
+        If a configuration does not fit the run (see
+        `regc.initial_configurations.check_configuration`).
+    """
+    from .driver import METADATA_FILE
+    from .initial_configurations import (DEFAULT_MIN_DISTANCE, expand_files,
+                                         read_configurations, start_from_configurations)
+    settings = _initial_configurations_settings(config)
+    meta = setup["metadata"]
+    if resuming:
+        saved = None
+        path = os.path.join(out_dir, METADATA_FILE)
+        if os.path.isfile(path):
+            with open(path) as f:
+                saved = json.load(f).get("initial_configurations")
+        if saved is not None:
+            meta["initial_configurations"] = saved
+        else:
+            meta.pop("initial_configurations", None)
+        before = None if saved is None else {k: saved.get(k) for k in
+                                             ("files", "assign", "species", "index")}
+        if before != (None if settings is None else json.loads(json.dumps(settings))):
+            warnings.warn("replica_exchange.initial_configurations differs from the run being "
+                          "resumed; it is ignored: a resumed run continues from the "
+                          "checkpoint's configurations", stacklevel=3)
+        return
+    if settings is None:
+        return
+    md = (config.get("calculator") or {}).get("min_distance")
+    confs = read_configurations(expand_files(settings["files"]), index=settings["index"])
+    record = start_from_configurations(
+        sim, confs, assign=settings["assign"], species=settings["species"],
+        min_distance=DEFAULT_MIN_DISTANCE if md is None else _as_float(
+            md, "calculator.min_distance"))
+    meta["initial_configurations"] = {**settings, "configurations": record["configurations"],
+                                      "assignment": record["assignment"]}
+    if verbose:
+        sp = settings["species"]
+        print(f"initial configurations: {len(confs)} file(s), frame {settings['index']}, "
+              f"assign {settings['assign']}"
+              + (f" by N_{sp}" if settings["assign"] == "by_count" else "")
+              + f"; #file:N_{sp} per grid point (the files are in run_metadata.json):")
+        for T, row in zip(setup["temperatures_K"], record["assignment"]):
+            print(f"  {T:g} K: " + "  ".join(
+                f"#{k}:{record['configurations'][k]['counts'][sp]}" for k in row))
 
 
 def _validate_site_exchange(config: Dict[str, Any]) -> None:
@@ -2449,12 +2625,16 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
         pressure_unit = None
     bias = _bias_columns_settings(config) if _scheme(re_cfg) == "regc" else None
     column_labels = shift_grid = None
-    if bias is not None:   # extra columns at p_max with lowered mu of the biased species
+    if bias is not None:   # extra columns at p_bias with lowered mu of the biased species
         n_physical = len(pressures)
+        base = (None if bias["pressure"] is None   # default: a copy of the p_max column
+                else np.asarray(feed.mu_grid(temperatures_K, [bias["pressure"]],
+                                             unit=pressure_unit))[:, 0])
         mu_grid, shift_grid = bias_column_mu_grid(mu_grid, temperatures_K, species,
-                                                  bias["shifts_kT"])
+                                                  bias["shifts_kT"], base=base)
         bias["n_physical_columns"] = n_physical
-        column_labels = _bias_column_labels(pressures, pressure_unit, bias["shifts_kT"])
+        column_labels = _bias_column_labels(pressures, pressure_unit, bias["shifts_kT"],
+                                            bias["pressure"])
     if feed is not None:
         lambda_cubed_of_T = feed.lambda_cubed_of_T()
     elif len(species) == 1:
@@ -2513,9 +2693,12 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
         metadata["bias_columns"] = {"species": bias["species"], "shifts_kT": bias["shifts_kT"],
                                     "n_physical_columns": bias["n_physical_columns"],
                                     "n_bias_columns": bias["n_columns"]}
-        n_cols = bias["n_physical_columns"] + bias["n_columns"]
-        metadata["pressure_grid"] = [[float(pressures[min(j, len(pressures) - 1)])
-                                      for j in range(n_cols)] for _ in temperatures_K]
+        if bias["pressure"] is not None:   # (only then: earlier runs' metadata stay unchanged)
+            metadata["bias_columns"]["pressure"] = bias["pressure"]
+        p_bias = pressures[-1] if bias["pressure"] is None else bias["pressure"]
+        metadata["pressure_grid"] = [[float(p) for p in pressures]
+                                     + [float(p_bias)] * bias["n_columns"]
+                                     for _ in temperatures_K]
         metadata["bias_shift_kT_grid"] = shift_grid.tolist()
         metadata["column_labels"] = column_labels
     if subsurface is not None:
@@ -2602,7 +2785,10 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
                  if bias else ""))
         if bias:
             from .units import kelvin_to_eV
-            print(f"bias columns at p = {pressures[-1]:g} {pressure_unit}: "
+            p_bias = pressures[-1] if bias["pressure"] is None else bias["pressure"]
+            print(f"bias columns at p = {p_bias:g} {pressure_unit}"
+                  + (" (p_max)" if bias["pressure"] is None else
+                     f" (p_max = {pressures[-1]:g} {pressure_unit})") + ": "
                   + "; ".join(f"mu_{sp} - {v} kT" for sp, v in bias["shifts_kT"].items()))
             for T in temperatures_K:
                 print(f"  {T:g} K: largest shift "
@@ -2930,6 +3116,11 @@ def run_from_config(config: Dict[str, Any], verbose: bool = True, resume: bool =
                              records_every=int(rec_cfg.get("every", 1)),
                              n_physical_mu=(setup["bias_columns"]["n_physical_columns"]
                                             if setup["bias_columns"] else None)) as sim:
+        from .driver import CHECKPOINT_FILE
+        _start_from_initial_configurations(
+            config, setup, sim, out_dir, verbose=verbose,
+            resuming=(resume and scheme == "regc" and "checkpoint" in config
+                      and os.path.isfile(os.path.join(out_dir, CHECKPOINT_FILE))))
         labels = {"temperatures_K": [float(T) for T in setup["temperatures_K"]],
                   "pressures": (None if setup["pressures"] is None
                                 else [float(p) for p in setup["pressures"]]),
@@ -3940,6 +4131,24 @@ def check_config(config: Dict[str, Any]) -> Dict[str, Any]:
     bare = setup["system_factory"](np.random.default_rng(0))
     print(f"\nbare-slab energy: {bare.total_energy():.4f} eV "
           f"({setup['calc_spec'].type} calculator works)")
+    init = _initial_configurations_settings(config)
+    if init is not None:   # read and check them now (the run does it again)
+        from .initial_configurations import (DEFAULT_MIN_DISTANCE, assign_configurations,
+                                             check_configuration, expand_files,
+                                             read_configurations)
+        md = (config.get("calculator") or {}).get("min_distance")
+        confs = read_configurations(expand_files(init["files"]), index=init["index"])
+        counts = [check_configuration(bare, c["positions"], c["species"], c["lattice"],
+                                      min_distance=DEFAULT_MIN_DISTANCE if md is None else
+                                      _as_float(md, "calculator.min_distance"),
+                                      name=c["file"])["counts"][init["species"]] for c in confs]
+        n_mu = np.shape(setup["mu_grid"])[-1 if len(setup["species"]) == 1 else -2]
+        table = assign_configurations(counts, (len(setup["temperatures_K"]), n_mu),
+                                      init["assign"])
+        print(f"\ninitial configurations: {len(confs)} file(s) fit the run; #file:N_"
+              f"{init['species']} per grid point ({init['assign']}):")
+        for T, row in zip(setup["temperatures_K"], table):
+            print(f"{T:6.0f}  " + "  ".join(f"#{k}:{counts[k]}" for k in row))
     return setup
 
 

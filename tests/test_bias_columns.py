@@ -288,3 +288,79 @@ def test_yaml_run_analysis_and_resume(tmp_path):
     cfg["phase_diagram"]["suggest_ladder"] = True
     with pytest.raises(ValueError, match="bias_columns"):
         analyze_from_config(cfg, verbose=False)
+
+
+# ---------------------------------------------------------------- bias columns at their own pressure
+def test_bias_pressure_grid_labels_metadata_and_summary(tmp_path, capsys):
+    cfg = _config(tmp_path, species="Pd", shifts_kT=[5.0, 10.0], pressure=1.0e4)
+    setup = setup_from_config(cfg, verbose=True)
+    printed = capsys.readouterr().out
+    feed, T_K = setup["feed"], [500.0, 700.0, 900.0]
+    mu = np.asarray(setup["mu_grid"])
+    kT = np.array([kelvin_to_eV(T) for T in T_K])
+    at_p = np.asarray(feed.mu_grid(T_K, [1.0e4], unit="bar"))[:, 0]       # (n_T, n_species)
+    assert mu.shape == (3, 5, 2)
+    np.testing.assert_array_equal(mu[:, :3], feed.mu_grid(T_K, [1e-6, 1e-3, 1.0], unit="bar"))
+    for j, s in enumerate([5.0, 10.0]):
+        np.testing.assert_allclose(mu[:, 3 + j, 0], at_p[:, 0], rtol=0, atol=1e-12)   # O at p_bias
+        np.testing.assert_allclose(mu[:, 3 + j, 1], at_p[:, 1] - s * kT, rtol=0, atol=1e-12)
+        for it, T in enumerate(T_K):                       # the same through mu_at_T_eV
+            np.testing.assert_allclose(mu[it, 3 + j],
+                                       feed.mu_at_T_eV(kT[it], 1.0e4, unit="bar")
+                                       - np.array([0.0, s * kT[it]]), atol=1e-12)
+    assert np.all(mu[:, 3, 0] > mu[:, 2, 0])               # O: higher pressure, higher mu
+    meta = setup["metadata"]
+    assert meta["bias_columns"]["pressure"] == 1.0e4
+    assert np.allclose(meta["pressure_grid"], [[1e-6, 1e-3, 1.0, 1e4, 1e4]] * 3)
+    assert meta["column_labels"][3:] == ["1e+04 bar, mu_Pd - 5 kT", "1e+04 bar, mu_Pd - 10 kT"]
+    assert meta["column_labels"][2] == "1 bar"
+    assert "bias columns at p = 10000 bar (p_max = 1 bar)" in printed
+    # pressure = p_max is the default grid; without it, no 'pressure' key (older runs resume)
+    same = setup_from_config(_config(tmp_path, species="Pd", shifts_kT=[5.0, 10.0],
+                                     pressure=1.0), verbose=False)
+    plain = setup_from_config(_config(tmp_path), verbose=False)
+    np.testing.assert_allclose(same["mu_grid"], plain["mu_grid"], rtol=0, atol=1e-12)
+    assert "pressure" not in plain["metadata"]["bias_columns"]
+    assert plain["bias_columns"]["pressure"] is None
+
+
+def test_bias_column_mu_grid_base_argument():
+    T_K = [300.0, 600.0]
+    mu = np.array([[[-1.0, -3.0], [-0.5, -3.0]], [[-1.2, -3.1], [-0.7, -3.1]]])
+    base = np.array([[-0.2, -2.9], [-0.4, -3.0]])
+    ext, _ = bias_column_mu_grid(mu, T_K, SPECIES, {"Pd": [1.0]}, base=base)
+    np.testing.assert_allclose(ext[:, 2, 0], base[:, 0])
+    np.testing.assert_allclose(ext[:, 2, 1], base[:, 1] - np.array([kelvin_to_eV(T) for T in T_K]))
+    ext1, _ = bias_column_mu_grid(mu[..., 0], T_K, ["O"], {"O": [2.0]}, base=base[:, 0])
+    assert ext1.shape == (2, 3) and ext1[0, 2] == pytest.approx(-0.2 - 2 * kelvin_to_eV(300.0))
+    with pytest.raises(ValueError, match="base"):
+        bias_column_mu_grid(mu, T_K, SPECIES, {"Pd": [1.0]}, base=base[:, :1])
+
+
+@pytest.mark.parametrize("pressure, match", [(0.5, "at least the last physical pressure"),
+                                             ("lots", "pressure")])
+def test_bias_pressure_validation(tmp_path, pressure, match):
+    cfg = _config(tmp_path, species="Pd", shifts_kT=[5.0], pressure=pressure)
+    with pytest.raises(ValueError, match=match):
+        validate_config(cfg)
+
+
+def test_bias_pressure_run_and_resume(tmp_path):
+    from regc.runner import run_from_config
+    cfg = _config(tmp_path, species="Pd", shifts_kT=[5.0], pressure=1.0e3)
+    cfg.pop("phase_diagram")
+    cfg["replica_exchange"].update(temperatures_K=[500, 900], pressures=[1e-3, 1.0], n_steps=20)
+    cfg["checkpoint"] = {"chunk": 20}
+    res = run_from_config(cfg, verbose=False)
+    assert res["finished"] and res["sim"].mu_grid.shape == (2, 3, 2)
+    meta = json.loads((tmp_path / "out" / "run_metadata.json").read_text())
+    assert meta["bias_columns"]["pressure"] == 1.0e3
+    assert meta["pressure_grid"][0] == [1e-3, 1.0, 1.0e3]
+    status = json.loads((tmp_path / "out" / "status.json").read_text())
+    assert status["labels"]["column_labels"][2] == "1e+03 bar, mu_Pd - 5 kT"
+    cfg["replica_exchange"]["n_steps"] = 40
+    assert run_from_config(cfg, verbose=False, resume=True)["status"].steps_done == 40
+    cfg["replica_exchange"]["bias_columns"]["pressure"] = 1.0e2     # moved: refused
+    cfg["replica_exchange"]["n_steps"] = 60
+    with pytest.raises(ValueError, match="cannot resume"):
+        run_from_config(cfg, verbose=False, resume=True)

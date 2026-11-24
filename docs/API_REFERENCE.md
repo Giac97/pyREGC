@@ -7157,7 +7157,7 @@ Format is inferred from the extension.
 
 **Returns**
 
-- *dict*: The parsed config. A relative `structure.file` is resolved against the config file's own directory, and so are the potential files of the `calculator` section when they exist there (see the module docstring), so the config works from any working directory.
+- *dict*: The parsed config. A relative `structure.file` is resolved against the config file's own directory, and so are the potential files of the `calculator` section when they exist there (see the module docstring) and the paths and patterns of `replica_exchange.initial_configurations.files`, so the config works from any working directory.
 
 ---
 

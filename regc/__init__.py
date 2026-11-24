@@ -40,6 +40,8 @@ lammps_backend  LammpsCalculator (any LAMMPS pair style; native MD),
 Running and analysing
 ---------------------
 driver    run_with_checkpoints, RunStatus, EXIT_RESUBMIT -- long/batch runs
+initial_configurations  read_configurations, start_from_configurations -- start the
+          replicas from given frames (an earlier run's) instead of the template
 ladder    LadderAdapter, propose_ladder -- adapt the (T, p) ladder from measured swap
           rates between checkpoint chunks (needs scipy); LadderES -- model-free
           evolution strategy on short trial runs before the run

@@ -1371,6 +1371,21 @@ the biased species. Its μ is lowered by shift_j k_B T:
 
     μ_Pd(T, n_p + j) = μ_Pd(T, p_max) − shift_j · k_B T
 
+With `pressure` the bias columns sit at their own gas pressure p_bias
+instead of p_max (in the run's `pressure_unit`, at least p_max): every
+species' μ then comes from the gas feed at (T, p_bias), exactly as in the
+physical columns, and the biased species is lowered from there:
+
+    μ_O(T, n_p + j)  = μ_O(T, p_bias)
+    μ_Pd(T, n_p + j) = μ_Pd(T, p_bias) − shift_j · k_B T
+
+A higher O pressure in the bias columns helps where the oxide needs both
+more O and fewer Pd than the surface holds at p_max: the bias then pushes
+both ways at once. p_bias ≥ p_max keeps the μ axis ordered (the first
+bias column is the next step up in μ_O); a smaller value is refused. The
+gap p_max → p_bias adds to the shift of the first bias column, so check
+its swap acceptance in `mixing.json`.
+
 In these replicas Pd removal, and with it oxide formation, is favoured.
 Ordinary replica exchange links them to the physical states: μ swaps
 along the row, diagonal swaps, and T swaps within a column. A
@@ -1392,6 +1407,8 @@ replica_exchange:
   bias_columns: {species: Pd, shifts_kT: [2, 4, 6, 8, 10, 12]}
   # or one list per species, all of the same length:
   # bias_columns: {shifts_kT: {Pd: [2, 4, 6], Pt: [1, 2, 3]}}
+  # at a higher gas pressure than p_max (here 1e4 bar):
+  # bias_columns: {species: Pd, shifts_kT: [2, 4, 6], pressure: 1.0e+4}
 ```
 
 **Why shifts in kT.** With a fixed shift in units of k_B T, the reduced
@@ -1463,19 +1480,104 @@ every reweighted estimate.
 In `run_metadata.json`:
 
 - `bias_columns`: `species`, `shifts_kT`, `n_physical_columns`,
-  `n_bias_columns`.
+  `n_bias_columns`, and `pressure` when given. Changing any of them
+  (`pressure` included) refuses `--resume`.
 - `mu_grid_eV`: the full grid.
 - `pressure_grid`: the pressure of every state; bias columns sit at
-  p_max.
+  p_max, or at `pressure`.
 - `bias_shift_kT_grid`: the shift of every state and species.
-- `column_labels`: e.g. `1 bar, mu_Pd - 1.5 kT`. `regc-monitor` and
-  `regc gui` show these labels on the replica grid.
+- `column_labels`: e.g. `1 bar, mu_Pd - 1.5 kT`, or with `pressure`
+  `1e+04 bar, mu_Pd - 3 kT`. `regc-monitor` and `regc gui` show these
+  labels on the replica grid. The setup summary prints
+  `bias columns at p = 10000 bar (p_max = 1 bar): ...`.
 
 `pressures` lists only the physical columns. From Python, build the grid
-with `regc.runner.bias_column_mu_grid` and pass
+with `regc.runner.bias_column_mu_grid` (its `base` argument takes the
+unshifted μ of the bias columns, e.g. `feed.mu_grid(T, [p_bias])[:, 0]`;
+default the last column) and pass
 `n_physical_mu=n_p` to `ReplicaExchangeGCMC`. The sampling does not
 depend on it; it only adds the bias round trips
 (`round_trip_counts()['bias']`).
+
+### 7.6 Starting from earlier configurations
+
+A run starts every replica from the template slab: bare, with the
+template's exchangeable atoms. When an earlier run (a short test, an
+interrupted run with another seed, a run on a neighbouring ladder) has
+already built adsorbate layers, an oxide or vacancies, a new run can
+start from those configurations instead of repeating the slow build-up:
+
+```yaml
+replica_exchange:
+  initial_configurations:
+    files: ../pd100_test/trajectories/replica_T*_mu*.xyz   # glob or list, relative to the yaml
+    assign: by_count        # or cyclic
+    species: O              # by_count sorts by N_O (default: the first exchanged species)
+    # index: -1             # the frame of each file (default: the last)
+```
+
+**Which files.** Any extended-XYZ (or ASE-readable) file with the atoms
+in the order regc writes them (`trajectory.save`,
+`configurations.save`): the frozen atoms, the displaceable substrate,
+then the exchangeable (mobile) particles. `files` is a path, a glob
+pattern or a list of them; each pattern's matches are sorted naturally
+(`replica_T2_mu0` before `replica_T10_mu0`). One frame is read per file
+(`index`, default the last).
+
+**What is checked.** Each frame must fit the run, otherwise a
+`ValueError` names the file:
+
+- the cell: the periodic rows (a1, a2 of a slab) within 10⁻³ Å (a plain
+  XYZ file without a cell skips this check);
+- the frozen atoms: same species, in order, at the template positions
+  (within 10⁻³ Å; regc puts the top frozen layer at z = 0, so a frame
+  from another slab or another z origin fails here);
+- the displaceable substrate: same number and species, in order (with
+  an `sgc` section, swappable species may have changed identity; with
+  `ensemble: canonical` the composition must be the template's);
+- every atom after them is an exchanged species, any number: fewer
+  exchangeable slab atoms (removed Pd) and extra adsorbates are fine;
+- every moving atom is inside the box (0 < z ≤ L_z for a slab);
+- no two atoms are closer than `calculator.min_distance` (0.5 Å without
+  it).
+
+**Who gets which.** `cyclic`: grid point s in row-major order ((T₀, μ₀),
+(T₀, μ₁), …, (T₁, μ₀), …) gets file s mod F (F files, in the order
+above). `by_count` (the default) sorts the files by their count of
+`species` (ties keep the file order) and walks the grid column by
+column in increasing μ (physical columns, then bias columns), each
+column from the hottest row to the coldest (coverage usually falls with
+T). Visit s of R = n_T × n_μ gets sorted file ⌊s F / R⌋ when F ≤ R
+(neighbours share), else round(s (F − 1)/(R − 1)) (spread over the
+whole list, both ends used). So the count never decreases along that
+walk: the emptiest configurations go to low μ, the fullest to high μ.
+With the final frames of an earlier run on the same grid (F = R) every
+grid point gets its own.
+
+Every replica's energy is recomputed with the run's calculator (in the
+main process, before the first step). The setup summary prints the file
+number and count of every grid point, and `run_metadata.json` keeps
+`initial_configurations`: the settings, every file with its frame,
+SHA-256 and counts, and `assignment` (n_T × n_μ file numbers).
+`regc-run --check` reads and checks the files too.
+
+**Exactness.** The starting configurations change only the initial
+condition of the Markov chain. Every move and swap keeps its acceptance
+rule, so the stationary distribution, and with it every MBAR estimate,
+is the same as from the template. They do not make the samples
+equilibrated: discard a burn-in as always (`phase_diagram.discard`) and
+watch the convergence checks. A configuration far from equilibrium at
+its grid point (a dense oxide at the hottest, lowest-pressure state)
+relaxes away like any other start.
+
+**Resume.** On `--resume` the checkpoint's configurations are used and
+the files are not read again (they may have changed or gone). The saved
+`initial_configurations` entry is kept; a changed, added or removed
+section gives a warning, never a refusal.
+
+From Python: `regc.initial_configurations.read_configurations(files)`
+and `start_from_configurations(sim, configurations, assign, species)` on
+a freshly built `ReplicaExchangeGCMC`, before the first step.
 
 ## 8. Saving and loading samples
 
@@ -3388,6 +3490,7 @@ The ladder: give `temperatures_K` and **exactly one** of `pressures` or
 | `adsorbed_cutoff` | – | Record `N_ads` with this cutoff (Å). |
 | `record_every` | 100 (regc), 5 (sweep) | Steps or cycles between samples. |
 | `hmc` | – | `{leapfrog_steps: 10, timestep_fs: 0.5}` (or `dt` in internal units); `enabled: true` turns on HMC in the sweep scheme. |
+| `initial_configurations` | off | Start the replicas from given configurations instead of the template ([§7.6](#76-starting-from-earlier-configurations)): `{files: run1/trajectories/*.xyz, assign: by_count, species: O, index: -1}`. `files`: a path, glob pattern or list (relative to the config file); one frame (`index`, default the last) per file, checked against the slab (cell, frozen atoms, substrate, exchanged species only, inside the box, `calculator.min_distance` or 0.5 Å apart). `assign`: `by_count` (sorted by the count of `species`, default the first exchanged species, increasing with μ) or `cyclic` (file s mod F to grid point s, row-major). Energies recomputed; ignored (with a warning if changed) on `--resume`. |
 
 `scheme: regc` keys:
 
@@ -3408,7 +3511,7 @@ The ladder: give `temperatures_K` and **exactly one** of `pressures` or
 | `displace_substrate` | false | With `mc`: move displaceable substrate atoms too. |
 | `md` | – | `{timestep_fs: 1.0, thermostat: bussi, taut_fs: 20.0, friction_per_fs: 0.01}` for `diffusion: md`. |
 | `adapt_ladder` | off | Move the (T, p) ladder after the first chunks from the measured swap rates, then freeze it ([§7.3](#73-adapting-the-ladder-during-a-run)). `true` or `{method: model, chunks: 3, trust: 1.5, per_row: true, min_gap_ratio: 0.25, max_gap_ratio: 4.0, min_attempts: 20, min_samples: 5, max_evals: 20000, max_time_s: null}`. Needs `pressures`, a `checkpoint` section with `chunk` < `n_steps`, at least 3 temperatures or 3 pressures, and scipy. Every change discards the samples so far. With `method: es` the ladder is optimised before the run by an evolution strategy on short trial runs ([§7.4](#74-optimising-the-ladder-by-an-evolution-strategy-model-free)); its keys are in the table below. |
-| `bias_columns` | off | Extra columns after the highest pressure, in which a species' μ is lowered by shift × k_B T ([§7.5](#75-bias-columns-replicas-at-a-shifted-chemical-potential)): `{species: Pd, shifts_kT: [1.5, 3.0, 4.5]}` (one list for one or several species) or `{shifts_kT: {Pd: [...], Pt: [...]}}` (one list per species, all the same length). Shifts positive and strictly increasing, at least one; the species must be exchanged. Needs `pressures`; not with `adapt_ladder`, `phase_diagram.merge` or `phase_diagram.suggest_ladder`. Adds n_T × len(shifts) replicas; the phase diagram stays at the physical μ. |
+| `bias_columns` | off | Extra columns after the highest pressure, in which a species' μ is lowered by shift × k_B T ([§7.5](#75-bias-columns-replicas-at-a-shifted-chemical-potential)): `{species: Pd, shifts_kT: [1.5, 3.0, 4.5]}` (one list for one or several species) or `{shifts_kT: {Pd: [...], Pt: [...]}}` (one list per species, all the same length). Shifts positive and strictly increasing, at least one; the species must be exchanged. `pressure` (in `pressure_unit`, ≥ the last of `pressures`; default that last pressure): the gas pressure of the bias columns, every species' μ from the feed at (T, `pressure`) before the shift. Needs `pressures`; not with `adapt_ladder`, `phase_diagram.merge` or `phase_diagram.suggest_ladder`. Adds n_T × len(shifts) replicas; the phase diagram stays at the physical μ. |
 
 `adapt_ladder` keys with `method: es` (other keys are refused):
 
@@ -3611,7 +3714,7 @@ Everything goes to `output.directory`:
 | File | Contents |
 |---|---|
 | `samples.npz` | Per replica: U, N, N_ads, N_s, plus the ladder, μ grid and Λ³. Readable with `load_samples`. |
-| `run_metadata.json` | The setup: species, masses, temperatures, μ grid, pressures and unit, composition, reservoirs (D0, e_atom, ...), structure, calculator, lattice constant, `n_surface`, area, insertion window and sampling settings. `--analyze-only` and `--resume` rely on it. |
+| `run_metadata.json` | The setup: species, masses, temperatures, μ grid, pressures and unit, composition, reservoirs (D0, e_atom, ...), structure, calculator, lattice constant, `n_surface`, area, insertion window and sampling settings (and with `initial_configurations` which file every grid point started from). `--analyze-only` and `--resume` rely on it. |
 | `checkpoint.pkl` | With a `checkpoint` section: the full simulation state. |
 | `phase_diagram.png` | The coverage map. |
 | `phase_diagram_most_probable.png` | With `most_probable: true`. |
