@@ -862,11 +862,43 @@ pre#log{margin:0;height:380px;overflow:auto;padding:12px 14px;font:12.5px/1.55 v
 pre#log.nowrap{white-space:pre;overflow-wrap:normal}
 .bezel-label,.led{display:none}
 .phos{display:none}
+.phos select{min-height:32px}
 /* ---- log, vintage CRT (1960s/70s video terminal) ---------------------------------------------- */
-.crt-on{--ph:#41ff7a;--ph-dim:#1f9f4a;--ph-glow:rgba(65,255,122,.45);--glass:#0d1a10,#050906,#010201}
-.crt-on.ph-amber{--ph:#ffb238;--ph-dim:#a8701a;--ph-glow:rgba(255,178,56,.42)}
-.crt-on.ph-white{--ph:#e9f1ff;--ph-dim:#8995a8;--ph-glow:rgba(205,222,255,.35)}
-.crt-on .phos{display:inline-flex}
+body.crt{--ph:#41ff7a;--ph-dim:#1f9f4a;--ph-hi:#c2ffd3;--ph-deep:#06301a;--ph-grid:rgba(65,255,122,.16);
+--ph-glow:rgba(65,255,122,.45);--glass-a:#0d1a10;--glass-b:#050906}
+body.crt.ph-amber{--ph:#ffb238;--ph-dim:#a8701a;--ph-hi:#ffe3ad;--ph-deep:#3a2306;--ph-grid:rgba(255,178,56,.16);
+--ph-glow:rgba(255,178,56,.42);--glass-a:#1d1406;--glass-b:#0b0703}
+body.crt.ph-white{--ph:#e9f1ff;--ph-dim:#8995a8;--ph-hi:#ffffff;--ph-deep:#1b2230;--ph-grid:rgba(205,222,255,.14);
+--ph-glow:rgba(205,222,255,.35);--glass-a:#141922;--glass-b:#07090d}
+body.crt .phos{display:inline-flex}
+/* ---- vintage mode for the whole dashboard: every card a 1970s terminal ---------------------- */
+body.crt .card{background:linear-gradient(160deg,#e6dfcb 0%,#d3cab2 45%,#bdb49c 100%);border-color:#a39a82;color:#3a362c;
+box-shadow:inset 0 2px 0 rgba(255,255,255,.55),inset 0 -3px 0 rgba(0,0,0,.15),0 8px 22px rgba(0,0,0,.3)}
+body.crt .card-h h2{color:#5d5646;font:20px/1 var(--crt);letter-spacing:.14em;text-shadow:0 1px 0 rgba(255,255,255,.5)}
+body.crt .card .sub,body.crt .card .note,body.crt .where{color:#665f4e}
+body.crt .card .sel{background-color:#efe8d6;border-color:#a39a82;color:#3a362c}
+body.crt .card table td,body.crt .card table th{border-color:#b3aa92}body.crt .card th{color:#5d5646}
+body.crt .card tr:hover td{background:rgba(0,0,0,.05)}
+body.crt .card .chip{background:#efe8d6;border-color:#a39a82;color:#5d5646}
+body.crt .card .toggle{color:#5d5646}
+body.crt .plot{position:relative;border-radius:16px/22px;overflow:hidden;
+background:radial-gradient(ellipse at 50% 45%,var(--glass-a) 0%,var(--glass-b) 62%,#000 100%);
+box-shadow:inset 0 0 60px rgba(0,0,0,.95),0 0 0 3px #2c2a24,0 0 0 6px #191814;margin:6px 0}
+body.crt .plot::after{content:"";position:absolute;inset:0;pointer-events:none;z-index:5;
+background:repeating-linear-gradient(to bottom,rgba(0,0,0,.3) 0,rgba(0,0,0,.3) 1px,transparent 2px,transparent 3px),
+radial-gradient(ellipse at center,transparent 58%,rgba(0,0,0,.55) 100%)}
+body.crt .plot .main-svg{filter:drop-shadow(0 0 1.6px var(--ph-glow))}
+body.crt .plot .note{color:var(--ph);font:20px/1.2 var(--crt);text-shadow:0 0 6px var(--ph-glow);padding:24px 18px!important}
+body.crt .kpi{background:radial-gradient(ellipse at 50% 40%,var(--glass-a),#000);border:0;box-shadow:inset 0 0 18px rgba(0,0,0,.9),0 0 0 3px #2c2a24}
+body.crt .kpis{grid-template-columns:repeat(auto-fill,minmax(175px,1fr))}
+body.crt .kpi b{color:var(--ph);font:25px/1.1 var(--crt);text-shadow:0 0 2px var(--ph),0 0 10px var(--ph-glow)}
+body.crt .kpi span{color:var(--ph-dim);font:16px/1.1 var(--crt);letter-spacing:.04em}
+body.crt .bar{background:#050906;box-shadow:inset 0 0 6px #000,0 0 0 2px #2c2a24}
+body.crt .bar>div{background:var(--ph);box-shadow:0 0 10px var(--ph-glow)}
+body.crt .pct{color:#3a362c;font-family:var(--crt);font-size:22px}
+body.crt .imgs img{filter:sepia(.35) contrast(1.05);border-color:#a39a82}
+body.crt .bezel{background:none;box-shadow:none;padding:4px 0 26px}
+body.crt .bezel-label{left:4px;bottom:6px}body.crt .led{right:6px;bottom:8px}
 .crt-on .bezel{padding:22px 24px 34px;border-radius:26px;position:relative;
 background:linear-gradient(160deg,#e3dbc6 0%,#cfc6ae 45%,#b9b099 100%);
 box-shadow:inset 0 2px 0 rgba(255,255,255,.6),inset 0 -3px 0 rgba(0,0,0,.18),0 10px 30px rgba(0,0,0,.35)}
@@ -909,6 +941,9 @@ animation:blink 1.05s steps(1) infinite}
 <select id="run" class="sel" aria-label="run"></select>
 <span id="badge" class="pill waiting" role="status"><i></i><span id="badgetxt">…</span></span>
 <span id="updated" class="updated"></span><span class="spacer"></span>
+<label class="toggle" title="1960s/70s video terminals: plots, numbers and log"><input type="checkbox" id="crt"> vintage</label>
+<label class="phos toggle"><select id="phosphor" class="sel" aria-label="phosphor colour">
+<option value="green">P1 green</option><option value="amber">P3 amber</option><option value="white">P4 white</option></select></label>
 <label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh 5 s</label>
 <button class="iconbtn" id="theme" type="button" aria-label="colour theme" title="colour theme"></button>
 </header>
@@ -947,9 +982,7 @@ animation:blink 1.05s steps(1) infinite}
 <span id="logname" class="chip"></span><span class="spacer"></span>
 <label class="toggle"><input type="checkbox" id="follow" checked> follow</label>
 <label class="toggle"><input type="checkbox" id="wrap" checked> wrap</label>
-<label class="toggle" title="1960s/70s video terminal"><input type="checkbox" id="crt"> vintage</label>
-<label class="phos toggle">phosphor <select id="phosphor" class="sel" aria-label="phosphor colour">
-<option value="green">P1 green</option><option value="amber">P3 amber</option><option value="white">P4 white</option></select></label></div>
+</div>
 <div class="bezel"><div class="screen" id="screen"><pre id="log" tabindex="0" aria-label="run log"></pre></div>
 <span class="bezel-label">REGC&nbsp;&nbsp;MODEL&nbsp;1970&nbsp;&nbsp;VIDEO&nbsp;DISPLAY&nbsp;TERMINAL</span><span class="led" aria-hidden="true"></span></div></section>
 </main>
@@ -963,6 +996,10 @@ return d?`${d} d ${h} h`:h?`${h} h ${m} min`:m?`${m} min ${s%60} s`:`${s} s`};
 const fmtB=b=>b>1e9?(b/1e9).toFixed(2)+" GB":b>1e6?(b/1e6).toFixed(1)+" MB":b>1e3?(b/1e3).toFixed(0)+" kB":b+" B";
 const fmtN=(x,d=3)=>x==null||!isFinite(x)?"–":Number(x).toPrecision(d).replace("-","−");
 const fmtP=x=>{const a=Math.abs(x);return (a&&(a<1e-2||a>=1e4)?Number(x).toExponential(2).replace("e+","e").replace(/e(-?)0*(\d)/,"e$1$2"):Number(x).toPrecision(3)).replace("-","−")};
+const CRT=()=>document.body.classList.contains("crt");
+const bcss=v=>getComputedStyle(document.body).getPropertyValue(v).trim();
+/* series colours: the theme's, or phosphor shades on a monochrome CRT (told apart by brightness and dash) */
+const C=v=>CRT()?({"--accent":bcss("--ph"),"--ok":bcss("--ph-hi"),"--warn":bcss("--ph-dim"),"--bad":bcss("--ph-dim")}[v]||bcss("--ph")):css(v);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const ord=n=>n+(n%100>=11&&n%100<=13?"th":["th","st","nd","rd"][n%10]||"th");
 const tail=(p,n=3)=>{if(!p)return"";const a=String(p).split("/").filter(Boolean);return a.length>n?"…/"+a.slice(-n).join("/"):p};
@@ -975,10 +1012,11 @@ $("theme").title=$("theme").ariaLabel=`colour theme: ${t} (click to change)`;if(
 $("theme").onclick=()=>{const o=["auto","light","dark"],t=document.documentElement.dataset.theme;setTheme(o[(o.indexOf(t)+1)%3])};
 matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change",()=>last&&draw(last));
 /* ---- log controls --------------------------------------------------------------------------- */
-function setCrt(on,boot){$("logcard").classList.toggle("crt-on",on);$("crt").checked=on;store.set("crt",on?"1":"0");
+function setCrt(on,boot){document.body.classList.toggle("crt",on);$("logcard").classList.toggle("crt-on",on);$("crt").checked=on;store.set("crt",on?"1":"0");
+if(last)draw(last);
 if(on&&boot){const s=$("screen");s.classList.remove("boot");void s.offsetWidth;s.classList.add("boot")}renderLog(last)}
 $("crt").onchange=()=>setCrt($("crt").checked,true);
-$("phosphor").onchange=()=>{const p=$("phosphor").value;$("logcard").classList.remove("ph-amber","ph-white");if(p!="green")$("logcard").classList.add("ph-"+p);store.set("phosphor",p)};
+$("phosphor").onchange=()=>{const p=$("phosphor").value;document.body.classList.remove("ph-amber","ph-white");if(p!="green")document.body.classList.add("ph-"+p);store.set("phosphor",p);if(last&&CRT())draw(last)};
 $("wrap").onchange=()=>{$("log").classList.toggle("nowrap",!$("wrap").checked);store.set("wrap",$("wrap").checked?"1":"0")};
 $("follow").onchange=()=>{store.set("follow",$("follow").checked?"1":"0");if($("follow").checked)$("log").scrollTop=1e9};
 $("log").addEventListener("scroll",()=>{const l=$("log");const atEnd=l.scrollHeight-l.scrollTop-l.clientHeight<24;
@@ -991,11 +1029,13 @@ const atEnd=l.scrollHeight-l.scrollTop-l.clientHeight<24;l.innerHTML=esc(text)+(
 if($("follow").checked||atEnd){l._prog=true;l.scrollTop=l.scrollHeight;setTimeout(()=>l._prog=false,50)}
 $("logname").textContent=d.log?tail(d.log.path,3):"";$("logname").title=d.log?d.log.path:""}
 /* ---- plotly ----------------------------------------------------------------------------------- */
-function layout(extra){const ink=css("--ink"),line=css("--line"),mut=css("--muted");
-const ax={gridcolor:line,zerolinecolor:line,linecolor:line,automargin:true,tickfont:{color:mut,size:11},title:{standoff:10,font:{color:mut,size:12}}};
+function layout(extra){const crt=CRT(),ink=crt?bcss("--ph"):css("--ink"),line=crt?bcss("--ph-grid"):css("--line"),mut=crt?bcss("--ph-dim"):css("--muted");
+const fam=crt?css("--crt"):css("--sans"),fs=crt?15:12;
+const ax={gridcolor:line,zerolinecolor:line,linecolor:line,automargin:true,tickfont:{color:mut,size:fs-1},title:{standoff:10,font:{color:mut,size:fs}}};
 const base={margin:{l:10,r:10,t:30,b:10,pad:2},paper_bgcolor:"rgba(0,0,0,0)",plot_bgcolor:"rgba(0,0,0,0)",
-font:{color:ink,size:12,family:css("--sans")},hoverlabel:{font:{family:css("--mono")}},
-xaxis:{...ax},yaxis:{...ax},legend:{orientation:"h",x:0,y:-0.22,yanchor:"top",font:{size:11,color:mut}},hovermode:"closest"};
+font:{color:ink,size:fs,family:fam},hoverlabel:crt?{bgcolor:"#000",bordercolor:ink,font:{family:fam,color:ink,size:16}}:{font:{family:css("--mono")}},
+xaxis:{...ax},yaxis:{...ax},legend:{orientation:"h",x:0,y:-0.22,yanchor:"top",font:{size:fs-1,color:mut}},hovermode:"closest"};
+if(crt)base.margin={l:14,r:14,t:30,b:14,pad:2};
 const e=extra||{};for(const k of Object.keys(e)){if((k.startsWith("xaxis")||k.startsWith("yaxis"))&&typeof e[k]=="object"){
 const t=e[k].title;base[k]={...ax,...e[k],title:typeof t=="string"?{...ax.title,text:t}:{...ax.title,...(t||{})}}}else base[k]=e[k]}
 return base}
@@ -1045,9 +1085,10 @@ function heat(id,z,a,opts){const nM=a.x.length,nT=a.y.length;const cellW=(($(id)
 const big=nM*nT<=160&&cellW>=34;   /* cell values only where they fit */
 const text=z.map(r=>r.map(v=>v==null?"":fmtN(v,opts.digits||3)));
 const cd=z.map((r,i)=>r.map((_,j)=>a.x[j]));
-Plotly.react(id,[{type:"heatmap",z,x:a.x,y:a.y,customdata:cd,colorscale:opts.colorscale||"Viridis",reversescale:!!opts.reverse,zmin:opts.zmin,zmax:opts.zmax,
-xgap:1.5,ygap:1.5,text,texttemplate:big?"%{text}":"",textfont:{size:nM>9?9.5:11,family:css("--mono")},
-hovertemplate:"%{y} · %{customdata}<br><b>%{z}</b><extra></extra>",colorbar:{thickness:10,outlinewidth:0,tickfont:{color:css("--muted"),size:10}}}],
+const crt=CRT(),mono=[[0,"#000000"],[0.08,bcss("--ph-deep")],[1,bcss("--ph")]];
+Plotly.react(id,[{type:"heatmap",z,x:a.x,y:a.y,customdata:cd,colorscale:crt?mono:(opts.colorscale||"Viridis"),reversescale:crt?false:!!opts.reverse,zmin:opts.zmin,zmax:opts.zmax,
+xgap:1.5,ygap:1.5,text,texttemplate:big?"%{text}":"",textfont:{size:crt?(nM>9?13:15):(nM>9?9.5:11),family:crt?css("--crt"):css("--mono")},
+hovertemplate:"%{y} · %{customdata}<br><b>%{z}</b><extra></extra>",colorbar:{thickness:10,outlinewidth:0,tickfont:{color:crt?bcss("--ph-dim"):css("--muted"),size:crt?13:10}}}],
 layout({xaxis:{title:a.xt,type:"category",tickvals:a.x,ticktext:a.xs,tickangle:nM>7?-40:0,showgrid:false},
 yaxis:{title:a.yt,type:"category",showgrid:false}}),cfg)}
 function drawGrid(d){const g=gridData(d);if(!g||!g.z){empty("grid",g?"Not recorded in this run (adsorbed_cutoff / subsurface section).":"Per-replica data appear with status.json (new runs) or samples.npz (checkpoints, end of run).");return}
@@ -1058,9 +1099,9 @@ function drawTraces(d){const st=d.status;let tr=st?st.traces:d.samples&&d.sample
 if(!tr){Plotly.purge("traces");$("tracekey").textContent="";return}if(!sel)sel=keys[0];
 let i=keys.findIndex(k=>k[0]==sel[0]&&k[1]==sel[1]);if(i<0)i=0;const x=tr.N[i].map((_,j)=>j*tr.stride);
 $("tracekey").textContent=`replica (${keys[i][0]}, ${keys[i][1]}) · ${tr.stride>1?"every "+ord(tr.stride)+" sample":"all samples"}`;
-Plotly.react("traces",[{x,y:tr.N[i],name:"N",mode:"lines",line:{color:css("--accent"),width:1.6}},
-{x,y:tr.U[i],name:"U (eV)",yaxis:"y2",mode:"lines",line:{color:css("--warn"),width:1.2,dash:"dot"}},
-...(tr.N_sub&&tr.N_sub[i]&&tr.N_sub[i].length?[{x,y:tr.N_sub[i],name:"N subsurface",mode:"lines",line:{color:css("--ok"),width:1.4}}]:[])],
+Plotly.react("traces",[{x,y:tr.N[i],name:"N",mode:"lines",line:{color:C("--accent"),width:1.6}},
+{x,y:tr.U[i],name:"U (eV)",yaxis:"y2",mode:"lines",line:{color:C("--warn"),width:1.2,dash:"dot"}},
+...(tr.N_sub&&tr.N_sub[i]&&tr.N_sub[i].length?[{x,y:tr.N_sub[i],name:"N subsurface",mode:"lines",line:{color:C("--ok"),width:1.4}}]:[])],
 layout({xaxis:{title:"sample"},yaxis:{title:"N"},yaxis2:{title:"U (eV)",overlaying:"y",side:"right",showgrid:false}}),cfg)}
 function compSt(d,c){if(d.status)return d.status;const m=d.metadata||{},z=c.grids.mean_swappable;
 return {shape:[z.length,z[0].length],temperatures:m.temperatures_K||z.map((_,i)=>i),mu_grid:m.mu_grid_eV||[z[0]],labels:{}}}
@@ -1081,34 +1122,34 @@ drawCompTraces(d)}
 function drawCompTraces(d){const c=d.composition;if(!c)return;const keys=c.keys,tr=c.traces;if(!sel)sel=keys[0];
 let i=keys.findIndex(k=>k[0]==sel[0]&&k[1]==sel[1]);if(i<0)i=0;const ys=tr.swappable[i]||[];const x=ys.map((_,j)=>j*tr.stride);
 $("comptrkey").textContent=`replica (${keys[i][0]}, ${keys[i][1]})`;
-const t=[{x,y:ys,name:`${c.species}, swappable layers`,mode:"lines",line:{color:css("--accent"),width:1.4}}];
-if(tr.top)t.push({x,y:tr.top[i],name:`${c.species}, top layer`,mode:"lines",line:{color:css("--warn"),width:1.4}});
+const t=[{x,y:ys,name:`${c.species}, swappable layers`,mode:"lines",line:{color:C("--accent"),width:1.4}}];
+if(tr.top)t.push({x,y:tr.top[i],name:`${c.species}, top layer`,mode:"lines",line:{color:C("--warn"),width:1.4}});
 Plotly.react("comptr",t,layout({xaxis:{title:"sample"},yaxis:{title:`${c.species} fraction`,range:[0,1]}}),cfg)}
 function drawHist(d){const lp=d.log?d.log.progress:[];const h=d.history||[];
-const tr=[];if(lp.length)tr.push({x:lp.map(p=>p[0]),y:lp.map(p=>p[2]),name:"log",mode:"lines+markers",line:{color:css("--accent"),width:2},marker:{size:5}});
-if(h.length)tr.push({x:h.map(p=>p[1]),y:h.map(p=>p[2]),name:"status (this monitor)",mode:"markers",marker:{color:css("--warn"),size:5}});
+const tr=[];if(lp.length)tr.push({x:lp.map(p=>p[0]),y:lp.map(p=>p[2]),name:"log",mode:"lines+markers",line:{color:C("--accent"),width:2},marker:{size:5}});
+if(h.length)tr.push({x:h.map(p=>p[1]),y:h.map(p=>p[2]),name:"status (this monitor)",mode:"markers",marker:{color:C("--warn"),size:5}});
 if(!tr.length){empty("hist","No progress yet.");return}
 Plotly.react("hist",tr,layout({xaxis:{title:"step"},yaxis:{title:"mean N"},showlegend:tr.length>1}),cfg)}
 function drawSwaps(d){const src=d.status||d.mixing;if(!src){empty("swaps","Swap statistics appear with status.json or mixing.json.");$("pairs").innerHTML="";empty("trips","–");return}
 const acc=src.swap_acceptance,att=src.swap_attempts||{},t=Object.keys(acc).filter(k=>att[k]==null||att[k]>0);
-Plotly.react("swaps",[{type:"bar",x:t,y:t.map(k=>acc[k]),marker:{color:t.map(k=>acc[k]<0.05?css("--bad"):acc[k]<0.15?css("--warn"):css("--accent"))},
-text:t.map(k=>fmtN(acc[k],2)),textposition:"outside",cliponaxis:false,textfont:{size:11,color:css("--ink")},
+Plotly.react("swaps",[{type:"bar",x:t,y:t.map(k=>acc[k]),marker:{color:t.map(k=>acc[k]<0.05?C("--bad"):acc[k]<0.15?C("--warn"):C("--accent"))},
+text:t.map(k=>fmtN(acc[k],2)),textposition:"outside",cliponaxis:false,textfont:{size:CRT()?15:11,color:CRT()?bcss("--ph"):css("--ink")},
 customdata:t.map(k=>att[k]!=null?att[k].toLocaleString()+" attempts":""),hovertemplate:"%{x}: %{y:.3f}<br>%{customdata}<extra></extra>"}],
 layout({yaxis:{title:"acceptance",range:[0,1.15],dtick:.25},xaxis:{tickangle:0},bargap:.35}),cfg);
 const pairs=(src.pairs||[]).filter(p=>p.attempts>0).sort((a,b)=>a.acceptance-b.acceptance||b.attempts-a.attempts).slice(0,5);
 $("pairs").innerHTML=pairs.length?`<table><tr><th>worst pairs</th><th class="num">attempts</th><th class="num">acceptance</th></tr>${pairs.map(p=>`<tr><td class="nw">(${p.a}) ↔ (${p.b})</td><td class="num">${p.attempts}</td><td class="num">${fmtN(p.acceptance,3)}</td></tr>`).join("")}</table>`:"";
 const T=src.round_trips_T||[],M=src.round_trips_mu||[],B=src.round_trips_bias||[];const w=T.map((_,i)=>i);
-const tr=[{type:"bar",x:w,y:T,name:"along T",marker:{color:css("--accent")}},{type:"bar",x:w,y:M,name:"along μ / p",marker:{color:css("--ok")}}];
-if(B.length)tr.push({type:"bar",x:w,y:B,name:"to bias columns",marker:{color:css("--warn")}});
+const tr=[{type:"bar",x:w,y:T,name:"along T",marker:{color:C("--accent")}},{type:"bar",x:w,y:M,name:"along μ / p",marker:{color:C("--ok")}}];
+if(B.length)tr.push({type:"bar",x:w,y:B,name:"to bias columns",marker:{color:C("--warn")}});
 const mx=Math.max(1,...T,...M,...B);
 Plotly.react("trips",tr,layout({barmode:"group",bargap:.15,xaxis:{title:"walker"},yaxis:{title:"half round trips",range:[0,mx*1.1],rangemode:"tozero"}}),cfg)}
 function drawConv(d){const c=(d.status&&d.status.convergence_history)||[];if(!c.length){$("convsub").textContent="";
 empty("conv","No convergence checks yet (replica_exchange.convergence_every).");return}
 const cv=(d.status&&d.status.convergence)||{},st=cv.settings||{},noise=st.mode==="noise";const xs=c.map((_,i)=>i+1);
-const tr=[{y:c,x:xs,mode:"lines+markers",name:noise?"max TV / noise":"max |Δρ(u)|",line:{color:css("--accent"),width:2}}];
-if(st.tol!=null)tr.push({y:c.map(()=>st.tol),x:xs,mode:"lines",name:"tolerance (max)",line:{color:css("--accent"),dash:"dash",width:1}});
-if(noise){const ch=cv.checks||[];if(ch.length){tr.push({y:ch.map(x=>x.median_ratio),x:ch.map((_,i)=>i+1),mode:"lines+markers",name:"median TV / noise",line:{color:css("--warn"),width:2}});
-if(st.median_tol!=null)tr.push({y:ch.map(()=>st.median_tol),x:ch.map((_,i)=>i+1),mode:"lines",name:"tolerance (median)",line:{color:css("--warn"),dash:"dash",width:1}})}}
+const tr=[{y:c,x:xs,mode:"lines+markers",name:noise?"max TV / noise":"max |Δρ(u)|",line:{color:C("--accent"),width:2}}];
+if(st.tol!=null)tr.push({y:c.map(()=>st.tol),x:xs,mode:"lines",name:"tolerance (max)",line:{color:C("--accent"),dash:"dash",width:1}});
+if(noise){const ch=cv.checks||[];if(ch.length){tr.push({y:ch.map(x=>x.median_ratio),x:ch.map((_,i)=>i+1),mode:"lines+markers",name:"median TV / noise",line:{color:C("--warn"),width:2}});
+if(st.median_tol!=null)tr.push({y:ch.map(()=>st.median_tol),x:ch.map((_,i)=>i+1),mode:"lines",name:"tolerance (median)",line:{color:C("--warn"),dash:"dash",width:1}})}}
 const lc=(cv.checks||[]).slice(-1)[0];
 $("convsub").textContent=lc&&lc.min_neff!=null?`min n_eff ${lc.min_neff.toFixed(1)}${st.min_neff!=null?" (need "+st.min_neff+")":""}`:"";
 Plotly.react("conv",tr,layout({xaxis:{title:"check",dtick:c.length<12?1:undefined},yaxis:{title:noise?"TV / noise floor":"max |Δρ(u)|",rangemode:"tozero"}}),cfg)}
