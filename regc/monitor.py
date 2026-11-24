@@ -1076,7 +1076,11 @@ $("where").innerHTML=`<span title="${esc(d.directory)}">${esc(tail(d.directory,4
 drawGrid(d);drawTraces(d);drawComp(d);drawHist(d);drawSwaps(d);drawConv(d);drawData(d);renderLog(d);
 const imgs=d.images||[];$("imgcard").hidden=!imgs.length;
 $("imgs").innerHTML=imgs.map(n=>`<a href="file/${cur}/${encodeURIComponent(n)}" target="_blank" rel="noopener"><img loading="lazy" src="file/${cur}/${encodeURIComponent(n)}?t=${Math.round(d.now)}" alt="${esc(n)}"><div class="note" title="${esc(n)}">${esc(n)}</div></a>`).join("");}
-function gridData(d){const st=d.status;if(st)return {st,z:st.replicas[$("gridq").value]};
+const allNull=z=>!z||!z.flat().some(v=>v!=null);
+function gridData(d){const st=d.status;if(st){const q=$("gridq").value;let z=st.replicas[q],note="";
+const cur={mean_N:"current_N",std_N:"current_N",mean_U:"current_U",n_samples:"current_N"}[q];
+if(allNull(z)&&cur&&!allNull(st.replicas[cur])){z=st.replicas[cur];note=`No samples recorded yet (warm-up, ladder trials or burn-in): showing ${cur.replace("_"," ")} instead.`}
+return {st,z,note}}
 const s=d.samples;if(!s||!d.metadata)return null;const nT=d.metadata.temperatures_K.length,keys=s.keys,
 nM=Math.max(...keys.map(k=>k[1]))+1;const q=$("gridq").value,src={mean_N:s.mean_N,std_N:s.std_N,mean_U:s.mean_U}[q];
 if(!src)return null;const z=[...Array(nT)].map(()=>Array(nM).fill(null));keys.forEach((k,i)=>z[k[0]][k[1]]=src[i]);
@@ -1092,7 +1096,7 @@ hovertemplate:"%{y} · %{customdata}<br><b>%{z}</b><extra></extra>",colorbar:{th
 layout({xaxis:{title:a.xt,type:"category",tickvals:a.x,ticktext:a.xs,tickangle:nM>7?-40:0,showgrid:false},
 yaxis:{title:a.yt,type:"category",showgrid:false}}),cfg)}
 function drawGrid(d){const g=gridData(d);if(!g||!g.z){empty("grid",g?"Not recorded in this run (adsorbed_cutoff / subsurface section).":"Per-replica data appear with status.json (new runs) or samples.npz (checkpoints, end of run).");return}
-const a=axes(g.st,d.metadata);heat("grid",g.z,a,{});$("gridnote").textContent="";
+const a=axes(g.st,d.metadata);heat("grid",g.z,a,{});$("gridnote").textContent=g.note||"";
 $("grid").removeAllListeners?.("plotly_click");$("grid").on&&$("grid").on("plotly_click",e=>{const p=e.points[0];
 sel=[a.y.indexOf(p.y),a.x.indexOf(p.x)];drawTraces(last);drawCompTraces(last)})}
 function drawTraces(d){const st=d.status;let tr=st?st.traces:d.samples&&d.samples.traces,keys=st?st.keys:d.samples&&d.samples.keys;
