@@ -3132,7 +3132,7 @@ nanoparticle).
 | `cluster` | – | A mapping for an `ase.cluster` function (below). |
 | `geometry` | `cluster` with a `cluster` block, else `slab` | `slab` or `cluster`. Needed only to read a cluster from `file`. |
 | `n_frozen_layers` | all layers | Slab only: bottom layers kept rigid; the rest are displaceable. |
-| `exchangeable_top_layers` | 0 | Slab only: these top layers start as exchangeable atoms (their element must be in `gas.species`, usually with `reservoir.<el>.type: bulk`), so GC moves can remove and re-insert them (§14.4). |
+| `exchangeable_top_layers` | 0 | Slab only: these top layers start as exchangeable atoms (their element must be in `gas.species`, usually with `reservoir.<el>.type: bulk`), so GC moves can remove and re-insert them (§14.4). They then count in N, adsorbed counts and coverage: set `phase_diagram.observable` (e.g. `N_O`) and `subsurface.species` explicitly (required). With a slab from a file, a bulk reservoir needs `lattice_constant_angstrom`. |
 | `layers` | – | Slab only, instead of `n_frozen_layers`: `{fixed: 2, thermostat: 2, free: 2}`. Rigid bottom, thermostatted middle, NVE top (§2.1.1). With `build`, give `size: [nx, ny]` and the layers set the depth. On open or stepped surfaces a layer is several atomic planes (§2.1); the plane count must divide by the sum. A warning is printed unless `diffusion: md`. |
 | `layer_tol` | 0.001 | Slab only: z tolerance (Å) for grouping atoms into layers. |
 | `frozen` | `center` | Cluster only: `center` (the central atom), `core` (fully coordinated atoms), `none`, or a number of central atoms (§2.6). |
@@ -3316,7 +3316,7 @@ mapping. It can sit next to `subsurface`, which then is channel 0.
 | `merge_angstrom` | 0.3 (trilateration), 0.25 (voronoi) | Merge sites closer than this. |
 | `delta_angstrom` | 0.3 | Radius of the insertion ball around a site. |
 | `defensive_fraction` | 0.05 | ε: fraction of proposals uniform in the region. |
-| `partition_gas_zone` | false | `true` raises the gas zone to the top of the region, as `subsurface` does. `false` is an overlay. |
+| `partition_gas_zone` | false | `true` raises the gas zone to the top of the region, as `subsurface` does, for every exchanged species (not only the channel's): no species is then inserted or deleted instantaneously in that z-range. `false` is an overlay. |
 | `freeze_switched` | true | Hold the switched atom fixed during the protocol. |
 | `ncmc_steps`, `kernel`, `kernel_steps`, `leapfrog_steps`, `timestep_fs`, `friction_per_fs`, `max_disp`, `weight` | as `subsurface` | The NCMC protocol and the channel's frequency (§14.4c). |
 

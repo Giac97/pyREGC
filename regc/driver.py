@@ -166,6 +166,42 @@ def update_metadata(path: str, update: dict) -> None:
     _write_json_atomic(path, saved)
 
 
+#: Metadata keys added after v0.6.0 with the value they take when the feature is unused:
+#: a run saved before they existed resumes when the current run has exactly that value.
+_NEW_METADATA_DEFAULTS = {"initial_mobile_counts": {}}
+#: The same for keys inside a metadata section (the subsurface channel's settings).
+_NEW_NESTED_METADATA_DEFAULTS = {
+    "subsurface": {"freeze_switched": False, "site_method": "voronoi", "bond_length": None,
+                   "site_merge": 0.25, "defensive_fraction": 0.0, "partition_gas_zone": True},
+}
+
+
+def _drop_new_defaults(saved: dict, current: dict) -> None:
+    """
+    Drop keys that only one side has and that hold their pre-existing default.
+
+    Parameters
+    ----------
+    saved, current : dict
+        Saved and current metadata (modified in place).
+
+    Returns
+    -------
+    None
+    """
+    def drop(a, b, defaults):
+        for key, default in defaults.items():
+            if (key in a) != (key in b):
+                side = a if key in a else b
+                if side[key] == default:
+                    side.pop(key)
+    drop(saved, current, _NEW_METADATA_DEFAULTS)
+    for section, defaults in _NEW_NESTED_METADATA_DEFAULTS.items():
+        a, b = saved.get(section), current.get(section)
+        if isinstance(a, dict) and isinstance(b, dict):
+            drop(a, b, defaults)
+
+
 def _check_metadata(path: str, metadata: dict) -> None:
     """
     Refuse to resume a run whose metadata differ from the saved ones.
@@ -194,6 +230,7 @@ def _check_metadata(path: str, metadata: dict) -> None:
             saved.pop(key, None)
         saved.update(adapted.get("original", {}))
     current = json.loads(json.dumps(metadata, default=float))
+    _drop_new_defaults(saved, current)    # runs saved before those keys existed
     only = sorted(set(saved) ^ set(current))
     if only:
         raise ValueError(f"cannot resume: metadata keys {only} are in only one of the current "

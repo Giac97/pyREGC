@@ -526,7 +526,8 @@ def validate_config(config: Dict[str, Any]) -> None:
     kind = _geometry_kind(struct)
     if kind == "cluster" and "build" in struct:
         raise ValueError("structure.build makes a slab; use structure.cluster for a cluster")
-    wrong = ({"n_frozen_layers", "layers", "layer_tol"} if kind == "cluster"
+    wrong = ({"n_frozen_layers", "layers", "layer_tol", "exchangeable_top_layers"}
+             if kind == "cluster"
              else {"frozen", "full_coordination"}) & set(struct)
     if kind == "slab" and "layers" in struct:
         from .structures import substrate_layers
@@ -2019,6 +2020,10 @@ def _subsurface_settings(config: Dict[str, Any], geometry: Any, species: Sequenc
     if "species" in sec:
         sub_species = [sec["species"]] if isinstance(sec["species"], str) else [
             str(x) for x in sec["species"]]
+    elif int((config.get("structure") or {}).get("exchangeable_top_layers", 0) or 0) > 0:
+        raise ValueError("subsurface: with structure.exchangeable_top_layers the slab atoms are "
+                         "exchanged too; list subsurface.species explicitly (e.g. [O]) instead of "
+                         "defaulting to every exchanged species")
     elif "molecules" not in config:
         sub_species = list(species)
     else:
@@ -2373,6 +2378,11 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
                 raise ValueError(f"structure.exchangeable_top_layers: the top layers hold "
                                  f"{foreign}, which are not exchanged species {list(species)} "
                                  f"(add them to gas.species with a reservoir, e.g. type: bulk)")
+            if "observable" not in (config.get("phase_diagram") or {}):
+                warnings.warn("structure.exchangeable_top_layers: the slab's top-layer atoms are "
+                              "mobile particles now, so N (the default phase_diagram.observable, "
+                              "adsorbed counts and coverage) includes them; set "
+                              "phase_diagram.observable to e.g. N_O", stacklevel=2)
         cell, pbc = np.zeros((3, 3)), (True, True, False)
         cell[:2, :2], cell[2, 2] = geometry.cell_xy, geometry.Lz
         region = {"insertion_z_range": None}
@@ -2421,6 +2431,12 @@ def setup_from_config(config: Dict[str, Any], verbose: bool = True) -> Dict[str,
         res_cfgs = _per_species_reservoir_cfg(config, species)
         solid = [s for s in species if str(res_cfgs[s].get("type", "")).lower() == "bulk"]
         for s in solid:     # the bulk crystal at the slab's lattice constant
+            if a is None and "lattice_constant_angstrom" not in res_cfgs[s]:
+                raise ValueError(
+                    f"reservoir.{s}: type bulk with a slab read from a file needs "
+                    "lattice_constant_angstrom (the slab's own lattice constant; it cannot be "
+                    "inferred from the file, and the tabulated value can be off by ~1% for "
+                    "a potential)")
             res_cfgs[s].setdefault("lattice_constant_angstrom", a)
         reservoirs = [_build_reservoir(s, res_cfgs[s], masses[s], calc_spec, ase_calc)
                       for s in species]

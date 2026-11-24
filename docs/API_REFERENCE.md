@@ -2685,6 +2685,22 @@ List the disjoint replica pairs of one swap pattern ([ZSG] Fig. 2).
 
 - *ValueError*: If `swap_type` is not one of `SWAP_TYPES`.
 
+#### `ReplicaExchangeGCMC.reset_round_trips`
+
+```python
+ReplicaExchangeGCMC.reset_round_trips() -> None
+```
+
+Start the walkers' round-trip counts afresh (after a ladder change).
+
+Round trips made on an earlier or a trial ladder say nothing about
+mixing on the current one, and the stop rule's round-trip
+requirement must not count them.
+
+**Returns**
+
+- *None*
+
 #### `ReplicaExchangeGCMC.check_energies`
 
 ```python
@@ -2766,7 +2782,8 @@ Move every grid point to a new (T, mu) state, discarding the samples recorded so
 
 The configurations stay where they are (each slot keeps its current
 configuration and energy, which do not depend on the state), and so
-do the walkers, round trips and pair statistics. Each slot gets a
+do the walkers and pair statistics; round-trip counts restart
+(`reset_round_trips`). Each slot gets a
 new `ThermoState`: temperature, mu, Lambda^3(T) from
 `lambda_cubed_of_T` and, for a semi-grand-canonical substrate, the
 field `sgc_dmu + T * sgc_log_ratio`. Every move reads the state

@@ -751,6 +751,24 @@ class ReplicaExchangeGCMC:
             self.walker_last_end["bias"], self.round_trips["bias"] = [None] * n, [0] * n
         self._track_walkers()
 
+    def reset_round_trips(self) -> None:
+        """
+        Start the walkers' round-trip counts afresh (after a ladder change).
+
+        Round trips made on an earlier or a trial ladder say nothing about
+        mixing on the current one, and the stop rule's round-trip
+        requirement must not count them.
+
+        Returns
+        -------
+        None
+        """
+        for axis in self.round_trips:
+            n = len(self.round_trips[axis])
+            self.round_trips[axis] = [0] * n
+            self.walker_last_end[axis] = [None] * n
+        self._track_walkers()
+
     def _has_bias_columns(self) -> bool:
         """
         Whether the mu axis ends in bias columns (`n_physical_mu`).
@@ -902,7 +920,8 @@ class ReplicaExchangeGCMC:
 
         The configurations stay where they are (each slot keeps its current
         configuration and energy, which do not depend on the state), and so
-        do the walkers, round trips and pair statistics. Each slot gets a
+        do the walkers and pair statistics; round-trip counts restart
+        (`reset_round_trips`). Each slot gets a
         new `ThermoState`: temperature, mu, Lambda^3(T) from
         `lambda_cubed_of_T` and, for a semi-grand-canonical substrate, the
         field ``sgc_dmu + T * sgc_log_ratio``. Every move reads the state
@@ -948,6 +967,7 @@ class ReplicaExchangeGCMC:
             for name in v:
                 v[name] = []
         self.convergence_history, self.convergence_details = [], []
+        self.reset_round_trips()
         self.ladder_version += 1
         self.ladder_history.append({**(info or {}), "version": self.ladder_version})
 

@@ -2048,6 +2048,7 @@ class LadderES(_LadderRecords):
             rec["version"] = int(sim.ladder_version)
         else:
             sim.assign_states(T1, mu1)
+            sim.reset_round_trips()     # the survivor's trial round trips do not count
             rec["version"] = int(getattr(sim, "ladder_version", 0))
             sim.ladder_history.append(rec)
         return rec
