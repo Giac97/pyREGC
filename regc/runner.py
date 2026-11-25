@@ -192,7 +192,8 @@ _ADAPT_LADDER_ES_DEFAULTS = {"method": "es", "generations": 3, "population": 4, 
                              "eval_steps": None, "fitness": "uniform", "per_row": True,
                              "reevaluate_parent": True, "min_gap_fraction": 0.0,
                              "warmup_steps": 0, "min_attempts_per_pair": None,
-                             "eval_steps_max": None}
+                             "eval_steps_max": None, "warmup_until_stationary": False,
+                             "warmup_max_steps": None, "target_acceptance": 0.25}
 _MD_KEYS = {"timestep_fs", "thermostat", "taut_fs", "friction_per_fs"}
 
 
@@ -689,7 +690,8 @@ def _adapt_ladder_es_settings(config: Dict[str, Any], cfg: Dict[str, Any]) -> Di
         if v != int(v) or v < 1:
             raise ValueError(f"{where}.{key} must be an integer >= 1, got {out[key]!r}")
         out[key] = int(v)
-    for key, low in (("warmup_steps", 0), ("min_attempts_per_pair", 1), ("eval_steps_max", 1)):
+    for key, low in (("warmup_steps", 0), ("min_attempts_per_pair", 1), ("eval_steps_max", 1),
+                     ("warmup_max_steps", 1)):
         if out[key] is None:
             continue
         v = _as_float(out[key], f"{where}.{key}")
@@ -707,7 +709,18 @@ def _adapt_ladder_es_settings(config: Dict[str, Any], cfg: Dict[str, Any]) -> Di
     if out["fitness"] not in ("uniform", "resistance"):
         raise ValueError(f"{where}.fitness must be 'uniform' or 'resistance', got "
                          f"{out['fitness']!r}")
-    for key in ("per_row", "reevaluate_parent"):
+    out["target_acceptance"] = _as_float(out["target_acceptance"], f"{where}.target_acceptance")
+    if not 0.0 < out["target_acceptance"] < 1.0:
+        raise ValueError(f"{where}.target_acceptance must be in (0, 1), got "
+                         f"{out['target_acceptance']}")
+    if out["warmup_until_stationary"] and not out["warmup_steps"]:
+        raise ValueError(f"{where}.warmup_until_stationary needs warmup_steps >= 1 (the block "
+                         f"length)")
+    if (out["warmup_max_steps"] is not None
+            and out["warmup_max_steps"] < (out["warmup_steps"] or 0)):
+        raise ValueError(f"{where}.warmup_max_steps ({out['warmup_max_steps']}) must be >= "
+                         f"warmup_steps ({out['warmup_steps']})")
+    for key in ("per_row", "reevaluate_parent", "warmup_until_stationary"):
         if not isinstance(out[key], bool):
             raise ValueError(f"{where}.{key} must be true or false, got {out[key]!r}")
     n_T, n_p = len(re_cfg.get("temperatures_K") or []), len(re_cfg.get("pressures") or [])

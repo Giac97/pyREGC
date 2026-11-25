@@ -174,6 +174,9 @@ _NEW_NESTED_METADATA_DEFAULTS = {
     "subsurface": {"freeze_switched": False, "site_method": "voronoi", "bond_length": None,
                    "site_merge": 0.25, "defensive_fraction": 0.0, "partition_gas_zone": True},
 }
+#: The same for the ES ladder settings (``sampling.adapt_ladder`` with ``method: es``).
+_NEW_ES_LADDER_DEFAULTS = {"warmup_until_stationary": False, "warmup_max_steps": None,
+                           "target_acceptance": 0.25}
 
 
 def _drop_new_defaults(saved: dict, current: dict) -> None:
@@ -200,6 +203,9 @@ def _drop_new_defaults(saved: dict, current: dict) -> None:
         a, b = saved.get(section), current.get(section)
         if isinstance(a, dict) and isinstance(b, dict):
             drop(a, b, defaults)
+    a, b = ((m.get("sampling") or {}).get("adapt_ladder") for m in (saved, current))
+    if isinstance(a, dict) and isinstance(b, dict) and a.get("method") == b.get("method") == "es":
+        drop(a, b, _NEW_ES_LADDER_DEFAULTS)
 
 
 def _check_metadata(path: str, metadata: dict) -> None:

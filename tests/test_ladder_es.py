@@ -12,9 +12,9 @@ import numpy as np
 import pytest
 
 from regc import BulkSystem, LJCalculator, ReplicaExchangeGCMC
-from regc.ladder import (ACCEPT_FLOOR, LadderES, acceptance_by_type, effective_resistance,
+from regc.ladder import (LadderES, acceptance_by_type, drift_t, effective_resistance,
                          fitness_noise, fitness_resistance, fitness_uniform,
-                         measured_resistances, pair_type, select_survivor)
+                         measured_resistances, pair_type, select_survivor, states_needed)
 
 
 def _mu_of(T, y):
@@ -135,7 +135,7 @@ def test_resistance_fitness_matches_effective_resistance():
     pairs = sorted(counts)
     att = np.array([counts[p][0] for p in pairs], float)
     acc = np.array([counts[p][1] for p in pairs], float)
-    g = np.maximum(acc / att, ACCEPT_FLOOR) * att / att.sum()
+    g = (acc + 0.5) / (att + 1.0) * att / att.sum()
     ia = np.array([a[0] * 4 + a[1] for a, _ in pairs])
     ib = np.array([b[0] * 4 + b[1] for _, b in pairs])
     R_T = effective_resistance(12, ia, ib, g, range(4), range(8, 12))
@@ -159,6 +159,49 @@ def test_fitness_noise_shrinks_with_the_attempts():
     assert se_l[0] < se_s[0] / 4 and se_l[1] < se_s[1] / 4
     assert fitness_noise((3, 3), small) == se_s          # its own fixed seed
     assert fitness_noise((3, 3), {}) == (0.0, 0.0)
+
+
+def test_blocked_link_costs_in_proportion_to_its_attempts():
+    # a row-wide blocked T link: finite resistance, growing as its rate (k + 1/2) / (n + 1) falls
+    base = _counts(3, 3, lambda a, b: 0.3)
+
+    def blocked(n):
+        return {p: ((n, 0) if pair_type(p) != "mu" and min(p)[0] == 1 else c)
+                for p, c in base.items()}
+    r100, r400 = (measured_resistances((3, 3), blocked(n))[0] for n in (100, 400))
+    assert np.isfinite(r100) and r100 < 1e6 and r400 > 1.5 * r100
+    # it still dominates: the blocked ladder loses against an evenly connected one
+    assert fitness_resistance((3, 3), blocked(100)) > fitness_resistance((3, 3), base) + 2.0
+
+
+def test_states_needed():
+    # every neighbour pair at the target: the ladder as it is
+    even = _counts(4, 3, lambda a, b: 0.25)
+    assert states_needed((4, 3), even, 0.25) == {"T": 4, "mu": 3}
+    # one T gap at 0.02 in one column: that column needs more temperatures
+    one = dict(even)
+    one[((1, 2), (2, 2))] = (1000, 20)
+    need = states_needed((4, 3), one, 0.25)
+    assert need["mu"] == 3 and need["T"] > 4
+    # a never-accepted gap with more attempts asks for more (a lower bound)
+    n1 = states_needed((4, 3), {**even, ((1, 2), (2, 2)): (100, 0)})["T"]
+    n2 = states_needed((4, 3), {**even, ((1, 2), (2, 2)): (10000, 0)})["T"]
+    assert n2 > n1 > 4
+    assert states_needed((1, 3), _counts(1, 3, lambda a, b: 0.25))["T"] is None
+    missing = {p: c for p, c in even.items() if p != ((0, 0), (1, 0))}
+    assert states_needed((4, 3), missing)["T"] is None
+    with pytest.raises(ValueError, match="target"):
+        states_needed((4, 3), even, 1.0)
+
+
+def test_drift_t():
+    assert drift_t([1.0, 2.0], [1.0, 2.0]) == 0.0
+    assert drift_t([1.0], [2.0]) is None
+    assert drift_t([0, 0, 0, 0], [1, 1, 1, 1]) == np.inf
+    rng = np.random.default_rng(0)
+    a = rng.normal(5.0, 1.0, 400)
+    assert abs(drift_t(a, a + rng.normal(0.0, 0.5, 400))) < 4.0
+    assert drift_t(a, a + 0.3 + rng.normal(0.0, 0.5, 400)) > 5.0
 
 
 # ---- selection --------------------------------------------------------------------------------
@@ -323,6 +366,34 @@ def test_warmup_and_evaluations_extended_to_min_attempts():
         rec2 = es.run_generation(sim, dict(kw))
         assert rec2["warmup"] is None                        # generation 1 only
         assert "+-" in es.describe(rec2)
+        assert set(rec2["evaluations"][0]["states_needed"]) == {"T", "mu"}
+
+
+def test_warmup_until_stationary():
+    sim, T, Y = _sim()
+    kw = dict(x0=0.7, diffusion_steps=3, record_every=10)
+    with sim:
+        sim.run_regc(5, verbose=False, **kw)
+        n_samples = {k: len(v["U"]) for k, v in sim.samples.items()}
+        es = LadderES(_mu_of, _lam, T, Y, generations=1, population=1, eval_steps=10,
+                      warmup_steps=20, warmup_until_stationary=True, warmup_max_steps=100)
+        lines = []
+        rec = es.run_generation(sim, dict(kw), progress=lines.append)
+        w = rec["warmup"]
+        assert 40 <= w["steps"] <= 100 and w["steps"] % 20 == 0 or w["steps"] == 100
+        assert len(w["blocks"]) == math.ceil(w["steps"] / 20)
+        assert w["blocks"][0]["drift_t"] is None
+        assert w["stationary"] == (abs(w["blocks"][-1]["drift_t"]) < 2.0)
+        assert w["stationary"] or w["steps"] == 100
+        assert sum("warm-up block" in x for x in lines) == len(w["blocks"])
+        if not rec["changed"]:
+            assert {k: len(v["U"]) for k, v in sim.samples.items()} == n_samples
+    with pytest.raises(ValueError, match="warmup_steps"):
+        LadderES(_mu_of, _lam, T, Y, warmup_until_stationary=True)
+    with pytest.raises(ValueError, match="warmup_max_steps"):
+        LadderES(_mu_of, _lam, T, Y, warmup_steps=20, warmup_max_steps=10)
+    with pytest.raises(ValueError, match="target_acceptance"):
+        LadderES(_mu_of, _lam, T, Y, target_acceptance=0.0)
 
 
 def test_generation_is_independent_of_the_worker_count():
@@ -465,6 +536,12 @@ def test_es_ladder_run_is_analysed_and_resumes_mid_es(tmp_path, capsys, monkeypa
     (lambda c: c["replica_exchange"]["adapt_ladder"].update(min_attempts_per_pair=0),
      "min_attempts_per_pair"),
     (lambda c: c["replica_exchange"]["adapt_ladder"].update(eval_steps_max=10), "eval_steps_max"),
+    (lambda c: c["replica_exchange"]["adapt_ladder"].update(target_acceptance=1.5),
+     "target_acceptance"),
+    (lambda c: c["replica_exchange"]["adapt_ladder"].update(warmup_until_stationary="yes"),
+     "warmup_until_stationary"),
+    (lambda c: c["replica_exchange"]["adapt_ladder"].update(warmup_max_steps=5),
+     "warmup_max_steps"),
     (lambda c: c["replica_exchange"].update(temperatures_K=[300, 500],
                                             pressures=[1e-6, 1e2]), "at least 3"),
     (lambda c: c["replica_exchange"].update(mu_eV=[-1.0, -0.5, 0.0]) or
@@ -488,6 +565,8 @@ def test_es_settings_defaults(tmp_path):
     assert out == {"method": "es", "generations": 3, "population": 4, "sigma": 0.3,
                    "eval_steps": 100, "fitness": "uniform", "per_row": True,
                    "reevaluate_parent": True, "min_gap_fraction": 0.0, "warmup_steps": 0,
-                   "min_attempts_per_pair": None, "eval_steps_max": None}
+                   "min_attempts_per_pair": None, "eval_steps_max": None,
+                   "warmup_until_stationary": False, "warmup_max_steps": None,
+                   "target_acceptance": 0.25}
     cfg["replica_exchange"]["adapt_ladder"] = {"method": "model"}
     assert "method" not in _adapt_ladder_settings(cfg)   # older runs' metadata unchanged

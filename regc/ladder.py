@@ -1321,10 +1321,13 @@ def measured_resistances(shape: Tuple[int, int], counts: Dict[Pair, Tuple[int, i
     Effective resistances R_T and R_mu of the swap graph with measured conductances.
 
     As `AcceptanceModel.resistances`, with the measured rates: an edge per
-    pair with conductance max(acceptance, `ACCEPT_FLOOR`) x its share of the
-    attempts. Every T and mu neighbour pair is an edge, so the graph stays
-    connected: one that was not attempted counts as one attempt at the
-    floor acceptance.
+    pair with conductance (accepts + 1/2) / (attempts + 1) x its share of
+    the attempts. The rate is the Jeffreys-prior posterior mean of the
+    acceptance, so a pair that never swapped costs in proportion to how
+    often it was tried (about 1 / (2 x attempts)) instead of an arbitrary
+    floor that would swamp every other difference between ladders. Every T
+    and mu neighbour pair is an edge, so the graph stays connected: one
+    that was not attempted counts as one attempt at `ACCEPT_FLOOR`.
 
     Parameters
     ----------
@@ -1352,7 +1355,7 @@ def measured_resistances(shape: Tuple[int, int], counts: Dict[Pair, Tuple[int, i
     att = np.array([edges[p][0] for p in pairs], dtype=float)
     acc = np.array([edges[p][1] for p in pairs], dtype=float)
     rate = np.maximum(att, 1.0) / max(att.sum(), 1.0)
-    g = np.maximum(acc / np.maximum(att, 1.0), ACCEPT_FLOOR) * rate
+    g = np.where(att > 0, (acc + 0.5) / (att + 1.0), ACCEPT_FLOOR) * rate
     ia = np.array([a[0] * nm + a[1] for a, _ in pairs])
     ib = np.array([b[0] * nm + b[1] for _, b in pairs])
     n = nT * nm
@@ -1380,6 +1383,65 @@ def fitness_resistance(shape: Tuple[int, int], counts: Dict[Pair, Tuple[int, int
         The fitness (`measured_resistances`; an axis with one state is left out).
     """
     return _loss(measured_resistances(shape, counts))
+
+
+def states_needed(shape: Tuple[int, int], counts: Dict[Pair, Tuple[int, int]],
+                  target: float = 0.25) -> Dict[str, Optional[int]]:
+    """
+    States per axis a ladder needs for a target neighbour acceptance, from the measured rates.
+
+    Each neighbour pair along an axis gets a length s from its acceptance a
+    (Jeffreys rate (accepts + 1/2) / (attempts + 1)) through the Gaussian
+    form a = 2 Phi(-s/2), so s = -2 Phi^-1(a/2); lengths add along the
+    axis, and a ladder of n gaps at acceptance `target` spans
+    n x (-2 Phi^-1(target/2)). Along T the worst column decides, along mu
+    the worst row. A pair that never swapped gives a lower bound only (its
+    true acceptance may be far below 1 / (2 x attempts)).
+
+    Parameters
+    ----------
+    shape : tuple of int
+        Grid shape (n_T, n_mu).
+    counts : dict
+        ``{pair: (attempts, accepts)}``.
+    target : float, optional
+        Neighbour acceptance to reach. Default 0.25.
+
+    Returns
+    -------
+    dict
+        ``{'T': n_T needed, 'mu': n_mu needed}``; None along an axis with a
+        single state or with an unattempted pair.
+    """
+    if not 0.0 < float(target) < 1.0:
+        raise ValueError(f"target must be in (0, 1), got {target}")
+    nd = NormalDist()
+    s_star = -2.0 * nd.inv_cdf(float(target) / 2.0)
+    nT, nm = int(shape[0]), int(shape[1])
+    by_pair = {tuple(sorted(tuple(map(int, k)) for k in p)): c for p, c in counts.items()}
+
+    def length(a, b):
+        att, acc = by_pair.get((a, b), (0, 0))
+        if att <= 0:
+            return None
+        rate = min((acc + 0.5) / (att + 1.0), 0.999)
+        return -2.0 * nd.inv_cdf(rate / 2.0)
+
+    out: Dict[str, Optional[int]] = {}
+    for axis, n_lines, n_along, key in (("T", nm, nT, lambda line, i: (i, line)),
+                                        ("mu", nT, nm, lambda line, i: (line, i))):
+        if n_along < 2:
+            out[axis] = None
+            continue
+        worst = 0.0
+        for line in range(n_lines):
+            ls = [length(key(line, i), key(line, i + 1)) for i in range(n_along - 1)]
+            if any(x is None for x in ls):
+                worst = None
+                break
+            worst = max(worst, sum(ls))
+        out[axis] = None if worst is None else int(math.ceil(worst / s_star - 1e-9)) + 1
+    return out
 
 
 def fitness_noise(shape: Tuple[int, int], counts: Dict[Pair, Tuple[int, int]],
@@ -1421,6 +1483,31 @@ def fitness_noise(shape: Tuple[int, int], counts: Dict[Pair, Tuple[int, int]],
         uni.append(fitness_uniform(c))
         res.append(fitness_resistance(shape, c))
     return float(np.std(uni, ddof=1)), float(np.std(res, ddof=1))
+
+
+def drift_t(previous, current) -> Optional[float]:
+    """
+    Drift of per-state block means between two blocks, in units of its standard error.
+
+    Parameters
+    ----------
+    previous, current : array_like
+        Block means of an observable, one per state, in the same order.
+
+    Returns
+    -------
+    float or None
+        mean(d) / (std(d) / sqrt(n)), d = current - previous; 0 if no
+        state's mean changed (inf with the sign of the change if all changed
+        by the same amount); None with fewer than 2 states.
+    """
+    d = np.asarray(current, dtype=float) - np.asarray(previous, dtype=float)
+    if d.size < 2:
+        return None
+    se = float(np.std(d, ddof=1)) / math.sqrt(d.size)
+    if se == 0.0:
+        return 0.0 if float(np.mean(d)) == 0.0 else float(np.sign(np.mean(d)) * np.inf)
+    return float(np.mean(d) / se)
 
 
 def select_survivor(parent_fitness: Optional[float], fitnesses: Sequence[float]) -> Optional[int]:
@@ -1522,6 +1609,19 @@ class LadderES(_LadderRecords):
         Kelvin per engine temperature unit, for the reports. Default None.
     pressure_unit : str, optional
         Unit of 10**y, for the reports. Default None.
+    warmup_until_stationary : bool, optional
+        Repeat the warm-up in blocks of `warmup_steps` until the block mean
+        of N no longer drifts (`drift_t`: the mean change of the per-state
+        block means over the previous block, in units of its standard
+        error over the states, below 2 in magnitude). Default False (one
+        block).
+    warmup_max_steps : int, optional
+        Longest warm-up with `warmup_until_stationary`. Default None
+        (10 x `warmup_steps`).
+    target_acceptance : float, optional
+        Neighbour acceptance for the `states_needed` estimate of every
+        evaluation (reported only; the grid shape is not changed).
+        Default 0.25.
 
     Raises
     ------
@@ -1538,7 +1638,9 @@ class LadderES(_LadderRecords):
                  min_gap_fraction: float = 0.0, warmup_steps: int = 0,
                  min_attempts_per_pair: Optional[int] = None,
                  eval_steps_max: Optional[int] = None, seed: int = 0,
-                 kelvin_per_unit: Optional[float] = None, pressure_unit: Optional[str] = None):
+                 kelvin_per_unit: Optional[float] = None, pressure_unit: Optional[str] = None,
+                 warmup_until_stationary: bool = False, warmup_max_steps: Optional[int] = None,
+                 target_acceptance: float = 0.25):
         """
         Store the settings and the initial ladder.
 
@@ -1580,6 +1682,12 @@ class LadderES(_LadderRecords):
             Kelvin per engine temperature unit. Default None.
         pressure_unit : str, optional
             Pressure unit. Default None.
+        warmup_until_stationary : bool, optional
+            Repeat the warm-up block until N stops drifting. Default False.
+        warmup_max_steps : int, optional
+            Longest stationary warm-up. Default None (10 x `warmup_steps`).
+        target_acceptance : float, optional
+            Neighbour acceptance for `states_needed`. Default 0.25.
 
         Raises
         ------
@@ -1623,7 +1731,16 @@ class LadderES(_LadderRecords):
         if eval_steps_max is not None and (int(eval_steps_max) < 1 or (
                 eval_steps is not None and int(eval_steps_max) < int(eval_steps))):
             raise ValueError(f"eval_steps_max must be >= eval_steps, got {eval_steps_max}")
+        if warmup_until_stationary and int(warmup_steps) < 1:
+            raise ValueError("warmup_until_stationary needs warmup_steps >= 1 (the block)")
+        if warmup_max_steps is not None and int(warmup_max_steps) < int(warmup_steps):
+            raise ValueError(f"warmup_max_steps must be >= warmup_steps, got {warmup_max_steps}")
+        if not 0.0 < float(target_acceptance) < 1.0:
+            raise ValueError(f"target_acceptance must be in (0, 1), got {target_acceptance}")
         self.warmup_steps = int(warmup_steps)
+        self.warmup_until_stationary = bool(warmup_until_stationary)
+        self.warmup_max_steps = (None if warmup_max_steps is None else int(warmup_max_steps))
+        self.target_acceptance = float(target_acceptance)
         self.min_attempts_per_pair = (None if min_attempts_per_pair is None
                                       else int(min_attempts_per_pair))
         self.eval_steps_max = None if eval_steps_max is None else int(eval_steps_max)
@@ -1648,7 +1765,10 @@ class LadderES(_LadderRecords):
                 "per_row": self.per_row, "reevaluate_parent": self.reevaluate_parent,
                 "min_gap_fraction": self.min_gap_fraction, "warmup_steps": self.warmup_steps,
                 "min_attempts_per_pair": self.min_attempts_per_pair,
-                "eval_steps_max": self.eval_steps_max, "seed": self.seed}
+                "eval_steps_max": self.eval_steps_max, "seed": self.seed,
+                "warmup_until_stationary": self.warmup_until_stationary,
+                "warmup_max_steps": self.warmup_max_steps,
+                "target_acceptance": self.target_acceptance}
 
     def n_evaluations(self) -> int:
         """
@@ -1833,6 +1953,8 @@ class LadderES(_LadderRecords):
         attempted = [a for a in rec["attempts"] if a > 0]
         rec["min_attempts"] = int(min(attempted)) if attempted else 0
         rec["fitness_uniform_se"], rec["fitness_resistance_se"] = fitness_noise(shape, counts)
+        rec["states_needed"] = states_needed(shape, counts, self.target_acceptance)
+        rec["target_acceptance"] = self.target_acceptance
         if self.kelvin_per_unit is not None:
             rec["temperatures_K"] = (T * self.kelvin_per_unit).tolist()
         rec["fitness"] = rec["fitness_" + self.fitness]
@@ -1858,11 +1980,16 @@ class LadderES(_LadderRecords):
         short = {"T": "T", "mu": "mu", "cross_left": "xl", "cross_right": "xr"}
         acc = " ".join(f"{short[t]} {a:.2f}" for t, a in rec["acceptance_by_type"].items())
         steps = "" if rec.get("steps") is None else f"{rec['steps']} steps, "
+        need = rec.get("states_needed") or {}
+        need = "".join(f"; {need[a]} {name} needed for acceptance {rec['target_acceptance']:g}"
+                       for a, name in (("T", "temperatures"), ("mu", "pressures"))
+                       if need.get(a) is not None)
         return (f"ladder ES {generation}/{self.generations} {rec['label']}: fitness uniform "
                 f"{rec['fitness_uniform']:.4g} +- {rec['fitness_uniform_se']:.2g}, resistance "
                 f"{rec['fitness_resistance']:.4g} +- {rec['fitness_resistance_se']:.2g} "
                 f"(R_T {rec['R_T']:.3g}, R_mu {rec['R_mu']:.3g}); acceptance {acc}; "
-                f">= {rec['min_attempts']} attempts per pair; {steps}{rec['seconds']:.1f} s")
+                f">= {rec['min_attempts']} attempts per pair; {steps}{rec['seconds']:.1f} s"
+                f"{need}")
 
     def run_generation(self, sim, run_kwargs: Optional[dict] = None, step: Optional[int] = None,
                        eval_steps: Optional[int] = None,
@@ -1971,23 +2098,58 @@ class LadderES(_LadderRecords):
                 # equilibrate on the initial ladder; keep only the configurations
                 t0 = time.time()
                 pre = sim.snapshot_state()
-                n_before = float(np.mean([r.system.n for r in sim.grid.values()]))
-                counts = run_counted(self.warmup_steps)
+                keys = sorted(sim.grid)
+                n_before = float(np.mean([sim.grid[k].system.n for k in keys]))
+                block = self.warmup_steps
+                longest = (block if not self.warmup_until_stationary else
+                           self.warmup_max_steps if self.warmup_max_steps is not None
+                           else 10 * block)
+                n_sub = max(1, min(10, block))
+                counts, done, prev, blocks = {}, 0, None, []
+                while done < longest:
+                    # one block; N of every state read n_sub times (its block mean)
+                    sums = np.zeros(len(keys))
+                    n_block = min(block, longest - done)
+                    for j in range(n_sub):
+                        n = n_block // n_sub + (1 if j < n_block % n_sub else 0)
+                        if n:
+                            for k, (a, c) in run_counted(n).items():
+                                a0, c0 = counts.get(k, (0, 0))
+                                counts[k] = (a0 + a, c0 + c)
+                        sums += [sim.grid[k].system.n for k in keys]
+                    done += n_block
+                    means = sums / n_sub
+                    t = drift_t(prev, means) if prev is not None else None
+                    blocks.append({"steps": done, "mean_N": float(means.mean()), "drift_t": t})
+                    if progress and self.warmup_until_stationary:
+                        progress(f"ladder ES warm-up block {len(blocks)}: {done} steps, block "
+                                 f"mean N {means.mean():.3f}"
+                                 + ("" if t is None else f", drift t {t:+.2f}"))
+                    if t is not None and abs(t) < 2.0:
+                        break
+                    prev = means
+                stationary = bool(blocks[-1]["drift_t"] is not None
+                                  and abs(blocks[-1]["drift_t"]) < 2.0)
                 end = sim.snapshot_state()
                 sim.restore_state(pre)
                 sim.restore_state(end, configurations_only=True)
                 by_type = acceptance_by_type(counts)
-                warmup = {"steps": self.warmup_steps, "seconds": time.time() - t0,
+                warmup = {"steps": done, "seconds": time.time() - t0,
                           "mean_N_before": n_before,
                           "mean_N_after": float(np.mean([r.system.n for r in sim.grid.values()])),
                           "acceptance_by_type": {t: float(np.mean(v))
-                                                 for t, v in by_type.items()}}
+                                                 for t, v in by_type.items()},
+                          "blocks": blocks,
+                          "stationary": stationary if self.warmup_until_stationary else None}
                 if progress:
-                    progress(f"ladder ES warm-up: {self.warmup_steps} steps on the initial "
+                    tail = ("" if not self.warmup_until_stationary else
+                            "; N stationary" if stationary else
+                            f"; N still drifting after {done} steps (warmup_max_steps)")
+                    progress(f"ladder ES warm-up: {done} steps on the initial "
                              f"ladder, mean N {n_before:.2f} -> {warmup['mean_N_after']:.2f}, "
                              f"acceptance " + " ".join(f"{t} {a:.2f}" for t, a in
                                                       warmup["acceptance_by_type"].items())
-                             + f"; {warmup['seconds']:.1f} s")
+                             + f"; {warmup['seconds']:.1f} s{tail}")
             base = sim.snapshot_state()
 
         def score(x):
